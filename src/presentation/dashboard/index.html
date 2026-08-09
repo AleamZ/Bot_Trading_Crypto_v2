@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SMC Futures Bot</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">SMC Futures Bot</div>
+      <nav class="nav-tabs" aria-label="Main navigation">
+        <button class="nav-tab active" id="home-nav" type="button">Home</button>
+        <button class="nav-tab" id="chart-nav" type="button">Chart</button>
+        <button class="nav-tab" id="settings-nav" type="button">Setting</button>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <section class="view active" id="home-view">
+        <section class="wallet-hero">
+          <div>
+            <h1>Futures Wallet <span>(Binance)</span></h1>
+            <div class="hero-line">
+              <span>Connection:</span>
+              <strong class="hero-badge" id="account-pill">CHECKING</strong>
+            </div>
+            <div class="hero-line mode-line">
+              <span>Mode:</span>
+              <strong class="hero-badge muted" id="network-pill">-</strong>
+              <small id="mode-detail">-</small>
+            </div>
+            <p class="balance-line">
+              Wallet balance:
+              <strong id="wallet-balance">-</strong>
+              <span>· Available:</span>
+              <strong id="available-balance">-</strong>
+            </p>
+          </div>
+          <div class="hero-actions">
+            <span class="pill" id="db-pill">DB: -</span>
+            <button id="refresh" title="Refresh snapshot" aria-label="Refresh snapshot">Refresh</button>
+          </div>
+        </section>
+
+        <section class="topbar">
+          <div>
+            <h2>SMC Strategy Console</h2>
+            <p id="connection">Waiting for snapshot</p>
+          </div>
+        </section>
+
+        <section class="status-grid">
+          <article class="status-card">
+            <span>Binance Account</span>
+            <strong id="account">-</strong>
+            <small id="account-detail">-</small>
+          </article>
+          <article class="status-card">
+            <span>Database</span>
+            <strong id="database">-</strong>
+            <small id="database-detail">-</small>
+          </article>
+          <article class="status-card">
+            <span>Market Data</span>
+            <strong id="market-data">-</strong>
+            <small id="market-data-detail">-</small>
+          </article>
+          <article class="status-card">
+            <span>Engine</span>
+            <strong id="engine-state">-</strong>
+            <small id="engine-detail">-</small>
+          </article>
+        </section>
+
+        <section class="grid">
+          <article class="metric-card">
+            <span>Trend</span>
+            <strong id="trend">-</strong>
+            <small id="symbol">-</small>
+          </article>
+          <article class="metric-card">
+            <span>HTF FVG</span>
+            <strong id="fvg">-</strong>
+            <small id="fvg-detail">-</small>
+          </article>
+          <article class="metric-card">
+            <span>LTF Signal</span>
+            <strong id="signal">-</strong>
+            <small id="signal-detail">-</small>
+          </article>
+          <article class="metric-card">
+            <span>Risk</span>
+            <strong id="risk">-</strong>
+            <small id="risk-detail">-</small>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Decision Log</h2>
+            <span id="event-count">0 events</span>
+          </div>
+          <ol id="events"></ol>
+        </section>
+      </section>
+
+      <section class="view" id="chart-view">
+        <section class="chart-toolbar">
+          <div>
+            <h1>Chart</h1>
+            <p id="chart-status">Waiting for candles</p>
+          </div>
+          <div class="chart-controls">
+            <input id="chart-symbol" value="BTCUSDT" aria-label="Symbol" />
+            <select id="chart-interval" aria-label="Interval">
+              <option value="1m">1m</option>
+              <option value="5m" selected>5m</option>
+              <option value="15m">15m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+              <option value="1d">1d</option>
+            </select>
+            <button id="chart-refresh" type="button">Refresh</button>
+          </div>
+        </section>
+        <section class="chart-shell">
+          <div class="chart-stage">
+            <div id="price-chart"></div>
+            <div id="chart-overlay"></div>
+          </div>
+        </section>
+        <section class="positions-panel" aria-label="Binance positions">
+          <div class="positions-head">
+            <div class="positions-tabs">
+              <button class="positions-tab active" type="button">Positions<span id="positions-count">0</span></button>
+              <button class="positions-tab" type="button" disabled>Open Orders<span>-</span></button>
+              <button class="positions-tab" type="button" disabled>Order History</button>
+              <button class="positions-tab" type="button" disabled>Trade History</button>
+            </div>
+            <label class="positions-filter">
+              <input id="hide-other-symbols" type="checkbox" checked />
+              <span>Hide Other Symbols</span>
+            </label>
+          </div>
+          <div class="positions-table-wrap">
+            <table class="positions-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Size</th>
+                  <th>Entry Price</th>
+                  <th>Stop Loss</th>
+                  <th>Take Profit</th>
+                  <th>Margin</th>
+                  <th>PNL</th>
+                  <th>Risk/Reward</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody id="positions-body">
+                <tr>
+                  <td colspan="9" class="empty-position">No positions</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="settings-view">
+        <section class="settings-toolbar">
+          <div>
+            <h1>Setting</h1>
+            <p id="settings-status">Local draft</p>
+          </div>
+          <div class="settings-actions">
+            <button id="settings-reset" type="button">Reset</button>
+            <button id="settings-save" type="button">Save</button>
+          </div>
+        </section>
+
+        <section class="settings-grid">
+          <article class="setting-card">
+            <label for="setting-size">Size</label>
+            <input id="setting-size" inputmode="decimal" min="0" step="0.000001" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label>Order Type</label>
+            <div class="segmented-control" data-setting-group="orderType">
+              <button class="segmented-option" data-setting-value="limit" type="button">Limit</button>
+              <button class="segmented-option" data-setting-value="market" type="button">Market</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label>Margin</label>
+            <div class="segmented-control" data-setting-group="marginMode">
+              <button class="segmented-option" data-setting-value="cross" type="button">Cross</button>
+              <button class="segmented-option" data-setting-value="isolated" type="button">Isolated</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-leverage">Đòn bẩy</label>
+            <input id="setting-leverage" inputmode="numeric" min="1" max="125" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-risk-reward">Risk/Reward</label>
+            <input id="setting-risk-reward" inputmode="decimal" min="0.1" step="0.1" type="number" />
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

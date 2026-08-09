@@ -1,4 +1,4 @@
-import { fetchCandles, fetchOverlays } from "./api/ChartApi.js";
+import { fetchAccountActivity, fetchCandles, fetchOverlays } from "./api/ChartApi.js";
 import { BOSRenderer } from "./renderer/BOSRenderer.js";
 import { CandleRenderer } from "./renderer/CandleRenderer.js";
 import { CHOCHRenderer } from "./renderer/CHOCHRenderer.js";
@@ -10,14 +10,38 @@ import { SwingRenderer } from "./renderer/SwingRenderer.js";
 import { TradeRenderer } from "./renderer/TradeRenderer.js";
 
 export class TradingChart {
-  constructor({ container, overlayRoot, statusElement, positionsBody = null, positionsCount = null }) {
+  constructor({
+    container,
+    overlayRoot,
+    statusElement,
+    accountTableHead = null,
+    positionsBody = null,
+    positionsCount = null,
+    openOrdersCount = null,
+    orderHistoryCount = null,
+    tradeHistoryCount = null,
+    tabButtons = [],
+  }) {
     this.container = container;
     this.overlayRoot = overlayRoot;
     this.statusElement = statusElement;
+    this.accountTableHead = accountTableHead;
     this.positionsBody = positionsBody;
     this.positionsCount = positionsCount;
+    this.openOrdersCount = openOrdersCount;
+    this.orderHistoryCount = orderHistoryCount;
+    this.tradeHistoryCount = tradeHistoryCount;
+    this.tabButtons = tabButtons;
+    this.activeAccountTab = "positions";
+    this.accountTables = {
+      positions: [],
+      openOrders: [],
+      orderHistory: [],
+      tradeHistory: [],
+    };
     this.lastKey = null;
     this.createChart();
+    this.bindAccountTabs();
 
     window.addEventListener("resize", () => this.resize());
     container.addEventListener(
@@ -119,9 +143,10 @@ export class TradingChart {
       this.resetChart();
     }
     const visibleRange = resetRange ? null : this.chart.timeScale().getVisibleLogicalRange();
-    const [candlePayload, overlayPayload] = await Promise.all([
+    const [candlePayload, overlayPayload, accountActivity] = await Promise.all([
       fetchCandles({ symbol, interval, limit }),
       fetchOverlays({ symbol, interval, limit: 200 }),
+      fetchAccountActivity({ symbol, limit: 100 }),
     ]);
 
     const candles = (candlePayload.klines ?? []).map((kline) => ({
@@ -151,7 +176,7 @@ export class TradingChart {
     this.choch.render(overlayPayload.choch ?? []);
     this.liquidity.render(overlayPayload.externalLiquidity ?? []);
     this.position.render(overlayPayload.positions ?? []);
-    this.renderPositions(overlayPayload.positions ?? []);
+    this.setAccountTables(overlayPayload.positions ?? [], accountActivity);
     this.swing.render(this.trade.render(overlayPayload.trades ?? []));
 
     if (visibleRange) {
@@ -190,25 +215,63 @@ export class TradingChart {
     this.position.refresh();
   }
 
-  renderPositions(positions) {
+  bindAccountTabs() {
+    for (const button of this.tabButtons) {
+      button.addEventListener("click", () => {
+        this.activeAccountTab = button.dataset.accountTab ?? "positions";
+        this.renderAccountTable();
+      });
+    }
+  }
+
+  setAccountTables(positions, accountActivity) {
+    this.accountTables = {
+      positions,
+      openOrders: accountActivity?.openOrders ?? [],
+      orderHistory: accountActivity?.orderHistory ?? [],
+      tradeHistory: accountActivity?.tradeHistory ?? [],
+    };
+
+    if (this.positionsCount) this.positionsCount.textContent = String(this.accountTables.positions.length);
+    if (this.openOrdersCount) this.openOrdersCount.textContent = String(this.accountTables.openOrders.length);
+    if (this.orderHistoryCount) this.orderHistoryCount.textContent = String(this.accountTables.orderHistory.length);
+    if (this.tradeHistoryCount) this.tradeHistoryCount.textContent = String(this.accountTables.tradeHistory.length);
+    this.renderAccountTable();
+  }
+
+  renderAccountTable() {
     if (!this.positionsBody) return;
+    for (const button of this.tabButtons) {
+      button.classList.toggle("active", button.dataset.accountTab === this.activeAccountTab);
+    }
+
+    if (this.activeAccountTab === "positions") {
+      this.renderPositions(this.accountTables.positions);
+      return;
+    }
+
+    if (this.activeAccountTab === "openOrders") {
+      this.renderOpenOrders(this.accountTables.openOrders);
+      return;
+    }
+
+    if (this.activeAccountTab === "orderHistory") {
+      this.renderOrderHistory(this.accountTables.orderHistory);
+      return;
+    }
+
+    this.renderTradeHistory(this.accountTables.tradeHistory);
+  }
+
+  renderPositions(positions) {
+    this.renderHeader(["Symbol", "Size", "Entry Price", "Stop Loss", "Take Profit", "Margin", "PNL", "Risk/Reward", "Source"]);
 
     const rows = positions
       .filter((position) => position.state === "active" || position.state === "pending")
       .sort((a, b) => sourceRank(a.source) - sourceRank(b.source));
 
-    if (this.positionsCount) {
-      this.positionsCount.textContent = String(rows.length);
-    }
-
     if (rows.length === 0) {
-      const row = document.createElement("tr");
-      const cell = document.createElement("td");
-      cell.className = "empty-position";
-      cell.colSpan = 9;
-      cell.textContent = "No positions";
-      row.append(cell);
-      this.positionsBody.replaceChildren(row);
+      this.renderEmpty("No positions", 9);
       return;
     }
 
@@ -231,6 +294,111 @@ export class TradingChart {
         return row;
       }),
     );
+  }
+
+  renderOpenOrders(orders) {
+    this.renderHeader(["Symbol", "Order", "Side", "Price", "Stop Price", "Quantity", "Filled", "Reduce Only", "Updated"]);
+
+    if (orders.length === 0) {
+      this.renderEmpty("No open orders", 9);
+      return;
+    }
+
+    this.positionsBody.replaceChildren(
+      ...orders.map((order) => {
+        const row = document.createElement("tr");
+        row.className = `position-row ${sideClass(order.side)}`;
+        row.append(
+          stackedCell(order.symbol, order.status),
+          stackedCell(order.type, `#${order.orderId}`),
+          toneCell(order.side, sideClass(order.side)),
+          textCell(formatNullablePrice(order.price)),
+          textCell(formatNullablePrice(order.stopPrice)),
+          textCell(formatQuantity(order.quantity)),
+          textCell(formatQuantity(order.executedQuantity)),
+          textCell(order.reduceOnly ? "Yes" : "No"),
+          textCell(formatTime(order.updatedAt)),
+        );
+        return row;
+      }),
+    );
+  }
+
+  renderOrderHistory(orders) {
+    this.renderHeader(["Symbol", "Order", "Side", "Avg Price", "Price", "Quantity", "Filled", "Status", "Updated"]);
+
+    if (orders.length === 0) {
+      this.renderEmpty("No order history", 9);
+      return;
+    }
+
+    this.positionsBody.replaceChildren(
+      ...orders.map((order) => {
+        const row = document.createElement("tr");
+        row.className = `position-row ${sideClass(order.side)}`;
+        row.append(
+          stackedCell(order.symbol, order.type),
+          textCell(`#${order.orderId}`),
+          toneCell(order.side, sideClass(order.side)),
+          textCell(formatNullablePrice(order.averagePrice)),
+          textCell(formatNullablePrice(order.price)),
+          textCell(formatQuantity(order.quantity)),
+          textCell(formatQuantity(order.executedQuantity)),
+          textCell(order.status ?? "-"),
+          textCell(formatTime(order.updatedAt)),
+        );
+        return row;
+      }),
+    );
+  }
+
+  renderTradeHistory(trades) {
+    this.renderHeader(["Symbol", "Trade", "Side", "Price", "Quantity", "Quote", "Realized PNL", "Commission", "Time"]);
+
+    if (trades.length === 0) {
+      this.renderEmpty("No trade history", 9);
+      return;
+    }
+
+    this.positionsBody.replaceChildren(
+      ...trades.map((trade) => {
+        const row = document.createElement("tr");
+        row.className = `position-row ${sideClass(trade.side)}`;
+        row.append(
+          stackedCell(trade.symbol, `Order #${trade.orderId}`),
+          textCell(`#${trade.tradeId}`),
+          toneCell(trade.side, sideClass(trade.side)),
+          textCell(formatPrice(trade.price)),
+          textCell(formatQuantity(trade.quantity)),
+          textCell(formatUsdt(trade.quoteQuantity)),
+          pnlValueCell(trade.realizedPnl),
+          textCell(`${formatQuantity(trade.commission)} ${trade.commissionAsset ?? ""}`.trim()),
+          textCell(formatTime(trade.createdAt)),
+        );
+        return row;
+      }),
+    );
+  }
+
+  renderHeader(labels) {
+    if (!this.accountTableHead) return;
+    const row = document.createElement("tr");
+    row.append(...labels.map((label) => {
+      const cell = document.createElement("th");
+      cell.textContent = label;
+      return cell;
+    }));
+    this.accountTableHead.replaceChildren(row);
+  }
+
+  renderEmpty(message, colSpan) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.className = "empty-position";
+    cell.colSpan = colSpan;
+    cell.textContent = message;
+    row.append(cell);
+    this.positionsBody.replaceChildren(row);
   }
 }
 
@@ -266,6 +434,23 @@ function textCell(value) {
   return cell;
 }
 
+function stackedCell(title, detail) {
+  const cell = document.createElement("td");
+  const strong = document.createElement("strong");
+  const small = document.createElement("span");
+  strong.textContent = title ?? "-";
+  small.textContent = detail ?? "-";
+  cell.append(strong, small);
+  return cell;
+}
+
+function toneCell(value, tone) {
+  const cell = document.createElement("td");
+  cell.className = tone;
+  cell.textContent = value ?? "-";
+  return cell;
+}
+
 function positionSizeCell(position) {
   const cell = document.createElement("td");
   const notional = document.createElement("strong");
@@ -293,6 +478,14 @@ function pnlCell(position) {
   return cell;
 }
 
+function pnlValueCell(value) {
+  const cell = document.createElement("td");
+  const number = Number(value ?? 0);
+  cell.className = number >= 0 ? "profit" : "danger";
+  cell.textContent = formatUsdt(number);
+  return cell;
+}
+
 function sourceCell(position) {
   const cell = document.createElement("td");
   const badge = document.createElement("span");
@@ -300,6 +493,12 @@ function sourceCell(position) {
   badge.textContent = position.source === "manual" ? "Binance" : "Bot";
   cell.append(badge);
   return cell;
+}
+
+function sideClass(side) {
+  if (side === "BUY" || side === "long") return "long";
+  if (side === "SELL" || side === "short") return "short";
+  return "";
 }
 
 function formatMargin(position) {
@@ -333,6 +532,10 @@ function formatPrice(value) {
   return number.toLocaleString("en-US", { maximumFractionDigits: 4 });
 }
 
+function formatNullablePrice(value) {
+  return value === null || value === undefined ? "--" : formatPrice(value);
+}
+
 function formatQuantity(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
@@ -349,4 +552,10 @@ function formatRatio(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return "-";
   return number.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+function formatTime(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
+  return formatUtc7Time(timestamp);
 }

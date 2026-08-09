@@ -25,6 +25,41 @@ export interface BinanceFuturesPositionStatus {
   takeProfit: number | null;
 }
 
+export interface BinanceFuturesOpenOrderStatus {
+  id: string;
+  symbol: string;
+  orderId: string;
+  side: string;
+  type: string;
+  price: number | null;
+  stopPrice: number | null;
+  quantity: number;
+  executedQuantity: number;
+  status: string;
+  reduceOnly: boolean;
+  createdAt: number | null;
+  updatedAt: number | null;
+}
+
+export interface BinanceFuturesOrderHistoryStatus extends BinanceFuturesOpenOrderStatus {
+  averagePrice: number | null;
+}
+
+export interface BinanceFuturesTradeHistoryStatus {
+  id: string;
+  symbol: string;
+  tradeId: string;
+  orderId: string;
+  side: string;
+  price: number;
+  quantity: number;
+  quoteQuantity: number;
+  realizedPnl: number;
+  commission: number;
+  commissionAsset: string | null;
+  createdAt: number | null;
+}
+
 type BinanceExitSide = "BUY" | "SELL";
 
 export class BinanceFuturesAccountClient {
@@ -116,6 +151,27 @@ export class BinanceFuturesAccountClient {
       .filter((position): position is BinanceFuturesPositionStatus => position !== null);
   }
 
+  async getOpenOrders(symbol?: string): Promise<BinanceFuturesOpenOrderStatus[]> {
+    const orders = await this.signedGet<OpenOrder[]>("/fapi/v1/openOrders", symbol ? { symbol } : {});
+    return orders.map(toOpenOrderStatus);
+  }
+
+  async getOrderHistory(symbol: string, limit = 100): Promise<BinanceFuturesOrderHistoryStatus[]> {
+    const orders = await this.signedGet<OrderHistoryItem[]>("/fapi/v1/allOrders", {
+      symbol,
+      limit: String(limit)
+    });
+    return orders.map(toOrderHistoryStatus).sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
+  }
+
+  async getTradeHistory(symbol: string, limit = 100): Promise<BinanceFuturesTradeHistoryStatus[]> {
+    const trades = await this.signedGet<UserTrade[]>("/fapi/v1/userTrades", {
+      symbol,
+      limit: String(limit)
+    });
+    return trades.map(toTradeHistoryStatus).sort((a, b) => Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0));
+  }
+
   private async signedGet<T>(path: string, queryParams: Record<string, string> = {}): Promise<T> {
     const query = new URLSearchParams({ ...queryParams, timestamp: String(Date.now()), recvWindow: "5000" });
     query.set("signature", this.sign(query.toString()));
@@ -163,12 +219,23 @@ interface AccountResponse {
 
 interface OpenOrder {
   symbol: string;
+  orderId?: number | string;
+  clientOrderId?: string;
   side?: BinanceExitSide;
   type?: string;
+  origQty?: string;
+  executedQty?: string;
   stopPrice?: string;
   price?: string;
+  status?: string;
   reduceOnly?: boolean | string;
   closePosition?: boolean | string;
+  time?: number;
+  updateTime?: number;
+}
+
+interface OrderHistoryItem extends OpenOrder {
+  avgPrice?: string;
 }
 
 interface OpenAlgoOrder {
@@ -183,9 +250,61 @@ interface OpenAlgoOrder {
 
 interface UserTrade {
   symbol: string;
+  id?: number | string;
+  orderId?: number | string;
   side?: "BUY" | "SELL";
+  price?: string;
   qty?: string;
+  quoteQty?: string;
+  realizedPnl?: string;
+  commission?: string;
+  commissionAsset?: string;
   time?: number;
+}
+
+function toOpenOrderStatus(order: OpenOrder): BinanceFuturesOpenOrderStatus {
+  const orderId = String(order.orderId ?? order.clientOrderId ?? `${order.symbol}:${order.side ?? "-"}:${order.type ?? "-"}:${order.time ?? 0}`);
+  return {
+    id: `binance:open-order:${order.symbol}:${orderId}`,
+    symbol: order.symbol,
+    orderId,
+    side: order.side ?? "-",
+    type: order.type ?? "-",
+    price: numberOrNull(order.price),
+    stopPrice: numberOrNull(order.stopPrice),
+    quantity: Number(order.origQty ?? 0),
+    executedQuantity: Number(order.executedQty ?? 0),
+    status: order.status ?? "OPEN",
+    reduceOnly: isTrue(order.reduceOnly) || isTrue(order.closePosition),
+    createdAt: toSecondsOrNull(order.time),
+    updatedAt: toSecondsOrNull(order.updateTime ?? order.time)
+  };
+}
+
+function toOrderHistoryStatus(order: OrderHistoryItem): BinanceFuturesOrderHistoryStatus {
+  return {
+    ...toOpenOrderStatus(order),
+    id: `binance:order-history:${order.symbol}:${String(order.orderId ?? order.clientOrderId ?? order.time ?? 0)}`,
+    averagePrice: numberOrNull(order.avgPrice)
+  };
+}
+
+function toTradeHistoryStatus(trade: UserTrade): BinanceFuturesTradeHistoryStatus {
+  const tradeId = String(trade.id ?? `${trade.symbol}:${trade.orderId ?? "-"}:${trade.time ?? 0}`);
+  return {
+    id: `binance:trade-history:${trade.symbol}:${tradeId}`,
+    symbol: trade.symbol,
+    tradeId,
+    orderId: String(trade.orderId ?? "-"),
+    side: trade.side ?? "-",
+    price: Number(trade.price ?? 0),
+    quantity: Number(trade.qty ?? 0),
+    quoteQuantity: Number(trade.quoteQty ?? 0),
+    realizedPnl: Number(trade.realizedPnl ?? 0),
+    commission: Number(trade.commission ?? 0),
+    commissionAsset: trade.commissionAsset ?? null,
+    createdAt: toSecondsOrNull(trade.time)
+  };
 }
 
 function groupOrdersBySymbol(orders: OpenOrder[]): Map<string, OpenOrder[]> {
@@ -208,6 +327,16 @@ function findTriggerPrice(orders: OpenOrder[], type: "STOP_MARKET" | "TAKE_PROFI
 
 function isTrue(value: boolean | string | undefined): boolean {
   return value === true || value === "true";
+}
+
+function numberOrNull(value: string | undefined): number | null {
+  const number = Number(value ?? 0);
+  return number > 0 ? number : null;
+}
+
+function toSecondsOrNull(value: number | undefined): number | null {
+  if (!value || !Number.isFinite(value)) return null;
+  return Math.floor(value / 1000);
 }
 
 function toOpenOrder(order: OpenAlgoOrder): OpenOrder {

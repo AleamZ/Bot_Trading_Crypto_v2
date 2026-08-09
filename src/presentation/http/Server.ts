@@ -5,7 +5,14 @@ import type { TradingEngine } from "../../application/engine/TradingEngine.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
 import type { DecisionLogger } from "../../application/ports/Logger.js";
 import type { AppConfig } from "../../application/config/AppConfig.js";
-import { BinanceFuturesAccountClient, type BinanceFuturesPositionStatus, type BinanceFuturesWalletStatus } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
+import {
+  BinanceFuturesAccountClient,
+  type BinanceFuturesOpenOrderStatus,
+  type BinanceFuturesOrderHistoryStatus,
+  type BinanceFuturesPositionStatus,
+  type BinanceFuturesTradeHistoryStatus,
+  type BinanceFuturesWalletStatus
+} from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
 import { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
 import { ema } from "../../domain/trend/Ema.js";
 import { buildLiquidityState } from "../../domain/liquidity/LiquidityDetector.js";
@@ -61,6 +68,14 @@ export function startHttpServer(params: {
         const store = await params.repository.getDashboardSnapshot();
         response.writeHead(200, noCacheHeaders("application/json"));
         response.end(JSON.stringify({ symbol, limit, events: selectBotEvents(store, symbol, limit) }));
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/binance/account-activity") {
+        const query = parseAccountActivityQuery(requestUrl, params.config.symbol);
+        const activity = await getAccountActivity(accountClient, query.symbol, query.limit, params.logger);
+        response.writeHead(200, noCacheHeaders("application/json"));
+        response.end(JSON.stringify({ symbol: query.symbol, limit: query.limit, ...activity }));
         return;
       }
 
@@ -120,6 +135,17 @@ function parseKlineQuery(url: URL, defaultSymbol: string): { symbol: string; int
   }
 
   return { symbol, interval, limit };
+}
+
+function parseAccountActivityQuery(url: URL, defaultSymbol: string): { symbol: string; limit: number } {
+  const symbol = (url.searchParams.get("symbol") ?? defaultSymbol).toUpperCase();
+  const limit = clampLimit(url.searchParams.get("limit"), 100, 500);
+
+  if (!/^[A-Z0-9]{5,20}$/.test(symbol)) {
+    throw new Error(`Invalid symbol: ${symbol}`);
+  }
+
+  return { symbol, limit };
 }
 
 function clampLimit(value: string | null, fallback: number, max: number): number {
@@ -833,6 +859,55 @@ async function getManualPositions(
     return await accountClient.getOpenPositions(symbol);
   } catch (error) {
     logger.warn("Binance position overlay check failed", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return [];
+  }
+}
+
+async function getAccountActivity(
+  accountClient: BinanceFuturesAccountClient | null,
+  symbol: string,
+  limit: number,
+  logger: DecisionLogger
+): Promise<{
+  connected: boolean;
+  positions: BinanceFuturesPositionStatus[];
+  openOrders: BinanceFuturesOpenOrderStatus[];
+  orderHistory: BinanceFuturesOrderHistoryStatus[];
+  tradeHistory: BinanceFuturesTradeHistoryStatus[];
+}> {
+  if (!accountClient) {
+    return {
+      connected: false,
+      positions: [],
+      openOrders: [],
+      orderHistory: [],
+      tradeHistory: []
+    };
+  }
+
+  const [positions, openOrders, orderHistory, tradeHistory] = await Promise.all([
+    readAccountActivity("positions", () => accountClient.getOpenPositions(symbol), logger),
+    readAccountActivity("open orders", () => accountClient.getOpenOrders(symbol), logger),
+    readAccountActivity("order history", () => accountClient.getOrderHistory(symbol, limit), logger),
+    readAccountActivity("trade history", () => accountClient.getTradeHistory(symbol, limit), logger)
+  ]);
+
+  return {
+    connected: true,
+    positions,
+    openOrders,
+    orderHistory,
+    tradeHistory
+  };
+}
+
+async function readAccountActivity<T>(label: string, read: () => Promise<T[]>, logger: DecisionLogger): Promise<T[]> {
+  try {
+    return await read();
+  } catch (error) {
+    logger.warn(`Binance ${label} check failed`, {
       error: error instanceof Error ? error.message : String(error)
     });
     return [];

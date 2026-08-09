@@ -198,8 +198,13 @@ async function ensureChart() {
     container: $("price-chart"),
     overlayRoot: $("chart-overlay"),
     statusElement: $("chart-status"),
+    accountTableHead: $("account-table-head"),
     positionsBody: $("positions-body"),
     positionsCount: $("positions-count"),
+    openOrdersCount: $("open-orders-count"),
+    orderHistoryCount: $("order-history-count"),
+    tradeHistoryCount: $("trade-history-count"),
+    tabButtons: [...document.querySelectorAll("[data-account-tab]")],
   });
 }
 

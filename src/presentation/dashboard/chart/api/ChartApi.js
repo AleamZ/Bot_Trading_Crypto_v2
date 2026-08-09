@@ -13,3 +13,11 @@ export async function fetchOverlays({ symbol, interval, limit }) {
   if (!response.ok) throw new Error(`Overlays request failed: ${response.status}`);
   return response.json();
 }
+
+export async function fetchAccountActivity({ symbol, limit }) {
+  const response = await fetch(
+    `/api/binance/account-activity?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+  );
+  if (!response.ok) throw new Error(`Account activity request failed: ${response.status}`);
+  return response.json();
+}

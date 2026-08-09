@@ -133,10 +133,10 @@
         <section class="positions-panel" aria-label="Binance positions">
           <div class="positions-head">
             <div class="positions-tabs">
-              <button class="positions-tab active" type="button">Positions<span id="positions-count">0</span></button>
-              <button class="positions-tab" type="button" disabled>Open Orders<span>-</span></button>
-              <button class="positions-tab" type="button" disabled>Order History</button>
-              <button class="positions-tab" type="button" disabled>Trade History</button>
+              <button class="positions-tab active" type="button" data-account-tab="positions">Positions<span id="positions-count">0</span></button>
+              <button class="positions-tab" type="button" data-account-tab="openOrders">Open Orders<span id="open-orders-count">0</span></button>
+              <button class="positions-tab" type="button" data-account-tab="orderHistory">Order History<span id="order-history-count">0</span></button>
+              <button class="positions-tab" type="button" data-account-tab="tradeHistory">Trade History<span id="trade-history-count">0</span></button>
             </div>
             <label class="positions-filter">
               <input id="hide-other-symbols" type="checkbox" checked />
@@ -145,7 +145,7 @@
           </div>
           <div class="positions-table-wrap">
             <table class="positions-table">
-              <thead>
+              <thead id="account-table-head">
                 <tr>
                   <th>Symbol</th>
                   <th>Size</th>

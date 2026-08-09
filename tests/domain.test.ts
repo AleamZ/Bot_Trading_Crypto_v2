@@ -5,7 +5,7 @@ import { calculateEntryPlan } from "../src/domain/entry/EntryCalculator.js";
 import { detectM5StructureSignal } from "../src/domain/market-structure/StructureDetector.js";
 import { evaluateRisk } from "../src/domain/risk/RiskManager.js";
 import { transitionSetupState } from "../src/domain/setup/SetupStateMachine.js";
-import { LiquidityManager, buildLiquidityState } from "../src/domain/liquidity/LiquidityDetector.js";
+import { LiquidityManager, buildLiquidityState, selectExternalLiquidityTarget } from "../src/domain/liquidity/LiquidityDetector.js";
 
 describe("FVG rules", () => {
   it("detects bullish H1 FVG from three closed candles", () => {
@@ -199,6 +199,20 @@ describe("liquidity state", () => {
     expect(levels.find((level) => level.id === first.id)?.isPrimary).toBe(false);
     expect(levels.find((level) => level.id === second.id)?.isPrimary).toBe(true);
     expect(manager.render().sweeps).toHaveLength(1);
+  });
+
+  it("selects the nearest external liquidity beyond the entry price", () => {
+    const swings = [
+      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "high" as const, candleOpenTime: 1, price: 100 },
+      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "high" as const, candleOpenTime: 2, price: 130 },
+      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "high" as const, candleOpenTime: 3, price: 120 },
+      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "low" as const, candleOpenTime: 4, price: 90 },
+      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "low" as const, candleOpenTime: 5, price: 70 },
+      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "low" as const, candleOpenTime: 6, price: 80 }
+    ];
+
+    expect(selectExternalLiquidityTarget(swings, "bullish", 110)?.price).toBe(120);
+    expect(selectExternalLiquidityTarget(swings, "bearish", 85)?.price).toBe(80);
   });
 });
 

@@ -12,7 +12,7 @@ import type { MarketStructureSignal } from "../../domain/market-structure/Market
 import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
 import { detectSwings } from "../../domain/market-structure/Swing.js";
 import { selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
-import { calculateEntryPlan, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
+import { calculateEntryPlan, calculateFvgEntry, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import { evaluateRisk } from "../../domain/risk/RiskManager.js";
 import { transitionSetupState, type SetupState } from "../../domain/setup/SetupStateMachine.js";
@@ -332,7 +332,8 @@ export class TradingEngine {
 
   private calculatePlanForLtfFvg(ltfFvg: Fvg): EntryPlan | null {
     const h1Swings = detectSwings(this.state.h1Candles, { left: this.config.swingLeft, right: this.config.swingRight });
-    const externalLiquidity = selectExternalLiquidityTarget(h1Swings, ltfFvg.direction);
+    const entry = calculateFvgEntry(ltfFvg, this.config.ltfFvgEntryMode);
+    const externalLiquidity = selectExternalLiquidityTarget(h1Swings, ltfFvg.direction, entry);
     return calculateEntryPlan({
       direction: ltfFvg.direction,
       ltfFvg,

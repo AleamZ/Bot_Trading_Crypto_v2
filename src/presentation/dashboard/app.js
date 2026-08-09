@@ -256,7 +256,6 @@ async function loadAnalysis() {
 
 function renderAnalysis(analysis) {
   const conditions = analysis.conditions ?? [];
-  const passed = conditions.filter((condition) => condition.status === "pass").length;
   $("analysis-status").textContent = `${analysis.symbol ?? "-"} · ${conditions.length} conditions checked`;
   $("analysis-symbol-label").textContent = analysis.symbol ?? "-";
   $("analysis-checked-at").textContent = analysis.checkedAt ? new Date(analysis.checkedAt).toLocaleString() : "-";
@@ -265,11 +264,11 @@ function renderAnalysis(analysis) {
     analysis.trend?.ema !== null && analysis.trend?.ema !== undefined
       ? `Close ${formatPrice(analysis.trend.close)} · EMA ${formatPrice(analysis.trend.ema)}`
       : analysis.trend?.reason ?? "-";
-  $("analysis-summary-text").textContent = analysis.summary ?? "-";
+  $("analysis-summary-text").textContent = analysis.setupStatus ?? analysis.summary ?? "-";
   $("analysis-plan").textContent = analysis.plan
     ? `Entry ${formatPrice(analysis.plan.entry)} · SL ${formatPrice(analysis.plan.stopLoss)} · TP ${formatPrice(analysis.plan.takeProfit)} · RR ${formatRatio(analysis.plan.riskReward)}`
-    : "No entry plan";
-  $("analysis-condition-count").textContent = `${passed} / ${conditions.length} passed`;
+    : analysis.summary ?? "No entry plan";
+  $("analysis-condition-count").textContent = analysis.setupStatus ?? "SETUP STATUS";
 
   $("analysis-conditions").replaceChildren(
     ...conditions.map((condition, index) => {
@@ -278,16 +277,22 @@ function renderAnalysis(analysis) {
       const body = document.createElement("div");
       const title = document.createElement("strong");
       const detail = document.createElement("small");
-      item.className = `condition-item ${condition.status}`;
+      item.className = `condition-item ${analysisStatusClass(condition.status)}`;
       mark.className = "condition-mark";
-      mark.textContent = condition.status === "pass" ? "✓" : condition.status === "fail" ? "×" : "...";
+      mark.textContent = condition.status === "PASSED" ? "✓" : condition.status === "INVALIDATED" ? "×" : "⏳";
       title.textContent = `${index + 1}. ${condition.label}`;
-      detail.textContent = condition.detail ?? "-";
+      detail.textContent = `${condition.status ?? "WAITING"} · ${condition.detail ?? "-"}`;
       body.append(title, detail);
       item.append(mark, body);
       return item;
     }),
   );
+}
+
+function analysisStatusClass(status) {
+  if (status === "PASSED") return "pass";
+  if (status === "INVALIDATED") return "invalidated";
+  return "waiting";
 }
 
 function loadSettings() {

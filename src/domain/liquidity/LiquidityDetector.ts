@@ -147,10 +147,11 @@ export function buildLiquidityState(
 
 export function selectExternalLiquidityTarget(
   swings: readonly SwingPoint[],
-  tradeDirection: Direction
+  tradeDirection: Direction,
+  referencePrice?: number
 ): LiquidityLevel | null {
   const type: LiquidityType = tradeDirection === "bullish" ? "BSL" : "SSL";
-  const queue = swings
+  const levels = swings
     .filter((swing) => (type === "BSL" ? swing.kind === "high" : swing.kind === "low"))
     .map((swing, index): LiquidityLevel => ({
       id: `${swing.symbol}:${swing.timeframe}:liq:${type}:${swing.candleOpenTime}:${swing.price}`,
@@ -164,6 +165,13 @@ export function selectExternalLiquidityTarget(
       isInternal: false,
       children: []
     }));
+
+  const queue =
+    referencePrice !== undefined
+      ? levels
+          .filter((level) => (tradeDirection === "bullish" ? level.price > referencePrice : level.price < referencePrice))
+          .sort((a, b) => (tradeDirection === "bullish" ? a.price - b.price : b.price - a.price))
+      : levels;
 
   return queue[0] ?? null;
 }

@@ -395,12 +395,14 @@ small {
   color: #ffffff;
 }
 
-.condition-item.fail {
+.condition-item.fail,
+.condition-item.invalidated {
   border-color: #fecaca;
   background: #fff5f5;
 }
 
-.condition-item.fail .condition-mark {
+.condition-item.fail .condition-mark,
+.condition-item.invalidated .condition-mark {
   background: #dc2626;
   color: #ffffff;
 }

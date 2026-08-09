@@ -15,8 +15,17 @@ import {
 } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
 import { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
 import { ema } from "../../domain/trend/Ema.js";
+import { detectH1Trend } from "../../domain/trend/TrendDetector.js";
+import { calculateEntryPlan, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
+import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgMitigated } from "../../domain/fvg/FvgDetector.js";
+import type { Fvg, FvgMitigationMode } from "../../domain/fvg/Fvg.js";
 import { buildLiquidityState } from "../../domain/liquidity/LiquidityDetector.js";
+import { selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
+import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
+import { detectSwings } from "../../domain/market-structure/Swing.js";
+import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
+import type { Direction } from "../../domain/trade/Direction.js";
 
 const contentTypes: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -76,6 +85,14 @@ export function startHttpServer(params: {
         const activity = await getAccountActivity(accountClient, query.symbol, query.limit, params.logger);
         response.writeHead(200, noCacheHeaders("application/json"));
         response.end(JSON.stringify({ symbol: query.symbol, limit: query.limit, ...activity }));
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/analysis") {
+        const query = parseAccountActivityQuery(requestUrl, params.config.symbol);
+        const analysis = await buildSymbolAnalysis(query.symbol, params.config, marketData);
+        response.writeHead(200, noCacheHeaders("application/json"));
+        response.end(JSON.stringify(analysis));
         return;
       }
 
@@ -268,6 +285,235 @@ async function buildChartOverlays(params: {
     trades: [],
     positions: [...positions.values()]
   };
+}
+
+type AnalysisStatus = "pass" | "fail" | "waiting";
+
+interface AnalysisCondition {
+  id: string;
+  label: string;
+  status: AnalysisStatus;
+  detail: string;
+}
+
+async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData: BinanceFuturesMarketData): Promise<{
+  symbol: string;
+  checkedAt: string;
+  trend: {
+    direction: Direction | "neutral";
+    ema: number | null;
+    close: number | null;
+    reason: string;
+  };
+  summary: string;
+  conditions: AnalysisCondition[];
+  plan: EntryPlan | null;
+}> {
+  const [h1Candles, m5Candles] = await Promise.all([
+    marketData.getClosedCandles(symbol, "H1", Math.max(config.emaPeriod + 80, 160)),
+    marketData.getClosedCandles(symbol, "M5", 360)
+  ]);
+  const trend = detectH1Trend(h1Candles, config.emaPeriod);
+  const direction = trend.direction === "neutral" ? null : trend.direction;
+  const htfFvgState = direction ? findLatestFvgState(h1Candles, direction, "H1", config.fvgMitigation) : null;
+  const signal = direction && htfFvgState?.status === "mitigated" ? findStructureSignalAfter(m5Candles, direction, htfFvgState.activatedAt, config) : null;
+  const ltfFvgState =
+    direction && signal ? findLatestLtfFvgState(m5Candles, direction, signal.candleOpenTime, config.ltfFvgEntryMode) : null;
+  const plan =
+    direction && ltfFvgState?.status === "mitigated"
+      ? calculateAnalysisEntryPlan(direction, ltfFvgState.fvg, h1Candles, m5Candles, config)
+      : null;
+
+  const conditions: AnalysisCondition[] = [
+    {
+      id: "h1-trend",
+      label: "EMA Trend H1",
+      status: direction ? "pass" : "waiting",
+      detail: trend.reason
+    },
+    {
+      id: "htf-fvg",
+      label: "HTF FVG H1 cùng hướng trend",
+      status: !direction ? "waiting" : htfFvgState ? "pass" : "waiting",
+      detail: htfFvgState ? describeFvg(htfFvgState.fvg) : "Đang chờ H1 tạo FVG hợp lệ cùng trend"
+    },
+    {
+      id: "htf-fvg-mitigated",
+      label: `HTF FVG mitigated (${config.fvgMitigation})`,
+      status: fvgStateToConditionStatus(htfFvgState),
+      detail: htfFvgState ? describeFvgState(htfFvgState) : "Chưa có HTF FVG để kiểm tra mitigation"
+    },
+    {
+      id: "m5-structure",
+      label: "M5 BOS/CHOCH close phá swing",
+      status: !htfFvgState || htfFvgState.status !== "mitigated" ? "waiting" : signal ? "pass" : "waiting",
+      detail: signal ? `${signal.type} ${signal.direction} tại close ${formatServerPrice(signal.close)}` : "Đang chờ M5 close phá swing sau khi HTF FVG mitigated"
+    },
+    {
+      id: "m5-fvg",
+      label: "M5 FVG mới sau BOS/CHOCH cùng hướng",
+      status: !signal ? "waiting" : ltfFvgState ? "pass" : "waiting",
+      detail: ltfFvgState ? describeFvg(ltfFvgState.fvg) : "Đang chờ M5 tạo FVG mới sau tín hiệu structure"
+    },
+    {
+      id: "m5-fvg-mitigated",
+      label: `M5 FVG pullback mitigated (${config.ltfFvgEntryMode})`,
+      status: fvgStateToConditionStatus(ltfFvgState),
+      detail: ltfFvgState ? describeFvgState(ltfFvgState) : "Chưa có M5 FVG để kiểm tra pullback"
+    },
+    {
+      id: "entry-plan",
+      label: "Tính entry / SL / TP hợp lệ",
+      status: !ltfFvgState || ltfFvgState.status !== "mitigated" ? "waiting" : plan ? "pass" : "fail",
+      detail: plan
+        ? `Entry ${formatServerPrice(plan.entry)} · SL ${formatServerPrice(plan.stopLoss)} · TP ${formatServerPrice(plan.takeProfit)} · RR ${formatServerPrice(plan.riskReward)}`
+        : "Chưa đủ dữ liệu hoặc TP/SL không hợp lệ"
+    }
+  ];
+
+  return {
+    symbol,
+    checkedAt: new Date().toISOString(),
+    trend: {
+      direction: trend.direction,
+      ema: Number.isFinite(trend.ema) ? trend.ema : null,
+      close: Number.isFinite(trend.close) ? trend.close : null,
+      reason: trend.reason
+    },
+    summary: buildAnalysisSummary(conditions, trend.direction),
+    conditions,
+    plan
+  };
+}
+
+function calculateAnalysisEntryPlan(
+  direction: Direction,
+  ltfFvg: Fvg,
+  h1Candles: readonly Candle[],
+  m5Candles: readonly Candle[],
+  config: AppConfig
+): EntryPlan | null {
+  const h1Swings = detectSwings(h1Candles, { left: config.swingLeft, right: config.swingRight });
+  const externalLiquidity = selectExternalLiquidityTarget(h1Swings, direction);
+  return calculateEntryPlan({
+    direction,
+    ltfFvg,
+    m5Candles,
+    externalLiquidityPrice: externalLiquidity?.price ?? null,
+    config: {
+      entryFvgMitigation: config.ltfFvgEntryMode,
+      takeProfitMode: config.takeProfitMode,
+      fixedRr: config.fixedRr,
+      stopLossBufferMode: config.stopLossBufferMode,
+      stopLossBufferTicks: config.stopLossBufferTicks,
+      stopLossBufferPercent: config.stopLossBufferPercent,
+      stopLossAtrPeriod: config.stopLossAtrPeriod,
+      stopLossAtrMultiplier: config.stopLossAtrMultiplier,
+      priceTickSize: config.priceTickSize
+    }
+  });
+}
+
+function findLatestFvgState(
+  candles: readonly Candle[],
+  direction: Direction,
+  timeframe: "H1",
+  mitigationMode: FvgMitigationMode
+): { fvg: Fvg; status: "waiting" | "mitigated" | "invalidated"; activatedAt?: number; invalidatedAt?: number } | null {
+  for (let end = candles.length; end >= 3; end -= 1) {
+    const fvg = detectLatestHtfFvg(candles.slice(0, end), direction);
+    if (!fvg || fvg.timeframe !== timeframe) continue;
+    const state = evaluateFvgProgress(fvg, candles.filter((candle) => candle.openTime > fvg.thirdCandleOpenTime), mitigationMode);
+    if (state.status !== "invalidated") return state;
+  }
+  return null;
+}
+
+function findLatestLtfFvgState(
+  candles: readonly Candle[],
+  direction: Direction,
+  afterOpenTime: number,
+  mitigationMode: FvgMitigationMode
+): { fvg: Fvg; status: "waiting" | "mitigated" | "invalidated"; activatedAt?: number; invalidatedAt?: number } | null {
+  for (let end = candles.length; end >= 3; end -= 1) {
+    const fvg = detectLatestLtfFvg(candles.slice(0, end), direction, afterOpenTime);
+    if (!fvg) continue;
+    const state = evaluateFvgProgress(fvg, candles.filter((candle) => candle.openTime > fvg.thirdCandleOpenTime), mitigationMode);
+    if (state.status !== "invalidated") return state;
+  }
+  return null;
+}
+
+function evaluateFvgProgress(
+  fvg: Fvg,
+  futureCandles: readonly Candle[],
+  mitigationMode: FvgMitigationMode
+): { fvg: Fvg; status: "waiting" | "mitigated" | "invalidated"; activatedAt?: number; invalidatedAt?: number } {
+  for (const candle of futureCandles) {
+    if (isFvgInvalidated(fvg, candle)) {
+      return { fvg, status: "invalidated", invalidatedAt: candle.closeTime };
+    }
+    if (isFvgMitigated(fvg, candle, mitigationMode)) {
+      return { fvg, status: "mitigated", activatedAt: candle.closeTime };
+    }
+  }
+
+  return { fvg, status: "waiting" };
+}
+
+function findStructureSignalAfter(
+  candles: readonly Candle[],
+  direction: Direction,
+  afterTime: number | undefined,
+  config: AppConfig
+): MarketStructureSignal | null {
+  if (afterTime === undefined) return null;
+  for (let end = 1; end <= candles.length; end += 1) {
+    const latest = candles[end - 1];
+    if (!latest || latest.closeTime < afterTime) continue;
+    const signal = detectM5StructureSignal(candles.slice(0, end), direction, {
+      left: config.swingLeft,
+      right: config.swingRight
+    });
+    if (signal?.direction === direction) return signal;
+  }
+  return null;
+}
+
+function fvgStateToConditionStatus(
+  state: { status: "waiting" | "mitigated" | "invalidated" } | null
+): AnalysisStatus {
+  if (!state) return "waiting";
+  if (state.status === "mitigated") return "pass";
+  if (state.status === "invalidated") return "fail";
+  return "waiting";
+}
+
+function describeFvg(fvg: Fvg): string {
+  return `${fvg.direction} ${fvg.timeframe} · ${formatServerPrice(fvg.lower)} - ${formatServerPrice(fvg.upper)} · CE ${formatServerPrice(fvg.midpoint)}`;
+}
+
+function describeFvgState(state: { fvg: Fvg; status: "waiting" | "mitigated" | "invalidated"; activatedAt?: number; invalidatedAt?: number }): string {
+  if (state.status === "mitigated") return `Đã mitigated tại ${formatServerDate(state.activatedAt)} · ${describeFvg(state.fvg)}`;
+  if (state.status === "invalidated") return `Đã invalidated tại ${formatServerDate(state.invalidatedAt)} · ${describeFvg(state.fvg)}`;
+  return `Đang chờ price quay lại FVG · ${describeFvg(state.fvg)}`;
+}
+
+function buildAnalysisSummary(conditions: readonly AnalysisCondition[], trend: Direction | "neutral"): string {
+  const failed = conditions.find((condition) => condition.status === "fail");
+  if (failed) return `Trend ${trend}; setup chưa hợp lệ vì ${failed.label}.`;
+  const waiting = conditions.find((condition) => condition.status === "waiting");
+  if (waiting) return `Trend ${trend}; đang chờ ${waiting.label}.`;
+  return `Trend ${trend}; toàn bộ điều kiện vào lệnh đã đạt.`;
+}
+
+function formatServerPrice(value: number): string {
+  return Number(value).toLocaleString("en-US", { maximumFractionDigits: 6 });
+}
+
+function formatServerDate(value: number | undefined): string {
+  if (!value) return "-";
+  return new Date(value).toISOString();
 }
 
 function buildPositionOverlays(params: {

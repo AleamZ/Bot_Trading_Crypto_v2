@@ -16,6 +16,7 @@ const settingsState = { ...defaultSettings };
 
 $("home-nav").addEventListener("click", () => showView("home"));
 $("chart-nav").addEventListener("click", () => showView("chart"));
+$("analysis-nav").addEventListener("click", () => showView("analysis"));
 $("settings-nav").addEventListener("click", () => showView("settings"));
 window.addEventListener("resize", () => resizeChart());
 
@@ -153,6 +154,10 @@ $("refresh").addEventListener("click", load);
 $("chart-refresh").addEventListener("click", loadChart);
 $("chart-symbol").addEventListener("change", loadChart);
 $("chart-interval").addEventListener("change", loadChart);
+$("analysis-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadAnalysis();
+});
 $("settings-save").addEventListener("click", saveSettings);
 $("settings-reset").addEventListener("click", resetSettings);
 $("setting-size").addEventListener("input", updateSettingFromInput);
@@ -174,9 +179,11 @@ load();
 function showView(view) {
   $("home-view").classList.toggle("active", view === "home");
   $("chart-view").classList.toggle("active", view === "chart");
+  $("analysis-view").classList.toggle("active", view === "analysis");
   $("settings-view").classList.toggle("active", view === "settings");
   $("home-nav").classList.toggle("active", view === "home");
   $("chart-nav").classList.toggle("active", view === "chart");
+  $("analysis-nav").classList.toggle("active", view === "analysis");
   $("settings-nav").classList.toggle("active", view === "settings");
 
   if (view === "chart") {
@@ -186,6 +193,12 @@ function showView(view) {
   } else if (chartState.timer) {
     clearInterval(chartState.timer);
     chartState.timer = null;
+  }
+
+  if (view === "analysis") {
+    const chartSymbol = $("chart-symbol").value.trim().toUpperCase();
+    if (chartSymbol) $("analysis-symbol").value = chartSymbol;
+    loadAnalysis();
   }
 }
 
@@ -222,6 +235,59 @@ async function loadChart() {
 
 function resizeChart() {
   chartState.instance?.resize();
+}
+
+async function loadAnalysis() {
+  const symbol = $("analysis-symbol").value.trim().toUpperCase() || "BTCUSDT";
+  $("analysis-symbol").value = symbol;
+  $("analysis-status").textContent = `Analyzing ${symbol}`;
+  $("analysis-run").disabled = true;
+
+  try {
+    const response = await fetch(`/api/analysis?symbol=${encodeURIComponent(symbol)}`);
+    if (!response.ok) throw new Error(`Analysis request failed: ${response.status}`);
+    renderAnalysis(await response.json());
+  } catch (error) {
+    $("analysis-status").textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    $("analysis-run").disabled = false;
+  }
+}
+
+function renderAnalysis(analysis) {
+  const conditions = analysis.conditions ?? [];
+  const passed = conditions.filter((condition) => condition.status === "pass").length;
+  $("analysis-status").textContent = `${analysis.symbol ?? "-"} · ${conditions.length} conditions checked`;
+  $("analysis-symbol-label").textContent = analysis.symbol ?? "-";
+  $("analysis-checked-at").textContent = analysis.checkedAt ? new Date(analysis.checkedAt).toLocaleString() : "-";
+  $("analysis-trend").textContent = analysis.trend?.direction ?? "-";
+  $("analysis-trend-detail").textContent =
+    analysis.trend?.ema !== null && analysis.trend?.ema !== undefined
+      ? `Close ${formatPrice(analysis.trend.close)} · EMA ${formatPrice(analysis.trend.ema)}`
+      : analysis.trend?.reason ?? "-";
+  $("analysis-summary-text").textContent = analysis.summary ?? "-";
+  $("analysis-plan").textContent = analysis.plan
+    ? `Entry ${formatPrice(analysis.plan.entry)} · SL ${formatPrice(analysis.plan.stopLoss)} · TP ${formatPrice(analysis.plan.takeProfit)} · RR ${formatRatio(analysis.plan.riskReward)}`
+    : "No entry plan";
+  $("analysis-condition-count").textContent = `${passed} / ${conditions.length} passed`;
+
+  $("analysis-conditions").replaceChildren(
+    ...conditions.map((condition, index) => {
+      const item = document.createElement("li");
+      const mark = document.createElement("span");
+      const body = document.createElement("div");
+      const title = document.createElement("strong");
+      const detail = document.createElement("small");
+      item.className = `condition-item ${condition.status}`;
+      mark.className = "condition-mark";
+      mark.textContent = condition.status === "pass" ? "✓" : condition.status === "fail" ? "×" : "...";
+      title.textContent = `${index + 1}. ${condition.label}`;
+      detail.textContent = condition.detail ?? "-";
+      body.append(title, detail);
+      item.append(mark, body);
+      return item;
+    }),
+  );
 }
 
 function loadSettings() {

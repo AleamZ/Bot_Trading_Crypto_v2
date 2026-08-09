@@ -12,6 +12,7 @@
       <nav class="nav-tabs" aria-label="Main navigation">
         <button class="nav-tab active" id="home-nav" type="button">Home</button>
         <button class="nav-tab" id="chart-nav" type="button">Chart</button>
+        <button class="nav-tab" id="analysis-nav" type="button">Analysis</button>
         <button class="nav-tab" id="settings-nav" type="button">Setting</button>
       </nav>
     </header>
@@ -165,6 +166,53 @@
               </tbody>
             </table>
           </div>
+        </section>
+      </section>
+
+      <section class="view" id="analysis-view">
+        <section class="analysis-toolbar">
+          <div>
+            <h1>Analysis</h1>
+            <p id="analysis-status">Enter a futures symbol to check the SMC workflow</p>
+          </div>
+          <form class="analysis-search" id="analysis-form">
+            <input id="analysis-symbol" value="BTCUSDT" aria-label="Analysis symbol" placeholder="BTCUSDT" />
+            <button id="analysis-run" type="submit">Analyze</button>
+          </form>
+        </section>
+
+        <section class="analysis-summary">
+          <article class="analysis-card">
+            <span>Symbol</span>
+            <strong id="analysis-symbol-label">-</strong>
+            <small id="analysis-checked-at">-</small>
+          </article>
+          <article class="analysis-card">
+            <span>Trend</span>
+            <strong id="analysis-trend">-</strong>
+            <small id="analysis-trend-detail">-</small>
+          </article>
+          <article class="analysis-card wide">
+            <span>Setup Summary</span>
+            <strong id="analysis-summary-text">Waiting</strong>
+            <small id="analysis-plan">No entry plan</small>
+          </article>
+        </section>
+
+        <section class="analysis-panel">
+          <div class="panel-head">
+            <h2>Entry Conditions</h2>
+            <span id="analysis-condition-count">0 / 0 passed</span>
+          </div>
+          <ol class="condition-list" id="analysis-conditions">
+            <li class="condition-item waiting">
+              <span class="condition-mark">...</span>
+              <div>
+                <strong>Waiting for analysis</strong>
+                <small>Nhập đồng coin rồi bấm Analyze</small>
+              </div>
+            </li>
+          </ol>
         </section>
       </section>
 

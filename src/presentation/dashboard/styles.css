@@ -301,23 +301,128 @@ small {
 }
 
 .chart-toolbar h1,
+.analysis-toolbar h1,
 .settings-toolbar h1 {
   font-size: 30px;
 }
 
 .chart-controls,
+.analysis-search,
 .settings-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
+.analysis-toolbar,
 .settings-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 16px;
+}
+
+.analysis-search input {
+  width: 180px;
+  text-transform: uppercase;
+}
+
+.analysis-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.analysis-card {
+  min-height: 132px;
+}
+
+.analysis-card.wide strong {
+  font-size: 18px;
+  text-transform: none;
+}
+
+.analysis-panel {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.condition-list {
+  display: grid;
+  gap: 10px;
+}
+
+.condition-item {
+  min-height: 68px;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.condition-item:first-child {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.condition-mark {
+  width: 32px;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.condition-item.pass {
+  border-color: #b8e0c9;
+  background: #f0fdf4;
+}
+
+.condition-item.pass .condition-mark {
+  background: #16a34a;
+  color: #ffffff;
+}
+
+.condition-item.fail {
+  border-color: #fecaca;
+  background: #fff5f5;
+}
+
+.condition-item.fail .condition-mark {
+  background: #dc2626;
+  color: #ffffff;
+}
+
+.condition-item.waiting {
+  border-color: #e2e8f0;
+  background: #f8fafc;
+}
+
+.condition-item.waiting .condition-mark {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.condition-item strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 15px;
+}
+
+.condition-item small {
+  display: block;
 }
 
 input,
@@ -1017,15 +1122,18 @@ code {
 
   .topbar,
   .chart-toolbar,
+  .analysis-toolbar,
   .settings-toolbar,
   .status-grid,
   .grid,
+  .analysis-summary,
   .settings-grid {
     grid-template-columns: 1fr;
   }
 
   .topbar,
   .chart-toolbar,
+  .analysis-toolbar,
   .settings-toolbar {
     display: grid;
   }
@@ -1033,6 +1141,11 @@ code {
   .chart-controls {
     display: grid;
     grid-template-columns: 1fr 1fr auto;
+  }
+
+  .analysis-search {
+    display: grid;
+    grid-template-columns: 1fr auto;
   }
 
   .positions-head {

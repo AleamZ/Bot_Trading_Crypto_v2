@@ -3,6 +3,7 @@ import type { Fvg } from "../../domain/fvg/Fvg.js";
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
+import type { TradingSettings } from "../../application/config/AppConfig.js";
 import type { RepositoryStatus } from "./RepositoryStatus.js";
 
 export class MemoryTradingRepository implements TradingRepository {
@@ -10,6 +11,7 @@ export class MemoryTradingRepository implements TradingRepository {
   private readonly signals: MarketStructureSignal[] = [];
   private readonly risks: RiskDecision[] = [];
   private readonly events: DomainEvent[] = [];
+  private settings: TradingSettings | null = null;
 
   async saveFvg(fvg: Fvg): Promise<void> {
     this.fvgs.set(fvg.id, fvg);
@@ -39,6 +41,14 @@ export class MemoryTradingRepository implements TradingRepository {
     this.events.push(event);
   }
 
+  async getTradingSettings(): Promise<TradingSettings | null> {
+    return this.settings;
+  }
+
+  async saveTradingSettings(settings: TradingSettings): Promise<void> {
+    this.settings = settings;
+  }
+
   constructor(private readonly status: RepositoryStatus = {
     database: "memory",
     connected: true,
@@ -52,6 +62,7 @@ export class MemoryTradingRepository implements TradingRepository {
       currentLtfFvg: [...this.fvgs.values()].filter((fvg) => fvg.timeframe === "M5").sort((a, b) => b.createdAt - a.createdAt)[0] ?? null,
       currentSignal: this.signals.at(-1) ?? null,
       riskStatus: this.risks.at(-1) ?? null,
+      tradingSettings: this.settings,
       events: this.events.slice(-100),
       connectionStatus: this.status.database,
       databaseStatus: this.status

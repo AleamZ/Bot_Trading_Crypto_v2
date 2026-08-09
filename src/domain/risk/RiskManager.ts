@@ -7,6 +7,7 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
   const estimatedProfit = Math.abs(input.takeProfit - input.entry) * quantity;
   const riskReward = estimatedLoss > 0 ? estimatedProfit / estimatedLoss : 0;
   const baseDecision = {
+    symbol: input.symbol,
     margin: input.marginPerTrade,
     leverage: input.leverage,
     positionSize,
@@ -33,6 +34,7 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
   if (riskReward < input.minimumRiskReward) return reject("MIN_RR_NOT_MET", `Risk reward ${formatNumber(riskReward)} is below minimum ${formatNumber(input.minimumRiskReward)}`, baseDecision);
   if (!input.tradingEnabled) return reject("TRADING_DISABLED", "Trading is disabled", baseDecision);
   if (input.openPositions >= input.maxOpenPositions) return reject("MAX_OPEN_POSITIONS", "Maximum open positions reached", baseDecision);
+  if (input.symbolOpenPositions >= input.maxPositionPerSymbol) return reject("POSITION_ALREADY_OPEN", "Maximum position per symbol reached", baseDecision);
   if (input.tradesToday >= input.maxTradesPerDay) return reject("MAX_TRADES_PER_DAY", "Maximum trades per day reached", baseDecision);
   if (input.dailyRealizedLoss >= input.availableBalance * (input.dailyLossLimitPercent / 100)) return reject("DAILY_LOSS_LIMIT", "Daily realized loss limit is active", baseDecision);
   if (input.consecutiveLosses >= input.maxConsecutiveLosses) return reject("MAX_CONSECUTIVE_LOSSES", "Maximum consecutive losses reached", baseDecision);

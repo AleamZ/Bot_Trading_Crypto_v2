@@ -453,6 +453,121 @@ input {
   min-height: 130px;
 }
 
+.wide-setting {
+  grid-column: 1 / -1;
+}
+
+.watchlist-picker {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.watchlist-search-row {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.watchlist-search-row label,
+.watchlist-subhead span {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.watchlist-search-row input {
+  width: 100%;
+  text-transform: uppercase;
+}
+
+.selected-watchlist,
+.available-watchlist {
+  display: grid;
+  gap: 8px;
+}
+
+.watchlist-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.watchlist-subhead strong {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.selected-symbols {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #e5ebf3;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.symbol-chip {
+  min-height: 30px;
+  border-color: #b8d9d4;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.symbol-check-list {
+  max-height: 320px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid #e5ebf3;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.symbol-check {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  font-weight: 800;
+}
+
+.symbol-check input {
+  width: 16px;
+  min-height: 16px;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+
+.symbol-check span {
+  min-width: 0;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty-selection {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .setting-card label {
   color: var(--muted);
   font-weight: 700;
@@ -471,6 +586,10 @@ input {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #eef2f7;
+}
+
+.segmented-control.three-options {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .segmented-option {
@@ -1129,7 +1248,9 @@ code {
   .status-grid,
   .grid,
   .analysis-summary,
-  .settings-grid {
+  .settings-grid,
+  .symbol-check-list,
+  .watchlist-search-row {
     grid-template-columns: 1fr;
   }
 

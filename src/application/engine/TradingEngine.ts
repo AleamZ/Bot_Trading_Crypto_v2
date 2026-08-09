@@ -42,7 +42,7 @@ export class TradingEngine {
   private state: EngineState;
 
   constructor(
-    private readonly config: AppConfig,
+    private config: AppConfig,
     private readonly repository: TradingRepository,
     private readonly execution: ExecutionGateway,
     private readonly logger: DecisionLogger,
@@ -71,6 +71,10 @@ export class TradingEngine {
 
   getState(): Readonly<EngineState> {
     return this.state;
+  }
+
+  updateConfig(config: AppConfig): void {
+    this.config = config;
   }
 
   getDashboardState(): unknown {
@@ -273,6 +277,8 @@ export class TradingEngine {
       maxPositionSize: this.config.maxPositionSize,
       openPositions: this.state.openPositions,
       maxOpenPositions: this.config.maxOpenPositions,
+      symbolOpenPositions: this.state.openPositions,
+      maxPositionPerSymbol: this.config.maxPositionPerSymbol,
       tradesToday: this.state.tradesToday,
       maxTradesPerDay: this.config.maxTradesPerDay,
       dailyRealizedLoss: availableBalance * (this.state.dailyLossPercent / 100),

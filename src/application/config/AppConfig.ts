@@ -3,8 +3,10 @@ import { z } from "zod";
 
 const schema = z.object({
   port: z.coerce.number().int().positive().default(8787),
-  executionMode: z.enum(["testnet", "live"]).default("testnet"),
+  executionMode: z.enum(["paper", "testnet", "live"]).default("paper"),
+  logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
   symbol: z.string().default("BTCUSDT"),
+  watchlist: z.array(z.string()).default(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]),
   positionSizingMode: z.literal("fixed-margin").default("fixed-margin"),
   marginPerTrade: z.coerce.number().positive().default(200),
   leverage: z.coerce.number().positive().default(5),
@@ -13,6 +15,7 @@ const schema = z.object({
   minNotional: z.coerce.number().positive().default(5),
   maxPositionSize: z.coerce.number().positive().default(100_000),
   maxOpenPositions: z.coerce.number().int().positive().default(1),
+  maxPositionPerSymbol: z.coerce.number().int().positive().default(1),
   minimumRiskReward: z.coerce.number().positive().default(2),
   maxTradesPerDay: z.coerce.number().int().positive().default(5),
   maxDailyLossPercent: z.coerce.number().positive().default(3),
@@ -44,47 +47,95 @@ const schema = z.object({
 });
 
 export type AppConfig = z.infer<typeof schema>;
+export type TradingSettings = Omit<AppConfig, "port" | "executionMode" | "logLevel" | "databaseUrl" | "binanceApiKey" | "binanceApiSecret" | "binanceTestnet">;
+
+export const defaultTradingSettings: TradingSettings = {
+  symbol: "BTCUSDT",
+  watchlist: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+  positionSizingMode: "fixed-margin",
+  marginPerTrade: 200,
+  leverage: 5,
+  maxLeverage: 125,
+  entryMode: "market",
+  minNotional: 5,
+  maxPositionSize: 100_000,
+  maxOpenPositions: 1,
+  maxPositionPerSymbol: 1,
+  minimumRiskReward: 2,
+  maxTradesPerDay: 5,
+  maxDailyLossPercent: 3,
+  maxConsecutiveLosses: 3,
+  cooldownAfterTradeMinutes: 30,
+  maxDrawdownPercent: 10,
+  tradingEnabled: false,
+  killSwitch: false,
+  emaPeriod: 50,
+  swingLeft: 2,
+  swingRight: 2,
+  fvgMitigation: "ce",
+  ltfFvgEntryMode: "ce",
+  stopLossBufferMode: "ticks",
+  stopLossBufferTicks: 5,
+  stopLossBufferPercent: 0.1,
+  stopLossAtrPeriod: 14,
+  stopLossAtrMultiplier: 1,
+  priceTickSize: 0.1,
+  requireDisplacement: false,
+  displacementBodyMultiplier: 1.5,
+  displacementLookback: 20,
+  takeProfitMode: "external-liquidity",
+  fixedRr: 2
+};
+
+const tradingSettingsSchema = schema.omit({
+  port: true,
+  executionMode: true,
+  logLevel: true,
+  databaseUrl: true,
+  binanceApiKey: true,
+  binanceApiSecret: true,
+  binanceTestnet: true
+});
+
+export function validateTradingSettings(input: unknown): TradingSettings {
+  const parsed = tradingSettingsSchema.parse({
+    ...defaultTradingSettings,
+    ...(typeof input === "object" && input !== null ? input : {}),
+    watchlist: normalizeWatchlist((input as { watchlist?: unknown } | null)?.watchlist ?? defaultTradingSettings.watchlist)
+  });
+  if (parsed.leverage > parsed.maxLeverage) {
+    throw new Error("Leverage must be less than or equal to max leverage");
+  }
+  if (parsed.watchlist.length === 0 && parsed.tradingEnabled) {
+    throw new Error("Watchlist cannot be empty when trading is enabled");
+  }
+  return parsed;
+}
+
+export function applyTradingSettings(config: AppConfig, settings: TradingSettings): AppConfig {
+  return schema.parse({ ...config, ...settings });
+}
 
 export function loadConfig(): AppConfig {
   return schema.parse({
+    ...defaultTradingSettings,
     port: process.env.PORT,
     executionMode: process.env.EXECUTION_MODE,
-    symbol: process.env.SYMBOL,
-    positionSizingMode: process.env.POSITION_SIZING_MODE,
-    marginPerTrade: process.env.MARGIN_PER_TRADE,
-    leverage: process.env.LEVERAGE,
-    maxLeverage: process.env.MAX_LEVERAGE,
-    entryMode: process.env.ENTRY_MODE,
-    minNotional: process.env.MIN_NOTIONAL,
-    maxPositionSize: process.env.MAX_POSITION_SIZE,
-    maxOpenPositions: process.env.MAX_OPEN_POSITIONS,
-    minimumRiskReward: process.env.MINIMUM_RR,
-    maxTradesPerDay: process.env.MAX_TRADES_PER_DAY,
-    maxDailyLossPercent: process.env.MAX_DAILY_LOSS_PERCENT,
-    maxConsecutiveLosses: process.env.MAX_CONSECUTIVE_LOSSES,
-    cooldownAfterTradeMinutes: process.env.COOLDOWN_AFTER_TRADE_MINUTES,
-    maxDrawdownPercent: process.env.MAX_DRAWDOWN_PERCENT,
-    tradingEnabled: process.env.TRADING_ENABLED,
-    killSwitch: process.env.KILL_SWITCH,
-    emaPeriod: process.env.EMA_PERIOD,
-    swingLeft: process.env.SWING_LEFT,
-    swingRight: process.env.SWING_RIGHT,
-    fvgMitigation: process.env.FVG_MITIGATION,
-    ltfFvgEntryMode: process.env.LTF_FVG_ENTRY_MODE,
-    stopLossBufferMode: process.env.STOP_LOSS_BUFFER_MODE,
-    stopLossBufferTicks: process.env.STOP_LOSS_BUFFER_TICKS,
-    stopLossBufferPercent: process.env.STOP_LOSS_BUFFER_PERCENT,
-    stopLossAtrPeriod: process.env.STOP_LOSS_ATR_PERIOD,
-    stopLossAtrMultiplier: process.env.STOP_LOSS_ATR_MULTIPLIER,
-    priceTickSize: process.env.PRICE_TICK_SIZE,
-    requireDisplacement: process.env.REQUIRE_DISPLACEMENT,
-    displacementBodyMultiplier: process.env.DISPLACEMENT_BODY_MULTIPLIER,
-    displacementLookback: process.env.DISPLACEMENT_LOOKBACK,
-    takeProfitMode: process.env.TAKE_PROFIT_MODE,
-    fixedRr: process.env.FIXED_RR,
+    logLevel: process.env.LOG_LEVEL,
+    symbol: normalizeWatchlist(process.env.DEFAULT_WATCHLIST ?? defaultTradingSettings.watchlist)[0],
+    watchlist: normalizeWatchlist(process.env.DEFAULT_WATCHLIST ?? defaultTradingSettings.watchlist),
     databaseUrl: process.env.DATABASE_URL,
     binanceApiKey: process.env.BINANCE_API_KEY,
     binanceApiSecret: process.env.BINANCE_API_SECRET,
     binanceTestnet: process.env.BINANCE_TESTNET
   });
+}
+
+function normalizeWatchlist(value: unknown): string[] {
+  const source = Array.isArray(value) ? value.join(",") : String(value ?? "");
+  const parsed = source
+    .split(",")
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter((symbol) => /^[A-Z0-9]{5,20}$/.test(symbol));
+  return [...new Set(parsed)];
 }

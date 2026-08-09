@@ -8,13 +8,12 @@ type EntryMode = "limit" | "market";
 
 export class BinanceFuturesExecutionGateway implements ExecutionGateway {
   private readonly baseUrl: string;
-  private symbolRules: SymbolRules | null = null;
+  private readonly symbolRules = new Map<string, SymbolRules>();
 
   constructor(
     private readonly apiKey: string,
     private readonly apiSecret: string,
     private readonly mode: "testnet" | "live",
-    private readonly symbol: string,
     private readonly entryMode: EntryMode,
     private readonly leverage: number
   ) {
@@ -22,17 +21,18 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
   }
 
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision): Promise<SubmittedOrder> {
-    const rules = await this.getSymbolRules();
+    const symbol = risk.symbol;
+    const rules = await this.getSymbolRules(symbol);
     const quantity = formatByStep(risk.quantity, rules.stepSize);
     if (Number(quantity) <= 0) throw new Error("Rounded quantity is zero");
 
-    await this.setLeverage();
+    await this.setLeverage(symbol);
 
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
-    const entry = await this.submitEntryOrder(entrySide, quantity, formatByStep(plan.entry, rules.tickSize));
-    const stopLoss = await this.submitTriggerOrder("STOP_MARKET", exitSide, quantity, formatByStep(plan.stopLoss, rules.tickSize));
-    const takeProfit = await this.submitTriggerOrder("TAKE_PROFIT_MARKET", exitSide, quantity, formatByStep(plan.takeProfit, rules.tickSize));
+    const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatByStep(plan.entry, rules.tickSize));
+    const stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatByStep(plan.stopLoss, rules.tickSize));
+    const takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatByStep(plan.takeProfit, rules.tickSize));
 
     return {
       orderId: String(entry.orderId),
@@ -42,9 +42,9 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
     };
   }
 
-  private async submitEntryOrder(side: BinanceOrderSide, quantity: string, price: string): Promise<BinanceOrderResponse> {
+  private async submitEntryOrder(symbol: string, side: BinanceOrderSide, quantity: string, price: string): Promise<BinanceOrderResponse> {
     const params = new URLSearchParams({
-      symbol: this.symbol,
+      symbol,
       side,
       type: this.entryMode.toUpperCase(),
       quantity,
@@ -60,13 +60,14 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
   }
 
   private async submitTriggerOrder(
+    symbol: string,
     type: "STOP_MARKET" | "TAKE_PROFIT_MARKET",
     side: BinanceOrderSide,
     quantity: string,
     stopPrice: string
   ): Promise<BinanceOrderResponse> {
     const params = new URLSearchParams({
-      symbol: this.symbol,
+      symbol,
       side,
       type,
       quantity,
@@ -79,9 +80,9 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
     return this.signedPost("/fapi/v1/order", params, `Binance ${type} order failed`);
   }
 
-  private async setLeverage(): Promise<void> {
+  private async setLeverage(symbol: string): Promise<void> {
     const params = new URLSearchParams({
-      symbol: this.symbol,
+      symbol,
       leverage: String(Math.trunc(this.leverage)),
       timestamp: String(Date.now())
     });
@@ -107,25 +108,27 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
     return crypto.createHmac("sha256", this.apiSecret).update(payload).digest("hex");
   }
 
-  private async getSymbolRules(): Promise<SymbolRules> {
-    if (this.symbolRules) return this.symbolRules;
+  private async getSymbolRules(symbol: string): Promise<SymbolRules> {
+    const cached = this.symbolRules.get(symbol);
+    if (cached) return cached;
 
     const url = new URL("/fapi/v1/exchangeInfo", this.baseUrl);
-    url.searchParams.set("symbol", this.symbol);
+    url.searchParams.set("symbol", symbol);
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Binance exchangeInfo failed ${response.status}: ${await response.text()}`);
     }
 
     const body = (await response.json()) as BinanceExchangeInfo;
-    const symbolInfo = body.symbols?.find((item) => item.symbol === this.symbol);
+    const symbolInfo = body.symbols?.find((item) => item.symbol === symbol);
     const lotSize = symbolInfo?.filters.find((filter) => filter.filterType === "LOT_SIZE");
     const priceFilter = symbolInfo?.filters.find((filter) => filter.filterType === "PRICE_FILTER");
     const minNotional = symbolInfo?.filters.find((filter) => filter.filterType === "MIN_NOTIONAL");
     const stepSize = Number(lotSize?.stepSize ?? 0.001);
     const tickSize = Number(priceFilter?.tickSize ?? 0.1);
-    this.symbolRules = { stepSize, tickSize, minNotional: Number(minNotional?.notional ?? 5) };
-    return this.symbolRules;
+    const rules = { stepSize, tickSize, minNotional: Number(minNotional?.notional ?? 5) };
+    this.symbolRules.set(symbol, rules);
+    return rules;
   }
 }
 

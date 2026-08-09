@@ -20,7 +20,16 @@ export interface BinanceKline {
   closeTime: number;
 }
 
+export interface BinanceFuturesSymbol {
+  symbol: string;
+  baseAsset: string;
+  quoteAsset: string;
+  status: string;
+}
+
 export class BinanceFuturesMarketData {
+  private symbolsCache: { expiresAt: number; symbols: BinanceFuturesSymbol[] } | null = null;
+
   constructor(private readonly testnet: boolean) {}
 
   async getClosedCandles(symbol: string, timeframe: Timeframe, limit: number): Promise<Candle[]> {
@@ -57,6 +66,43 @@ export class BinanceFuturesMarketData {
     const rows = (await response.json()) as unknown[][];
     return rows.map(toKline);
   }
+
+  async getFuturesSymbols(): Promise<BinanceFuturesSymbol[]> {
+    const now = Date.now();
+    if (this.symbolsCache && this.symbolsCache.expiresAt > now) {
+      return this.symbolsCache.symbols;
+    }
+
+    const baseUrl = this.testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    const url = new URL("/fapi/v1/exchangeInfo", baseUrl);
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Binance exchangeInfo failed ${response.status}: ${await response.text()}`);
+    }
+
+    const body = (await response.json()) as BinanceExchangeInfo;
+    const symbols = (body.symbols ?? [])
+      .filter((symbol) => symbol.status === "TRADING")
+      .map((symbol) => ({
+        symbol: symbol.symbol,
+        baseAsset: symbol.baseAsset,
+        quoteAsset: symbol.quoteAsset,
+        status: symbol.status
+      }))
+      .sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+    this.symbolsCache = { expiresAt: now + 5 * 60_000, symbols };
+    return symbols;
+  }
+}
+
+interface BinanceExchangeInfo {
+  symbols?: Array<{
+    symbol: string;
+    baseAsset: string;
+    quoteAsset: string;
+    status: string;
+  }>;
 }
 
 function toKline(row: unknown[]): BinanceKline {

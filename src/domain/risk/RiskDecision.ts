@@ -15,6 +15,8 @@ export interface RiskInput {
   maxPositionSize: number;
   openPositions: number;
   maxOpenPositions: number;
+  symbolOpenPositions: number;
+  maxPositionPerSymbol: number;
   tradesToday: number;
   maxTradesPerDay: number;
   dailyRealizedLoss: number;
@@ -34,6 +36,7 @@ export interface RiskInput {
 export interface RiskDecision {
   accepted: boolean;
   reason: string;
+  symbol: string;
   margin: number;
   leverage: number;
   positionSize: number;
@@ -61,6 +64,7 @@ export type RiskRejectCode =
   | "MAX_POSITION_SIZE"
   | "MIN_RR_NOT_MET"
   | "MAX_OPEN_POSITIONS"
+  | "POSITION_ALREADY_OPEN"
   | "MAX_TRADES_PER_DAY"
   | "DAILY_LOSS_LIMIT"
   | "MAX_CONSECUTIVE_LOSSES"

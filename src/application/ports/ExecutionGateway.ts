@@ -5,7 +5,7 @@ export interface SubmittedOrder {
   orderId: string;
   stopLossOrderId?: string;
   takeProfitOrderId?: string;
-  mode: "testnet" | "live";
+  mode: "paper" | "testnet" | "live";
 }
 
 export interface ExecutionGateway {

@@ -4,6 +4,7 @@ import type { DomainEvent } from "../../domain/events/DomainEvent.js";
 import type { Fvg } from "../../domain/fvg/Fvg.js";
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
+import type { TradingSettings } from "../../application/config/AppConfig.js";
 import { MemoryTradingRepository } from "./MemoryTradingRepository.js";
 import type { RepositoryStatus } from "./RepositoryStatus.js";
 
@@ -73,6 +74,17 @@ export class PostgresTradingRepository implements TradingRepository {
     await this.memoryMirror.appendEvent(event);
     this.eventSequence += 1;
     await this.upsert(`event:${event.at}:${event.type}:${this.eventSequence}`, "event", "symbol" in event ? event.symbol : null, event);
+  }
+
+  async getTradingSettings(): Promise<TradingSettings | null> {
+    const result = await this.pool.query(`select payload from trading_records where id = 'settings:active' and kind = 'settings' limit 1`);
+    const row = result.rows[0] as { payload: TradingSettings } | undefined;
+    return row?.payload ?? null;
+  }
+
+  async saveTradingSettings(settings: TradingSettings): Promise<void> {
+    await this.memoryMirror.saveTradingSettings(settings);
+    await this.upsert("settings:active", "settings", null, settings);
   }
 
   async getDashboardSnapshot(): Promise<unknown> {

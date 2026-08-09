@@ -4,20 +4,45 @@ const chartState = {
   timer: null,
   module: null,
 };
-const settingsKey = "smc-futures-settings";
 const defaultSettings = {
-  marginPerOrder: "200",
-  orderType: "limit",
+  watchlist: "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT",
+  positionSizingMode: "fixed-margin",
+  marginPerTrade: "200",
   leverage: "5",
+  maxLeverage: "125",
+  entryMode: "market",
+  minNotional: "5",
+  maxPositionSize: "100000",
   maxOpenPositions: "1",
-  minimumRr: "2",
+  maxPositionPerSymbol: "1",
+  minimumRiskReward: "2",
   maxTradesPerDay: "5",
-  dailyLossLimit: "3",
+  maxDailyLossPercent: "3",
   maxConsecutiveLosses: "3",
-  cooldownAfterTrade: "30",
+  cooldownAfterTradeMinutes: "30",
+  maxDrawdownPercent: "10",
   tradingEnabled: "false",
+  killSwitch: "false",
+  emaPeriod: "50",
+  swingLeft: "2",
+  swingRight: "2",
+  fvgMitigation: "ce",
+  ltfFvgEntryMode: "ce",
+  stopLossBufferMode: "ticks",
+  stopLossBufferTicks: "5",
+  stopLossBufferPercent: "0.1",
+  stopLossAtrPeriod: "14",
+  stopLossAtrMultiplier: "1",
+  priceTickSize: "0.1",
+  requireDisplacement: "false",
+  displacementBodyMultiplier: "1.5",
+  displacementLookback: "20",
+  takeProfitMode: "external-liquidity",
+  fixedRr: "2",
 };
 const settingsState = { ...defaultSettings };
+let marketSymbols = [];
+let symbolSearchTerm = "";
 
 $("home-nav").addEventListener("click", () => showView("home"));
 $("chart-nav").addEventListener("click", () => showView("chart"));
@@ -26,8 +51,12 @@ $("settings-nav").addEventListener("click", () => showView("settings"));
 window.addEventListener("resize", () => resizeChart());
 
 async function load() {
-  const response = await fetch("/api/snapshot");
-  const snapshot = await response.json();
+  const [snapshotResponse, watchlistResponse] = await Promise.all([
+    fetch("/api/snapshot"),
+    fetch("/api/watchlist/status"),
+  ]);
+  const snapshot = await snapshotResponse.json();
+  const watchlist = await watchlistResponse.json();
   const engine = snapshot.engine ?? {};
   const runtime = snapshot.runtime ?? {};
   const store = snapshot.store ?? {};
@@ -113,6 +142,8 @@ async function load() {
       return item;
     }),
   );
+
+  renderWatchlist(watchlist.rows ?? []);
 }
 
 function setPill(id, text, ok) {
@@ -148,11 +179,49 @@ function formatRatio(value) {
 }
 
 function getModeDetail(mode) {
+  if (mode === "paper")
+    return "Paper trading: signals are simulated, no Binance orders are sent.";
   if (mode === "testnet")
     return "Testnet trading: orders are sent to Binance Futures Testnet.";
   if (mode === "live")
     return "Live trading: real orders are sent to Binance Futures.";
   return "-";
+}
+
+function renderWatchlist(rows) {
+  $("watchlist-count").textContent = `${rows.length} symbols`;
+  if (rows.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.className = "empty-position";
+    cell.colSpan = 7;
+    cell.textContent = "Waiting for scanner";
+    row.append(cell);
+    $("watchlist-body").replaceChildren(row);
+    return;
+  }
+
+  $("watchlist-body").replaceChildren(
+    ...rows.map((item) => {
+      const row = document.createElement("tr");
+      row.append(
+        tableCell(item.symbol),
+        tableCell(item.state),
+        tableCell(item.conditions),
+        tableCell(item.rr === null || item.rr === undefined ? "-" : formatRatio(item.rr)),
+        tableCell(item.position),
+        tableCell(item.status),
+        tableCell(item.lastScanAt ? new Date(item.lastScanAt).toLocaleTimeString() : "-"),
+      );
+      return row;
+    }),
+  );
+}
+
+function tableCell(value) {
+  const cell = document.createElement("td");
+  cell.textContent = value ?? "-";
+  return cell;
 }
 
 $("refresh").addEventListener("click", load);
@@ -166,13 +235,43 @@ $("analysis-form").addEventListener("submit", (event) => {
 $("settings-save").addEventListener("click", saveSettings);
 $("settings-reset").addEventListener("click", resetSettings);
 $("setting-margin-per-order").addEventListener("input", updateSettingFromInput);
+$("setting-symbol-search").addEventListener("input", (event) => {
+  symbolSearchTerm = event.target.value.trim().toUpperCase();
+  renderWatchlistSettings();
+});
+$("available-symbols").addEventListener("change", (event) => {
+  const checkbox = event.target.closest("[data-watchlist-symbol]");
+  if (!checkbox) return;
+  toggleWatchlistSymbol(checkbox.dataset.watchlistSymbol, checkbox.checked);
+});
+$("selected-watchlist").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-symbol]");
+  if (!button) return;
+  toggleWatchlistSymbol(button.dataset.removeSymbol, false);
+});
 $("setting-leverage").addEventListener("input", updateSettingFromInput);
+$("setting-max-leverage").addEventListener("input", updateSettingFromInput);
+$("setting-min-notional").addEventListener("input", updateSettingFromInput);
+$("setting-max-position-size").addEventListener("input", updateSettingFromInput);
 $("setting-max-open-positions").addEventListener("input", updateSettingFromInput);
+$("setting-max-position-per-symbol").addEventListener("input", updateSettingFromInput);
 $("setting-minimum-rr").addEventListener("input", updateSettingFromInput);
 $("setting-max-trades-per-day").addEventListener("input", updateSettingFromInput);
 $("setting-daily-loss-limit").addEventListener("input", updateSettingFromInput);
 $("setting-max-consecutive-losses").addEventListener("input", updateSettingFromInput);
 $("setting-cooldown").addEventListener("input", updateSettingFromInput);
+$("setting-max-drawdown").addEventListener("input", updateSettingFromInput);
+$("setting-ema-period").addEventListener("input", updateSettingFromInput);
+$("setting-swing-left").addEventListener("input", updateSettingFromInput);
+$("setting-swing-right").addEventListener("input", updateSettingFromInput);
+$("setting-sl-buffer-ticks").addEventListener("input", updateSettingFromInput);
+$("setting-sl-buffer-percent").addEventListener("input", updateSettingFromInput);
+$("setting-sl-atr-period").addEventListener("input", updateSettingFromInput);
+$("setting-sl-atr-multiplier").addEventListener("input", updateSettingFromInput);
+$("setting-price-tick-size").addEventListener("input", updateSettingFromInput);
+$("setting-displacement-body").addEventListener("input", updateSettingFromInput);
+$("setting-displacement-lookback").addEventListener("input", updateSettingFromInput);
+$("setting-fixed-rr").addEventListener("input", updateSettingFromInput);
 document.querySelectorAll("[data-setting-group]").forEach((group) => {
   group.addEventListener("click", (event) => {
     const button = event.target.closest("[data-setting-value]");
@@ -314,28 +413,49 @@ function analysisStatusClass(status) {
   return "waiting";
 }
 
-function loadSettings() {
+async function loadSettings() {
   try {
-    Object.assign(
-      settingsState,
-      defaultSettings,
-      JSON.parse(localStorage.getItem(settingsKey) ?? "{}"),
-    );
+    const [response, symbolsResponse] = await Promise.all([
+      fetch("/api/settings"),
+      fetch("/api/market/symbols"),
+    ]);
+    if (!response.ok) throw new Error(`Settings request failed: ${response.status}`);
+    if (!symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
+    marketSymbols = await symbolsResponse.json();
+    Object.assign(settingsState, defaultSettings, settingsFromApi(await response.json()));
   } catch {
     Object.assign(settingsState, defaultSettings);
+    marketSymbols = [];
   }
   renderSettings();
 }
 
 function renderSettings() {
-  $("setting-margin-per-order").value = settingsState.marginPerOrder;
+  renderWatchlistSettings();
+  $("setting-margin-per-order").value = settingsState.marginPerTrade;
   $("setting-leverage").value = settingsState.leverage;
+  $("setting-max-leverage").value = settingsState.maxLeverage;
+  $("setting-min-notional").value = settingsState.minNotional;
+  $("setting-max-position-size").value = settingsState.maxPositionSize;
   $("setting-max-open-positions").value = settingsState.maxOpenPositions;
-  $("setting-minimum-rr").value = settingsState.minimumRr;
+  $("setting-max-position-per-symbol").value = settingsState.maxPositionPerSymbol;
+  $("setting-minimum-rr").value = settingsState.minimumRiskReward;
   $("setting-max-trades-per-day").value = settingsState.maxTradesPerDay;
-  $("setting-daily-loss-limit").value = settingsState.dailyLossLimit;
+  $("setting-daily-loss-limit").value = settingsState.maxDailyLossPercent;
   $("setting-max-consecutive-losses").value = settingsState.maxConsecutiveLosses;
-  $("setting-cooldown").value = settingsState.cooldownAfterTrade;
+  $("setting-cooldown").value = settingsState.cooldownAfterTradeMinutes;
+  $("setting-max-drawdown").value = settingsState.maxDrawdownPercent;
+  $("setting-ema-period").value = settingsState.emaPeriod;
+  $("setting-swing-left").value = settingsState.swingLeft;
+  $("setting-swing-right").value = settingsState.swingRight;
+  $("setting-sl-buffer-ticks").value = settingsState.stopLossBufferTicks;
+  $("setting-sl-buffer-percent").value = settingsState.stopLossBufferPercent;
+  $("setting-sl-atr-period").value = settingsState.stopLossAtrPeriod;
+  $("setting-sl-atr-multiplier").value = settingsState.stopLossAtrMultiplier;
+  $("setting-price-tick-size").value = settingsState.priceTickSize;
+  $("setting-displacement-body").value = settingsState.displacementBodyMultiplier;
+  $("setting-displacement-lookback").value = settingsState.displacementLookback;
+  $("setting-fixed-rr").value = settingsState.fixedRr;
 
   document.querySelectorAll("[data-setting-group]").forEach((group) => {
     const value = settingsState[group.dataset.settingGroup];
@@ -347,14 +467,31 @@ function renderSettings() {
 
 function updateSettingFromInput(event) {
   const fieldById = {
-    "setting-margin-per-order": "marginPerOrder",
+    "setting-watchlist": "watchlist",
+    "setting-margin-per-order": "marginPerTrade",
     "setting-leverage": "leverage",
+    "setting-max-leverage": "maxLeverage",
+    "setting-min-notional": "minNotional",
+    "setting-max-position-size": "maxPositionSize",
     "setting-max-open-positions": "maxOpenPositions",
-    "setting-minimum-rr": "minimumRr",
+    "setting-max-position-per-symbol": "maxPositionPerSymbol",
+    "setting-minimum-rr": "minimumRiskReward",
     "setting-max-trades-per-day": "maxTradesPerDay",
-    "setting-daily-loss-limit": "dailyLossLimit",
+    "setting-daily-loss-limit": "maxDailyLossPercent",
     "setting-max-consecutive-losses": "maxConsecutiveLosses",
-    "setting-cooldown": "cooldownAfterTrade",
+    "setting-cooldown": "cooldownAfterTradeMinutes",
+    "setting-max-drawdown": "maxDrawdownPercent",
+    "setting-ema-period": "emaPeriod",
+    "setting-swing-left": "swingLeft",
+    "setting-swing-right": "swingRight",
+    "setting-sl-buffer-ticks": "stopLossBufferTicks",
+    "setting-sl-buffer-percent": "stopLossBufferPercent",
+    "setting-sl-atr-period": "stopLossAtrPeriod",
+    "setting-sl-atr-multiplier": "stopLossAtrMultiplier",
+    "setting-price-tick-size": "priceTickSize",
+    "setting-displacement-body": "displacementBodyMultiplier",
+    "setting-displacement-lookback": "displacementLookback",
+    "setting-fixed-rr": "fixedRr",
   };
   const field = fieldById[event.target.id];
   if (!field) return;
@@ -362,8 +499,20 @@ function updateSettingFromInput(event) {
   saveSettings();
 }
 
-function saveSettings() {
-  localStorage.setItem(settingsKey, JSON.stringify(settingsState));
+async function saveSettings() {
+  $("settings-status").textContent = "Saving";
+  const payload = settingsPayload();
+  const response = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    $("settings-status").textContent = `Save failed: ${response.status}`;
+    return;
+  }
+  Object.assign(settingsState, settingsFromApi(await response.json()));
+  renderSettings();
   $("settings-status").textContent = "Saved";
 }
 
@@ -371,4 +520,164 @@ function resetSettings() {
   Object.assign(settingsState, defaultSettings);
   renderSettings();
   saveSettings();
+}
+
+function settingsFromApi(settings) {
+  return {
+    ...settings,
+    watchlist: Array.isArray(settings.watchlist) ? settings.watchlist.join(",") : String(settings.watchlist ?? defaultSettings.watchlist),
+    positionSizingMode: String(settings.positionSizingMode ?? defaultSettings.positionSizingMode),
+    marginPerTrade: String(settings.marginPerTrade ?? defaultSettings.marginPerTrade),
+    leverage: String(settings.leverage ?? defaultSettings.leverage),
+    maxLeverage: String(settings.maxLeverage ?? defaultSettings.maxLeverage),
+    entryMode: String(settings.entryMode ?? defaultSettings.entryMode),
+    minNotional: String(settings.minNotional ?? defaultSettings.minNotional),
+    maxPositionSize: String(settings.maxPositionSize ?? defaultSettings.maxPositionSize),
+    maxOpenPositions: String(settings.maxOpenPositions ?? defaultSettings.maxOpenPositions),
+    maxPositionPerSymbol: String(settings.maxPositionPerSymbol ?? defaultSettings.maxPositionPerSymbol),
+    minimumRiskReward: String(settings.minimumRiskReward ?? defaultSettings.minimumRiskReward),
+    maxTradesPerDay: String(settings.maxTradesPerDay ?? defaultSettings.maxTradesPerDay),
+    maxDailyLossPercent: String(settings.maxDailyLossPercent ?? defaultSettings.maxDailyLossPercent),
+    maxConsecutiveLosses: String(settings.maxConsecutiveLosses ?? defaultSettings.maxConsecutiveLosses),
+    cooldownAfterTradeMinutes: String(settings.cooldownAfterTradeMinutes ?? defaultSettings.cooldownAfterTradeMinutes),
+    maxDrawdownPercent: String(settings.maxDrawdownPercent ?? defaultSettings.maxDrawdownPercent),
+    tradingEnabled: String(settings.tradingEnabled ?? "false"),
+    killSwitch: String(settings.killSwitch ?? "false"),
+    emaPeriod: String(settings.emaPeriod ?? defaultSettings.emaPeriod),
+    swingLeft: String(settings.swingLeft ?? defaultSettings.swingLeft),
+    swingRight: String(settings.swingRight ?? defaultSettings.swingRight),
+    fvgMitigation: String(settings.fvgMitigation ?? defaultSettings.fvgMitigation),
+    ltfFvgEntryMode: String(settings.ltfFvgEntryMode ?? defaultSettings.ltfFvgEntryMode),
+    stopLossBufferMode: String(settings.stopLossBufferMode ?? defaultSettings.stopLossBufferMode),
+    stopLossBufferTicks: String(settings.stopLossBufferTicks ?? defaultSettings.stopLossBufferTicks),
+    stopLossBufferPercent: String(settings.stopLossBufferPercent ?? defaultSettings.stopLossBufferPercent),
+    stopLossAtrPeriod: String(settings.stopLossAtrPeriod ?? defaultSettings.stopLossAtrPeriod),
+    stopLossAtrMultiplier: String(settings.stopLossAtrMultiplier ?? defaultSettings.stopLossAtrMultiplier),
+    priceTickSize: String(settings.priceTickSize ?? defaultSettings.priceTickSize),
+    requireDisplacement: String(settings.requireDisplacement ?? "false"),
+    displacementBodyMultiplier: String(settings.displacementBodyMultiplier ?? defaultSettings.displacementBodyMultiplier),
+    displacementLookback: String(settings.displacementLookback ?? defaultSettings.displacementLookback),
+    takeProfitMode: String(settings.takeProfitMode ?? defaultSettings.takeProfitMode),
+    fixedRr: String(settings.fixedRr ?? defaultSettings.fixedRr),
+  };
+}
+
+function settingsPayload() {
+  const watchlist = getSelectedWatchlist();
+  return {
+    watchlist,
+    symbol: watchlist[0] ?? "BTCUSDT",
+    positionSizingMode: settingsState.positionSizingMode,
+    marginPerTrade: Number(settingsState.marginPerTrade),
+    leverage: Number(settingsState.leverage),
+    maxLeverage: Number(settingsState.maxLeverage),
+    entryMode: settingsState.entryMode,
+    minNotional: Number(settingsState.minNotional),
+    maxPositionSize: Number(settingsState.maxPositionSize),
+    maxOpenPositions: Number(settingsState.maxOpenPositions),
+    maxPositionPerSymbol: Number(settingsState.maxPositionPerSymbol),
+    minimumRiskReward: Number(settingsState.minimumRiskReward),
+    maxTradesPerDay: Number(settingsState.maxTradesPerDay),
+    maxDailyLossPercent: Number(settingsState.maxDailyLossPercent),
+    maxConsecutiveLosses: Number(settingsState.maxConsecutiveLosses),
+    cooldownAfterTradeMinutes: Number(settingsState.cooldownAfterTradeMinutes),
+    maxDrawdownPercent: Number(settingsState.maxDrawdownPercent),
+    tradingEnabled: settingsState.tradingEnabled === "true",
+    killSwitch: settingsState.killSwitch === "true",
+    emaPeriod: Number(settingsState.emaPeriod),
+    swingLeft: Number(settingsState.swingLeft),
+    swingRight: Number(settingsState.swingRight),
+    fvgMitigation: settingsState.fvgMitigation,
+    ltfFvgEntryMode: settingsState.ltfFvgEntryMode,
+    stopLossBufferMode: settingsState.stopLossBufferMode,
+    stopLossBufferTicks: Number(settingsState.stopLossBufferTicks),
+    stopLossBufferPercent: Number(settingsState.stopLossBufferPercent),
+    stopLossAtrPeriod: Number(settingsState.stopLossAtrPeriod),
+    stopLossAtrMultiplier: Number(settingsState.stopLossAtrMultiplier),
+    priceTickSize: Number(settingsState.priceTickSize),
+    requireDisplacement: settingsState.requireDisplacement === "true",
+    displacementBodyMultiplier: Number(settingsState.displacementBodyMultiplier),
+    displacementLookback: Number(settingsState.displacementLookback),
+    takeProfitMode: settingsState.takeProfitMode,
+    fixedRr: Number(settingsState.fixedRr),
+  };
+}
+
+function renderWatchlistSettings() {
+  const selected = getSelectedWatchlist();
+  $("selected-watchlist-count").textContent = `${selected.length} selected`;
+  $("available-watchlist-count").textContent = marketSymbols.length > 0 ? `${marketSymbols.length} symbols` : "Unavailable";
+
+  if (selected.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "empty-selection";
+    empty.textContent = "No symbols selected";
+    $("selected-watchlist").replaceChildren(empty);
+  } else {
+    $("selected-watchlist").replaceChildren(
+      ...selected.map((symbol) => {
+        const chip = document.createElement("button");
+        chip.className = "symbol-chip";
+        chip.type = "button";
+        chip.dataset.removeSymbol = symbol;
+        chip.textContent = `${symbol} ×`;
+        return chip;
+      }),
+    );
+  }
+
+  const filtered = filterAvailableSymbols();
+  if (filtered.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "empty-selection";
+    empty.textContent = marketSymbols.length === 0 ? "Could not load Binance Futures symbols" : "No matching symbols";
+    $("available-symbols").replaceChildren(empty);
+    return;
+  }
+
+  const selectedSet = new Set(selected);
+  $("available-symbols").replaceChildren(
+    ...filtered.map((item) => {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      const text = document.createElement("span");
+      label.className = "symbol-check";
+      checkbox.type = "checkbox";
+      checkbox.checked = selectedSet.has(item.symbol);
+      checkbox.dataset.watchlistSymbol = item.symbol;
+      text.textContent = `${item.symbol} · ${item.baseAsset}/${item.quoteAsset}`;
+      label.append(checkbox, text);
+      return label;
+    }),
+  );
+}
+
+function filterAvailableSymbols() {
+  const term = symbolSearchTerm;
+  const source = marketSymbols.length > 0 ? marketSymbols : getSelectedWatchlist().map((symbol) => ({ symbol, baseAsset: symbol.replace(/USDT$/, ""), quoteAsset: "USDT" }));
+  return source
+    .filter((item) => !term || item.symbol.includes(term) || item.baseAsset?.includes(term))
+    .slice(0, 120);
+}
+
+function getSelectedWatchlist() {
+  return [...new Set(String(settingsState.watchlist ?? "")
+    .split(",")
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter(Boolean))];
+}
+
+function setSelectedWatchlist(symbols) {
+  settingsState.watchlist = [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))].join(",");
+}
+
+function toggleWatchlistSymbol(symbol, enabled) {
+  if (!symbol) return;
+  const normalized = symbol.trim().toUpperCase();
+  const validSymbols = new Set(marketSymbols.map((item) => item.symbol));
+  if (marketSymbols.length > 0 && !validSymbols.has(normalized)) return;
+  const selected = getSelectedWatchlist();
+  const next = enabled ? [...selected, normalized] : selected.filter((item) => item !== normalized);
+  setSelectedWatchlist(next);
+  renderWatchlistSettings();
 }

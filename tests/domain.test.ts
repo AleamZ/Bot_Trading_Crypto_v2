@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Candle } from "../src/domain/market-data/Candle.js";
 import type { RiskInput } from "../src/domain/risk/RiskDecision.js";
+import { defaultTradingSettings, validateTradingSettings } from "../src/application/config/AppConfig.js";
 import { detectLatestHtfFvg, isFvgInvalidated, isFvgMitigated } from "../src/domain/fvg/FvgDetector.js";
 import { calculateEntryPlan } from "../src/domain/entry/EntryCalculator.js";
 import { detectM5StructureSignal } from "../src/domain/market-structure/StructureDetector.js";
@@ -168,6 +169,7 @@ describe("risk and state", () => {
 
   it("rejects risk protection blockers with explicit reason codes", () => {
     expect(evaluateRisk(riskInput({ openPositions: 1, maxOpenPositions: 1 }))).toMatchObject({ rejectCode: "MAX_OPEN_POSITIONS" });
+    expect(evaluateRisk(riskInput({ symbolOpenPositions: 1, maxPositionPerSymbol: 1 }))).toMatchObject({ rejectCode: "POSITION_ALREADY_OPEN" });
     expect(evaluateRisk(riskInput({ tradesToday: 5, maxTradesPerDay: 5 }))).toMatchObject({ rejectCode: "MAX_TRADES_PER_DAY" });
     expect(evaluateRisk(riskInput({ dailyRealizedLoss: 31, availableBalance: 1000, dailyLossLimitPercent: 3 }))).toMatchObject({ rejectCode: "DAILY_LOSS_LIMIT" });
     expect(evaluateRisk(riskInput({ consecutiveLosses: 3, maxConsecutiveLosses: 3 }))).toMatchObject({ rejectCode: "MAX_CONSECUTIVE_LOSSES" });
@@ -177,6 +179,23 @@ describe("risk and state", () => {
 
   it("rejects invalid setup state jumps", () => {
     expect(() => transitionSetupState("WaitingTrend", "ReadyToEnter")).toThrow();
+  });
+});
+
+describe("trading settings", () => {
+  it("loads defaults and normalizes database watchlist settings", () => {
+    const settings = validateTradingSettings({
+      ...defaultTradingSettings,
+      watchlist: ["btcusdt", "ETHUSDT", "btcusdt"]
+    });
+
+    expect(settings.watchlist).toEqual(["BTCUSDT", "ETHUSDT"]);
+    expect(settings.minimumRiskReward).toBe(2);
+  });
+
+  it("rejects invalid trading settings", () => {
+    expect(() => validateTradingSettings({ ...defaultTradingSettings, leverage: 200, maxLeverage: 125 })).toThrow();
+    expect(() => validateTradingSettings({ ...defaultTradingSettings, tradingEnabled: true, watchlist: [] })).toThrow();
   });
 });
 
@@ -282,6 +301,8 @@ function riskInput(overrides: Partial<RiskInput> = {}): RiskInput {
     maxPositionSize: 100_000,
     openPositions: 0,
     maxOpenPositions: 1,
+    symbolOpenPositions: 0,
+    maxPositionPerSymbol: 1,
     tradesToday: 0,
     maxTradesPerDay: 5,
     dailyRealizedLoss: 0,

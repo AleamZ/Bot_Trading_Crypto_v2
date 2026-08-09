@@ -99,6 +99,33 @@
 
         <section class="panel">
           <div class="panel-head">
+            <h2>Bot Monitor</h2>
+            <span id="watchlist-count">0 symbols</span>
+          </div>
+          <div class="positions-table-wrap">
+            <table class="positions-table watchlist-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>State</th>
+                  <th>Conditions</th>
+                  <th>R/R</th>
+                  <th>Position</th>
+                  <th>Status</th>
+                  <th>Last Scan</th>
+                </tr>
+              </thead>
+              <tbody id="watchlist-body">
+                <tr>
+                  <td colspan="7" class="empty-position">Waiting for scanner</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
             <h2>Decision Log</h2>
             <span id="event-count">0 events</span>
           </div>
@@ -245,6 +272,34 @@
         </section>
 
         <section class="settings-group">
+          <h2>Watchlist</h2>
+          <div class="watchlist-picker">
+            <div class="watchlist-search-row">
+              <label for="setting-symbol-search">Search Symbol</label>
+              <input id="setting-symbol-search" placeholder="BTCUSDT" type="search" autocomplete="off" />
+            </div>
+            <div class="selected-watchlist">
+              <div class="watchlist-subhead">
+                <span>Selected</span>
+                <strong id="selected-watchlist-count">0</strong>
+              </div>
+              <div class="selected-symbols" id="selected-watchlist">
+                <span class="empty-selection">No symbols selected</span>
+              </div>
+            </div>
+            <div class="available-watchlist">
+              <div class="watchlist-subhead">
+                <span>Available Symbols</span>
+                <strong id="available-watchlist-count">Loading</strong>
+              </div>
+              <div class="symbol-check-list" id="available-symbols">
+                <span class="empty-selection">Loading Binance Futures symbols</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-group">
           <h2>Position</h2>
           <div class="settings-grid">
           <article class="setting-card">
@@ -258,23 +313,159 @@
           </article>
 
           <article class="setting-card">
+            <label for="setting-max-leverage">Max Leverage</label>
+            <input id="setting-max-leverage" inputmode="numeric" min="1" max="125" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
             <label for="setting-max-open-positions">Max Open Positions</label>
             <input id="setting-max-open-positions" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-max-position-per-symbol">Max Position Per Symbol</label>
+            <input id="setting-max-position-per-symbol" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-min-notional">Min Notional <span>USDT</span></label>
+            <input id="setting-min-notional" inputmode="decimal" min="0.01" step="0.01" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-max-position-size">Max Position Size <span>USDT</span></label>
+            <input id="setting-max-position-size" inputmode="decimal" min="1" step="1" type="number" />
           </article>
           </div>
         </section>
 
         <section class="settings-group">
-          <h2>Entry Filter</h2>
+          <h2>Strategy</h2>
           <div class="settings-grid">
+          <article class="setting-card">
+            <label for="setting-ema-period">EMA Period</label>
+            <input id="setting-ema-period" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-swing-left">Swing Left</label>
+            <input id="setting-swing-left" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-swing-right">Swing Right</label>
+            <input id="setting-swing-right" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label>HTF FVG Mitigation</label>
+            <div class="segmented-control three-options" data-setting-group="fvgMitigation">
+              <button class="segmented-option" data-setting-value="edge" type="button">Edge</button>
+              <button class="segmented-option" data-setting-value="ce" type="button">CE</button>
+              <button class="segmented-option" data-setting-value="full" type="button">Full</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label>LTF FVG Entry</label>
+            <div class="segmented-control three-options" data-setting-group="ltfFvgEntryMode">
+              <button class="segmented-option" data-setting-value="edge" type="button">Edge</button>
+              <button class="segmented-option" data-setting-value="ce" type="button">CE</button>
+              <button class="segmented-option" data-setting-value="full" type="button">Full</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label>Displacement Filter</label>
+            <div class="segmented-control" data-setting-group="requireDisplacement">
+              <button class="segmented-option" data-setting-value="false" type="button">OFF</button>
+              <button class="segmented-option" data-setting-value="true" type="button">ON</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-displacement-body">Body Multiplier</label>
+            <input id="setting-displacement-body" inputmode="decimal" min="0.1" step="0.1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-displacement-lookback">Body Lookback</label>
+            <input id="setting-displacement-lookback" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+          </div>
+        </section>
+
+        <section class="settings-group">
+          <h2>Entry / Take Profit</h2>
+          <div class="settings-grid">
+          <article class="setting-card">
+            <label>Order Type</label>
+            <div class="segmented-control" data-setting-group="entryMode">
+              <button class="segmented-option" data-setting-value="market" type="button">Market</button>
+              <button class="segmented-option" data-setting-value="limit" type="button">Limit</button>
+            </div>
+          </article>
+
           <article class="setting-card">
             <label for="setting-minimum-rr">Minimum R/R</label>
             <input id="setting-minimum-rr" inputmode="decimal" min="0.1" step="0.1" type="number" />
           </article>
 
           <article class="setting-card">
+            <label>Take Profit Mode</label>
+            <div class="segmented-control" data-setting-group="takeProfitMode">
+              <button class="segmented-option" data-setting-value="external-liquidity" type="button">Liquidity</button>
+              <button class="segmented-option" data-setting-value="fixed-rr" type="button">Fixed RR</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-fixed-rr">Fixed R/R</label>
+            <input id="setting-fixed-rr" inputmode="decimal" min="0.1" step="0.1" type="number" />
+          </article>
+
+          <article class="setting-card">
             <label for="setting-max-trades-per-day">Max Trades / Day</label>
             <input id="setting-max-trades-per-day" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+          </div>
+        </section>
+
+        <section class="settings-group">
+          <h2>Stop Loss</h2>
+          <div class="settings-grid">
+          <article class="setting-card">
+            <label>Buffer Mode</label>
+            <div class="segmented-control three-options" data-setting-group="stopLossBufferMode">
+              <button class="segmented-option" data-setting-value="ticks" type="button">Ticks</button>
+              <button class="segmented-option" data-setting-value="percentage" type="button">Percent</button>
+              <button class="segmented-option" data-setting-value="atr" type="button">ATR</button>
+            </div>
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-sl-buffer-ticks">Buffer Ticks</label>
+            <input id="setting-sl-buffer-ticks" inputmode="decimal" min="0" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-sl-buffer-percent">Buffer Percent <span>%</span></label>
+            <input id="setting-sl-buffer-percent" inputmode="decimal" min="0" step="0.01" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-sl-atr-period">ATR Period</label>
+            <input id="setting-sl-atr-period" inputmode="numeric" min="1" step="1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-sl-atr-multiplier">ATR Multiplier</label>
+            <input id="setting-sl-atr-multiplier" inputmode="decimal" min="0" step="0.1" type="number" />
+          </article>
+
+          <article class="setting-card">
+            <label for="setting-price-tick-size">Price Tick Size</label>
+            <input id="setting-price-tick-size" inputmode="decimal" min="0.00000001" step="0.00000001" type="number" />
           </article>
           </div>
         </section>
@@ -296,20 +487,17 @@
             <label for="setting-cooldown">Cooldown After Trade <span>minutes</span></label>
             <input id="setting-cooldown" inputmode="numeric" min="0" step="1" type="number" />
           </article>
+
+          <article class="setting-card">
+            <label for="setting-max-drawdown">Max Drawdown <span>%</span></label>
+            <input id="setting-max-drawdown" inputmode="decimal" min="0.1" step="0.1" type="number" />
+          </article>
           </div>
         </section>
 
         <section class="settings-group">
-          <h2>Execution</h2>
+          <h2>Bot Control</h2>
           <div class="settings-grid">
-          <article class="setting-card">
-            <label>Order Type</label>
-            <div class="segmented-control" data-setting-group="orderType">
-              <button class="segmented-option" data-setting-value="limit" type="button">Limit</button>
-              <button class="segmented-option" data-setting-value="market" type="button">Market</button>
-            </div>
-          </article>
-
           <article class="setting-card">
             <label>Trading Enabled</label>
             <div class="segmented-control" data-setting-group="tradingEnabled">
@@ -317,6 +505,15 @@
               <button class="segmented-option" data-setting-value="true" type="button">ON</button>
             </div>
           </article>
+
+          <article class="setting-card">
+            <label>Kill Switch</label>
+            <div class="segmented-control" data-setting-group="killSwitch">
+              <button class="segmented-option" data-setting-value="false" type="button">OFF</button>
+              <button class="segmented-option" data-setting-value="true" type="button">ON</button>
+            </div>
+          </article>
+
           </div>
         </section>
       </section>

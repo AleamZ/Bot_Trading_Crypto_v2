@@ -6,11 +6,16 @@ const chartState = {
 };
 const settingsKey = "smc-futures-settings";
 const defaultSettings = {
-  size: "",
+  marginPerOrder: "200",
   orderType: "limit",
-  marginMode: "cross",
   leverage: "5",
-  riskReward: "2",
+  maxOpenPositions: "1",
+  minimumRr: "2",
+  maxTradesPerDay: "5",
+  dailyLossLimit: "3",
+  maxConsecutiveLosses: "3",
+  cooldownAfterTrade: "30",
+  tradingEnabled: "false",
 };
 const settingsState = { ...defaultSettings };
 
@@ -160,9 +165,14 @@ $("analysis-form").addEventListener("submit", (event) => {
 });
 $("settings-save").addEventListener("click", saveSettings);
 $("settings-reset").addEventListener("click", resetSettings);
-$("setting-size").addEventListener("input", updateSettingFromInput);
+$("setting-margin-per-order").addEventListener("input", updateSettingFromInput);
 $("setting-leverage").addEventListener("input", updateSettingFromInput);
-$("setting-risk-reward").addEventListener("input", updateSettingFromInput);
+$("setting-max-open-positions").addEventListener("input", updateSettingFromInput);
+$("setting-minimum-rr").addEventListener("input", updateSettingFromInput);
+$("setting-max-trades-per-day").addEventListener("input", updateSettingFromInput);
+$("setting-daily-loss-limit").addEventListener("input", updateSettingFromInput);
+$("setting-max-consecutive-losses").addEventListener("input", updateSettingFromInput);
+$("setting-cooldown").addEventListener("input", updateSettingFromInput);
 document.querySelectorAll("[data-setting-group]").forEach((group) => {
   group.addEventListener("click", (event) => {
     const button = event.target.closest("[data-setting-value]");
@@ -271,22 +281,31 @@ function renderAnalysis(analysis) {
   $("analysis-condition-count").textContent = analysis.setupStatus ?? "SETUP STATUS";
 
   $("analysis-conditions").replaceChildren(
-    ...conditions.map((condition, index) => {
-      const item = document.createElement("li");
-      const mark = document.createElement("span");
-      const body = document.createElement("div");
-      const title = document.createElement("strong");
-      const detail = document.createElement("small");
-      item.className = `condition-item ${analysisStatusClass(condition.status)}`;
-      mark.className = "condition-mark";
-      mark.textContent = condition.status === "PASSED" ? "✓" : condition.status === "INVALIDATED" ? "×" : "⏳";
-      title.textContent = `${index + 1}. ${condition.label}`;
-      detail.textContent = `${condition.status ?? "WAITING"} · ${condition.detail ?? "-"}`;
-      body.append(title, detail);
-      item.append(mark, body);
-      return item;
-    }),
+    ...conditions.map((condition, index) => analysisConditionItem(condition, index + 1)),
   );
+
+  const risk = analysis.riskManagement ?? {};
+  const riskChecks = risk.checks ?? [];
+  $("analysis-risk-final").textContent = risk.final ?? "WAITING";
+  $("analysis-risk-checks").replaceChildren(
+    ...riskChecks.map((check) => analysisConditionItem(check, null)),
+  );
+}
+
+function analysisConditionItem(condition, number) {
+  const item = document.createElement("li");
+  const mark = document.createElement("span");
+  const body = document.createElement("div");
+  const title = document.createElement("strong");
+  const detail = document.createElement("small");
+  item.className = `condition-item ${analysisStatusClass(condition.status)}`;
+  mark.className = "condition-mark";
+  mark.textContent = condition.status === "PASSED" ? "✓" : condition.status === "INVALIDATED" ? "×" : "⏳";
+  title.textContent = number === null ? condition.label : `${number}. ${condition.label}`;
+  detail.textContent = `${condition.status ?? "WAITING"} · ${condition.detail ?? "-"}`;
+  body.append(title, detail);
+  item.append(mark, body);
+  return item;
 }
 
 function analysisStatusClass(status) {
@@ -309,9 +328,14 @@ function loadSettings() {
 }
 
 function renderSettings() {
-  $("setting-size").value = settingsState.size;
+  $("setting-margin-per-order").value = settingsState.marginPerOrder;
   $("setting-leverage").value = settingsState.leverage;
-  $("setting-risk-reward").value = settingsState.riskReward;
+  $("setting-max-open-positions").value = settingsState.maxOpenPositions;
+  $("setting-minimum-rr").value = settingsState.minimumRr;
+  $("setting-max-trades-per-day").value = settingsState.maxTradesPerDay;
+  $("setting-daily-loss-limit").value = settingsState.dailyLossLimit;
+  $("setting-max-consecutive-losses").value = settingsState.maxConsecutiveLosses;
+  $("setting-cooldown").value = settingsState.cooldownAfterTrade;
 
   document.querySelectorAll("[data-setting-group]").forEach((group) => {
     const value = settingsState[group.dataset.settingGroup];
@@ -323,9 +347,14 @@ function renderSettings() {
 
 function updateSettingFromInput(event) {
   const fieldById = {
-    "setting-size": "size",
+    "setting-margin-per-order": "marginPerOrder",
     "setting-leverage": "leverage",
-    "setting-risk-reward": "riskReward",
+    "setting-max-open-positions": "maxOpenPositions",
+    "setting-minimum-rr": "minimumRr",
+    "setting-max-trades-per-day": "maxTradesPerDay",
+    "setting-daily-loss-limit": "dailyLossLimit",
+    "setting-max-consecutive-losses": "maxConsecutiveLosses",
+    "setting-cooldown": "cooldownAfterTrade",
   };
   const field = fieldById[event.target.id];
   if (!field) return;

@@ -40,12 +40,13 @@ export function calculateEntryPlan(params: {
   const riskDistance = Math.abs(entry - stopLoss);
   if (entry <= 0 || stopLoss <= 0 || riskDistance <= 0) return null;
 
-  const takeProfit =
-    params.config.takeProfitMode === "external-liquidity" && params.externalLiquidityPrice !== null
-      ? params.externalLiquidityPrice
-      : params.direction === "bullish"
-        ? entry + riskDistance * params.config.fixedRr
-        : entry - riskDistance * params.config.fixedRr;
+  let takeProfit: number;
+  if (params.config.takeProfitMode === "external-liquidity") {
+    if (params.externalLiquidityPrice === null) return null;
+    takeProfit = params.externalLiquidityPrice;
+  } else {
+    takeProfit = params.direction === "bullish" ? entry + riskDistance * params.config.fixedRr : entry - riskDistance * params.config.fixedRr;
+  }
 
   const rewardDistance = params.direction === "bullish" ? takeProfit - entry : entry - takeProfit;
   if (takeProfit <= 0 || rewardDistance <= 0) return null;

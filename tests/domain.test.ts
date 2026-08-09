@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Candle } from "../src/domain/market-data/Candle.js";
+import type { RiskInput } from "../src/domain/risk/RiskDecision.js";
 import { detectLatestHtfFvg, isFvgInvalidated, isFvgMitigated } from "../src/domain/fvg/FvgDetector.js";
 import { calculateEntryPlan } from "../src/domain/entry/EntryCalculator.js";
 import { detectM5StructureSignal } from "../src/domain/market-structure/StructureDetector.js";
@@ -111,33 +112,67 @@ describe("risk and state", () => {
     expect(plan?.takeProfit).toBe(116);
   });
 
-  it("calculates quantity from fixed margin and leverage", () => {
-    const decision = evaluateRisk({
-      symbol: "BTCUSDT",
+  it("does not turn external-liquidity TP into fixed RR when liquidity is missing", () => {
+    const plan = calculateEntryPlan({
       direction: "bullish",
-      availableBalance: 1000,
-      marginPerTrade: 200,
-      leverage: 5,
-      maxLeverage: 125,
-      entry: 100,
-      stopLoss: 95,
-      takeProfit: 110,
-      minNotional: 5,
-      maxPositionSize: 100_000,
-      openPositions: 0,
-      maxOpenPositions: 1,
-      dailyLossPercent: 0,
-      maxDailyLossPercent: 5,
-      drawdownPercent: 0,
-      maxDrawdownPercent: 10,
-      killSwitch: false,
-      createdAt: 1
+      ltfFvg: {
+        id: "BTCUSDT:M5:bullish:1:2:3",
+        symbol: "BTCUSDT",
+        timeframe: "M5",
+        direction: "bullish",
+        firstCandleOpenTime: 1,
+        middleCandleOpenTime: 2,
+        thirdCandleOpenTime: 3,
+        lower: 100,
+        upper: 110,
+        midpoint: 105,
+        status: "active",
+        createdAt: 4
+      },
+      m5Candles: [candle("M5", 1, 100, 110, 95, 105), candle("M5", 2, 105, 115, 101, 112)],
+      externalLiquidityPrice: null,
+      config: {
+        entryFvgMitigation: "ce",
+        takeProfitMode: "external-liquidity",
+        fixedRr: 2,
+        stopLossBufferMode: "ticks",
+        stopLossBufferTicks: 5,
+        stopLossBufferPercent: 0.1,
+        stopLossAtrPeriod: 14,
+        stopLossAtrMultiplier: 1,
+        priceTickSize: 0.1
+      }
     });
+
+    expect(plan).toBeNull();
+  });
+
+  it("calculates quantity from fixed margin and leverage", () => {
+    const decision = evaluateRisk(riskInput());
 
     expect(decision.accepted).toBe(true);
     expect(decision.positionSize).toBe(1000);
     expect(decision.quantity).toBe(10);
     expect(decision.estimatedLoss).toBe(50);
+  });
+
+  it("rejects entries below minimum RR but passes at the threshold", () => {
+    expect(evaluateRisk(riskInput({ takeProfit: 107.5, minimumRiskReward: 2 }))).toMatchObject({
+      accepted: false,
+      rejectCode: "MIN_RR_NOT_MET"
+    });
+    expect(evaluateRisk(riskInput({ takeProfit: 110, minimumRiskReward: 2 }))).toMatchObject({
+      accepted: true
+    });
+  });
+
+  it("rejects risk protection blockers with explicit reason codes", () => {
+    expect(evaluateRisk(riskInput({ openPositions: 1, maxOpenPositions: 1 }))).toMatchObject({ rejectCode: "MAX_OPEN_POSITIONS" });
+    expect(evaluateRisk(riskInput({ tradesToday: 5, maxTradesPerDay: 5 }))).toMatchObject({ rejectCode: "MAX_TRADES_PER_DAY" });
+    expect(evaluateRisk(riskInput({ dailyRealizedLoss: 31, availableBalance: 1000, dailyLossLimitPercent: 3 }))).toMatchObject({ rejectCode: "DAILY_LOSS_LIMIT" });
+    expect(evaluateRisk(riskInput({ consecutiveLosses: 3, maxConsecutiveLosses: 3 }))).toMatchObject({ rejectCode: "MAX_CONSECUTIVE_LOSSES" });
+    expect(evaluateRisk(riskInput({ lastClosedTradeAt: 10 * 60_000, availableAt: 20 * 60_000, cooldownAfterTradeMinutes: 30 }))).toMatchObject({ rejectCode: "COOLDOWN_ACTIVE" });
+    expect(evaluateRisk(riskInput({ tradingEnabled: false }))).toMatchObject({ rejectCode: "TRADING_DISABLED" });
   });
 
   it("rejects invalid setup state jumps", () => {
@@ -228,5 +263,39 @@ function candle(timeframe: Candle["timeframe"], openTime: number, open: number, 
     close,
     volume: 1,
     isClosed: true
+  };
+}
+
+function riskInput(overrides: Partial<RiskInput> = {}): RiskInput {
+  return {
+    symbol: "BTCUSDT",
+    direction: "bullish",
+    availableBalance: 1000,
+    marginPerTrade: 200,
+    leverage: 5,
+    maxLeverage: 125,
+    entry: 100,
+    stopLoss: 95,
+    takeProfit: 110,
+    minimumRiskReward: 2,
+    minNotional: 5,
+    maxPositionSize: 100_000,
+    openPositions: 0,
+    maxOpenPositions: 1,
+    tradesToday: 0,
+    maxTradesPerDay: 5,
+    dailyRealizedLoss: 0,
+    dailyLossLimitPercent: 3,
+    consecutiveLosses: 0,
+    maxConsecutiveLosses: 3,
+    lastClosedTradeAt: null,
+    cooldownAfterTradeMinutes: 30,
+    availableAt: 60 * 60_000,
+    drawdownPercent: 0,
+    maxDrawdownPercent: 10,
+    tradingEnabled: true,
+    killSwitch: false,
+    createdAt: 1,
+    ...overrides
   };
 }

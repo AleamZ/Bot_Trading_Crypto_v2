@@ -24,6 +24,9 @@ export interface EngineState {
   h1Candles: Candle[];
   m5Candles: Candle[];
   openPositions: number;
+  tradesToday: number;
+  consecutiveLosses: number;
+  lastClosedTradeAt: number | null;
   dailyLossPercent: number;
   drawdownPercent: number;
   pendingSignal: MarketStructureSignal | null;
@@ -54,6 +57,9 @@ export class TradingEngine {
       h1Candles: [],
       m5Candles: [],
       openPositions: 0,
+      tradesToday: 0,
+      consecutiveLosses: 0,
+      lastClosedTradeAt: null,
       dailyLossPercent: 0,
       drawdownPercent: 0,
       pendingSignal: null,
@@ -262,14 +268,23 @@ export class TradingEngine {
       entry: plan.entry,
       stopLoss: plan.stopLoss,
       takeProfit: plan.takeProfit,
+      minimumRiskReward: this.config.minimumRiskReward,
       minNotional: this.config.minNotional,
       maxPositionSize: this.config.maxPositionSize,
       openPositions: this.state.openPositions,
       maxOpenPositions: this.config.maxOpenPositions,
-      dailyLossPercent: this.state.dailyLossPercent,
-      maxDailyLossPercent: this.config.maxDailyLossPercent,
+      tradesToday: this.state.tradesToday,
+      maxTradesPerDay: this.config.maxTradesPerDay,
+      dailyRealizedLoss: availableBalance * (this.state.dailyLossPercent / 100),
+      dailyLossLimitPercent: this.config.maxDailyLossPercent,
+      consecutiveLosses: this.state.consecutiveLosses,
+      maxConsecutiveLosses: this.config.maxConsecutiveLosses,
+      lastClosedTradeAt: this.state.lastClosedTradeAt,
+      cooldownAfterTradeMinutes: this.config.cooldownAfterTradeMinutes,
+      availableAt: candle.closeTime,
       drawdownPercent: this.state.drawdownPercent,
       maxDrawdownPercent: this.config.maxDrawdownPercent,
+      tradingEnabled: this.config.tradingEnabled,
       killSwitch: this.config.killSwitch,
       createdAt: candle.closeTime
     });
@@ -281,7 +296,22 @@ export class TradingEngine {
       reason: risk.reason
     });
 
-    if (!risk.accepted) return;
+    if (!risk.accepted) {
+      this.logger.warn("[ENTRY REJECTED]", {
+        symbol: this.config.symbol,
+        reason: risk.rejectCode ?? risk.reason,
+        entry: risk.entry,
+        sl: risk.stopLoss,
+        tp: risk.takeProfit,
+        rr: risk.riskReward,
+        minimumRR: this.config.minimumRiskReward,
+        openPositions: this.state.openPositions,
+        maxOpenPositions: this.config.maxOpenPositions,
+        tradesToday: this.state.tradesToday,
+        maxTradesPerDay: this.config.maxTradesPerDay
+      });
+      return;
+    }
 
     let order;
     try {
@@ -300,6 +330,7 @@ export class TradingEngine {
 
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "PositionOpened");
     this.state.openPositions += 1;
+    this.state.tradesToday += 1;
     this.state.activeRisk = risk;
     this.state.pendingSignal = null;
     this.state.pendingLtfFvg = null;

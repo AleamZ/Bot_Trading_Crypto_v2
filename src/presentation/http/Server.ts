@@ -17,6 +17,8 @@ import { BinanceFuturesMarketData } from "../../infrastructure/market-data/Binan
 import { ema } from "../../domain/trend/Ema.js";
 import { detectH1Trend } from "../../domain/trend/TrendDetector.js";
 import { calculateEntryPlan, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
+import { evaluateRisk } from "../../domain/risk/RiskManager.js";
+import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgMitigated } from "../../domain/fvg/FvgDetector.js";
 import type { Fvg, FvgMitigationMode } from "../../domain/fvg/Fvg.js";
 import { buildLiquidityState } from "../../domain/liquidity/LiquidityDetector.js";
@@ -306,6 +308,13 @@ interface AnalysisCondition {
   detail: string;
 }
 
+interface AnalysisRiskCheck {
+  id: string;
+  label: string;
+  status: AnalysisStatus;
+  detail: string;
+}
+
 interface AnalysisSetupContext {
   id: string;
   state: AnalysisSetupState;
@@ -335,6 +344,12 @@ async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData
   };
   summary: string;
   conditions: AnalysisCondition[];
+  riskManagement: {
+    final: "WAITING_FOR_STRATEGY" | "READY_TO_TRADE" | "BLOCKED";
+    reason: string | null;
+    checks: AnalysisRiskCheck[];
+    decision: RiskDecision | null;
+  };
   plan: EntryPlan | null;
 }> {
   const [h1Candles, m5Candles] = await Promise.all([
@@ -344,6 +359,7 @@ async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData
   const trend = detectH1Trend(h1Candles, config.emaPeriod);
   const setup = buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config);
   const conditions = buildLifecycleConditions(setup, config);
+  const riskManagement = buildAnalysisRiskManagement(setup, config);
 
   return {
     symbol,
@@ -356,8 +372,9 @@ async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData
       close: Number.isFinite(trend.close) ? trend.close : null,
       reason: trend.reason
     },
-    summary: buildLifecycleSummary(setup, conditions),
+    summary: riskManagement.final === "READY_TO_TRADE" ? "READY TO TRADE" : riskManagement.final === "BLOCKED" ? `BLOCKED: ${riskManagement.reason ?? "-"}` : buildLifecycleSummary(setup, conditions),
     conditions,
+    riskManagement,
     plan: setup.plan
   };
 }
@@ -606,6 +623,85 @@ function condition(id: string, label: string, status: AnalysisStatus, detail: st
 function statusFor(setup: AnalysisSetupContext, conditionId: string): AnalysisStatus {
   if (setup.state === "INVALIDATED" && setup.invalidatedConditionId === conditionId) return "INVALIDATED";
   return "WAITING";
+}
+
+function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppConfig): {
+  final: "WAITING_FOR_STRATEGY" | "READY_TO_TRADE" | "BLOCKED";
+  reason: string | null;
+  checks: AnalysisRiskCheck[];
+  decision: RiskDecision | null;
+} {
+  const waitingChecks: AnalysisRiskCheck[] = [
+    riskCheck("minimum-rr", "Minimum R/R", "WAITING", "Waiting for strategy entry plan"),
+    riskCheck("trading-enabled", "Trading Enabled", "WAITING", "Waiting for strategy entry plan"),
+    riskCheck("max-open-positions", "Max Open Positions", "WAITING", "Waiting for strategy entry plan"),
+    riskCheck("max-trades-per-day", "Max Trades / Day", "WAITING", "Waiting for strategy entry plan"),
+    riskCheck("daily-loss-limit", "Daily Loss Limit", "WAITING", "Waiting for strategy entry plan"),
+    riskCheck("max-consecutive-losses", "Max Consecutive Losses", "WAITING", "Waiting for strategy entry plan"),
+    riskCheck("cooldown", "Cooldown", "WAITING", "Waiting for strategy entry plan")
+  ];
+
+  if (!setup.plan) {
+    return {
+      final: "WAITING_FOR_STRATEGY",
+      reason: null,
+      checks: waitingChecks,
+      decision: null
+    };
+  }
+
+  const availableBalance = 10_000;
+  const decision = evaluateRisk({
+    symbol: setup.id,
+    direction: setup.plan.direction,
+    availableBalance,
+    marginPerTrade: config.marginPerTrade,
+    leverage: config.leverage,
+    maxLeverage: config.maxLeverage,
+    entry: setup.plan.entry,
+    stopLoss: setup.plan.stopLoss,
+    takeProfit: setup.plan.takeProfit,
+    minimumRiskReward: config.minimumRiskReward,
+    minNotional: config.minNotional,
+    maxPositionSize: config.maxPositionSize,
+    openPositions: 0,
+    maxOpenPositions: config.maxOpenPositions,
+    tradesToday: 0,
+    maxTradesPerDay: config.maxTradesPerDay,
+    dailyRealizedLoss: 0,
+    dailyLossLimitPercent: config.maxDailyLossPercent,
+    consecutiveLosses: 0,
+    maxConsecutiveLosses: config.maxConsecutiveLosses,
+    lastClosedTradeAt: null,
+    cooldownAfterTradeMinutes: config.cooldownAfterTradeMinutes,
+    availableAt: Date.now(),
+    drawdownPercent: 0,
+    maxDrawdownPercent: config.maxDrawdownPercent,
+    tradingEnabled: config.tradingEnabled,
+    killSwitch: config.killSwitch,
+    createdAt: Date.now()
+  });
+
+  const checks: AnalysisRiskCheck[] = [
+    riskCheck("minimum-rr", "Minimum R/R", setup.plan.riskReward >= config.minimumRiskReward ? "PASSED" : "INVALIDATED", `RR thực tế ${formatServerPrice(setup.plan.riskReward)} · minimum ${formatServerPrice(config.minimumRiskReward)}`),
+    riskCheck("trading-enabled", "Trading Enabled", config.tradingEnabled ? "PASSED" : "INVALIDATED", config.tradingEnabled ? "ON" : "OFF"),
+    riskCheck("max-open-positions", "Max Open Positions", decision.rejectCode === "MAX_OPEN_POSITIONS" ? "INVALIDATED" : "PASSED", `Max ${config.maxOpenPositions}`),
+    riskCheck("max-trades-per-day", "Max Trades / Day", decision.rejectCode === "MAX_TRADES_PER_DAY" ? "INVALIDATED" : "PASSED", `Max ${config.maxTradesPerDay}`),
+    riskCheck("daily-loss-limit", "Daily Loss Limit", decision.rejectCode === "DAILY_LOSS_LIMIT" ? "INVALIDATED" : "PASSED", `${formatServerPrice(config.maxDailyLossPercent)}%`),
+    riskCheck("max-consecutive-losses", "Max Consecutive Losses", decision.rejectCode === "MAX_CONSECUTIVE_LOSSES" ? "INVALIDATED" : "PASSED", `Max ${config.maxConsecutiveLosses}`),
+    riskCheck("cooldown", "Cooldown", decision.rejectCode === "COOLDOWN_ACTIVE" ? "INVALIDATED" : "PASSED", `${config.cooldownAfterTradeMinutes} minutes`)
+  ];
+
+  return {
+    final: decision.accepted ? "READY_TO_TRADE" : "BLOCKED",
+    reason: decision.accepted ? null : decision.rejectCode ?? decision.reason,
+    checks,
+    decision
+  };
+}
+
+function riskCheck(id: string, label: string, status: AnalysisStatus, detail: string): AnalysisRiskCheck {
+  return { id, label, status, detail };
 }
 
 function calculateAnalysisEntryPlan(

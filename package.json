@@ -3,12 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "apps/api",
+    "apps/web",
+    "packages/shared"
+  ],
   "scripts": {
-    "dev": "tsx src/main.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/src/main.js",
-    "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "dev:api": "npm run dev -w @smc-futures-bot/api",
+    "dev:web": "npm run dev -w @smc-futures-bot/web",
+    "build:api": "npm run build -w @smc-futures-bot/api",
+    "build:web": "npm run build -w @smc-futures-bot/web",
+    "build": "npm run build:api && npm run build:web",
+    "start:api": "npm run start -w @smc-futures-bot/api",
+    "test": "npm run test -w @smc-futures-bot/api",
+    "typecheck": "npm run typecheck -w @smc-futures-bot/api && npm run typecheck -w @smc-futures-bot/web"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

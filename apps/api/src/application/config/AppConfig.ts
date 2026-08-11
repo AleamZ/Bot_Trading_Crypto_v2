@@ -1,10 +1,19 @@
-import "dotenv/config";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
+
+for (const envFile of [resolve(process.cwd(), ".env"), resolve(process.cwd(), "../../.env")]) {
+  if (existsSync(envFile)) {
+    loadDotenv({ path: envFile, override: false });
+  }
+}
 
 const schema = z.object({
   port: z.coerce.number().int().positive().default(8787),
   executionMode: z.enum(["paper", "testnet", "live"]).default("paper"),
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  corsOrigins: z.array(z.string()).default(["http://localhost:5173", "http://127.0.0.1:5173"]),
   symbol: z.string().default("BTCUSDT"),
   watchlist: z.array(z.string()).default(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]),
   positionSizingMode: z.literal("fixed-margin").default("fixed-margin"),
@@ -47,7 +56,7 @@ const schema = z.object({
 });
 
 export type AppConfig = z.infer<typeof schema>;
-export type TradingSettings = Omit<AppConfig, "port" | "executionMode" | "logLevel" | "databaseUrl" | "binanceApiKey" | "binanceApiSecret" | "binanceTestnet">;
+export type TradingSettings = Omit<AppConfig, "port" | "executionMode" | "logLevel" | "corsOrigins" | "databaseUrl" | "binanceApiKey" | "binanceApiSecret" | "binanceTestnet">;
 
 export const defaultTradingSettings: TradingSettings = {
   symbol: "BTCUSDT",
@@ -91,6 +100,7 @@ const tradingSettingsSchema = schema.omit({
   port: true,
   executionMode: true,
   logLevel: true,
+  corsOrigins: true,
   databaseUrl: true,
   binanceApiKey: true,
   binanceApiSecret: true,
@@ -122,6 +132,7 @@ export function loadConfig(): AppConfig {
     port: process.env.PORT,
     executionMode: process.env.EXECUTION_MODE,
     logLevel: process.env.LOG_LEVEL,
+    corsOrigins: normalizeCsv(process.env.CORS_ORIGINS ?? "http://localhost:5173,http://127.0.0.1:5173"),
     symbol: normalizeWatchlist(process.env.DEFAULT_WATCHLIST ?? defaultTradingSettings.watchlist)[0],
     watchlist: normalizeWatchlist(process.env.DEFAULT_WATCHLIST ?? defaultTradingSettings.watchlist),
     databaseUrl: process.env.DATABASE_URL,
@@ -138,4 +149,9 @@ function normalizeWatchlist(value: unknown): string[] {
     .map((symbol) => symbol.trim().toUpperCase())
     .filter((symbol) => /^[A-Z0-9]{5,20}$/.test(symbol));
   return [...new Set(parsed)];
+}
+
+function normalizeCsv(value: unknown): string[] {
+  const source = Array.isArray(value) ? value.join(",") : String(value ?? "");
+  return [...new Set(source.split(",").map((item) => item.trim()).filter(Boolean))];
 }

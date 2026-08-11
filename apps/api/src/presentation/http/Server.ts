@@ -1,6 +1,4 @@
 import { createServer, type IncomingMessage } from "node:http";
-import { readFile } from "node:fs/promises";
-import { extname, join } from "node:path";
 import type { TradingEngine } from "../../application/engine/TradingEngine.js";
 import type { MarketScanner } from "../../application/scanner/MarketScanner.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
@@ -31,12 +29,6 @@ import type { MarketStructureSignal } from "../../domain/market-structure/Market
 import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 
-const contentTypes: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8"
-};
-
 export function startHttpServer(params: {
   port: number;
   config: AppConfig;
@@ -46,7 +38,6 @@ export function startHttpServer(params: {
   scanner?: MarketScanner;
 }): void {
   let runtimeConfig = params.config;
-  const dashboardDir = join(process.cwd(), "src", "presentation", "dashboard");
   const marketData = new BinanceFuturesMarketData(runtimeConfig.binanceTestnet);
   const accountClient =
     runtimeConfig.binanceApiKey && runtimeConfig.binanceApiSecret
@@ -56,7 +47,15 @@ export function startHttpServer(params: {
   let accountCacheAt = 0;
 
   const server = createServer(async (request, response) => {
+    let requestCorsHeaders: Record<string, string> = {};
     try {
+      requestCorsHeaders = corsHeadersFor(request, runtimeConfig);
+      if (request.method === "OPTIONS") {
+        response.writeHead(204, requestCorsHeaders);
+        response.end();
+        return;
+      }
+
       const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
 
       if (requestUrl.pathname === "/api/snapshot") {
@@ -64,7 +63,7 @@ export function startHttpServer(params: {
         const accountStatus = await getAccountStatus(runtimeConfig, accountClient, accountCache, accountCacheAt);
         accountCache = accountStatus.cache;
         accountCacheAt = accountStatus.cacheAt;
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify({ engine: params.engine.getDashboardState(), runtime: getRuntimeStatus(runtimeConfig, accountStatus.status), store }));
         return;
       }
@@ -72,7 +71,7 @@ export function startHttpServer(params: {
       if (requestUrl.pathname === "/api/binance/klines" || requestUrl.pathname === "/binance/klines") {
         const query = parseKlineQuery(requestUrl, runtimeConfig.symbol);
         const klines = await marketData.getKlines(query.symbol, query.interval, query.limit);
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify({ symbol: query.symbol, interval: query.interval, limit: query.limit, klines }));
         return;
       }
@@ -81,7 +80,7 @@ export function startHttpServer(params: {
         const symbol = requestUrl.searchParams.get("symbol") ?? runtimeConfig.symbol;
         const limit = clampLimit(requestUrl.searchParams.get("limit"), 200, 500);
         const store = await params.repository.getDashboardSnapshot();
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify({ symbol, limit, events: selectBotEvents(store, symbol, limit) }));
         return;
       }
@@ -89,27 +88,48 @@ export function startHttpServer(params: {
       if (requestUrl.pathname === "/api/binance/account-activity") {
         const query = parseAccountActivityQuery(requestUrl, runtimeConfig.symbol);
         const activity = await getAccountActivity(accountClient, query.symbol, query.limit, params.logger);
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify({ symbol: query.symbol, limit: query.limit, ...activity }));
         return;
       }
 
+      if (requestUrl.pathname === "/api/watchlist") {
+        if (request.method === "GET") {
+          response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
+          response.end(JSON.stringify({ watchlist: runtimeConfig.watchlist }));
+          return;
+        }
+
+        if (request.method === "PUT") {
+          const body = await readJsonBody(request);
+          const nextWatchlist = Array.isArray(body) ? body : isRecord(body) ? body.watchlist : [];
+          const settings = validateTradingSettings({ ...toTradingSettings(runtimeConfig), watchlist: nextWatchlist });
+          await assertValidWatchlistSymbols(settings.watchlist, marketData);
+          await params.repository.saveTradingSettings(settings);
+          runtimeConfig = applyTradingSettings(runtimeConfig, settings);
+          params.scanner?.updateConfig(runtimeConfig);
+          response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
+          response.end(JSON.stringify({ watchlist: runtimeConfig.watchlist }));
+          return;
+        }
+      }
+
       if (requestUrl.pathname === "/api/watchlist/status") {
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify({ watchlist: runtimeConfig.watchlist, rows: params.scanner?.getWatchlistStatus() ?? [] }));
         return;
       }
 
       if (requestUrl.pathname === "/api/market/symbols") {
         const symbols = await marketData.getFuturesSymbols();
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify(symbols));
         return;
       }
 
       if (requestUrl.pathname === "/api/settings") {
         if (request.method === "GET") {
-          response.writeHead(200, noCacheHeaders("application/json"));
+          response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
           response.end(JSON.stringify(toTradingSettings(runtimeConfig)));
           return;
         }
@@ -120,7 +140,7 @@ export function startHttpServer(params: {
           await params.repository.saveTradingSettings(settings);
           runtimeConfig = applyTradingSettings(runtimeConfig, settings);
           params.scanner?.updateConfig(runtimeConfig);
-          response.writeHead(200, noCacheHeaders("application/json"));
+          response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
           response.end(JSON.stringify(settings));
           return;
         }
@@ -129,7 +149,7 @@ export function startHttpServer(params: {
       if (requestUrl.pathname === "/api/analysis") {
         const query = parseAccountActivityQuery(requestUrl, runtimeConfig.symbol);
         const analysis = await buildSymbolAnalysis(query.symbol, runtimeConfig, marketData);
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify(analysis));
         return;
       }
@@ -149,30 +169,22 @@ export function startHttpServer(params: {
           leverage: runtimeConfig.leverage,
           manualPositions: await getManualPositions(accountClient, query.symbol, params.logger)
         });
-        response.writeHead(200, noCacheHeaders("application/json"));
+        response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify(overlays));
         return;
       }
 
-      const path = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
-      if (path.startsWith("/.well-known/") || path === "/favicon.ico") {
-        response.writeHead(204);
-        response.end();
-        return;
-      }
-      const file = join(dashboardDir, path.replace(/^\//, ""));
-      const body = await readFile(file);
-      response.writeHead(200, noCacheHeaders(contentTypes[extname(file)] ?? "application/octet-stream"));
-      response.end(body);
+      response.writeHead(404, noCacheHeaders("application/json", requestCorsHeaders));
+      response.end(JSON.stringify({ error: "API route not found" }));
     } catch (error) {
       params.logger.error("HTTP request failed", { error: error instanceof Error ? error.message : String(error) });
-      response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+      response.writeHead(400, noCacheHeaders("application/json", requestCorsHeaders));
       response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     }
   });
 
-  server.listen(params.port, "127.0.0.1", () => {
-    params.logger.info(`Dashboard listening on http://localhost:${params.port}`);
+  server.listen(params.port, "0.0.0.0", () => {
+    params.logger.info(`API listening on http://localhost:${params.port}`);
   });
 }
 
@@ -206,6 +218,7 @@ function toTradingSettings(config: AppConfig): TradingSettings {
     port: _port,
     executionMode: _executionMode,
     logLevel: _logLevel,
+    corsOrigins: _corsOrigins,
     databaseUrl: _databaseUrl,
     binanceApiKey: _binanceApiKey,
     binanceApiSecret: _binanceApiSecret,
@@ -213,6 +226,19 @@ function toTradingSettings(config: AppConfig): TradingSettings {
     ...settings
   } = config;
   return settings;
+}
+
+function corsHeadersFor(request: IncomingMessage, config: AppConfig): Record<string, string> {
+  const origin = request.headers.origin;
+  const headers: Record<string, string> = {
+    "vary": "Origin"
+  };
+  if (typeof origin === "string" && config.corsOrigins.includes(origin)) {
+    headers["access-control-allow-origin"] = origin;
+    headers["access-control-allow-methods"] = "GET, PUT, OPTIONS";
+    headers["access-control-allow-headers"] = "content-type";
+  }
+  return headers;
 }
 
 async function assertValidWatchlistSymbols(watchlist: string[], marketData: BinanceFuturesMarketData): Promise<void> {
@@ -1574,8 +1600,9 @@ async function readAccountActivity<T>(label: string, read: () => Promise<T[]>, l
   }
 }
 
-function noCacheHeaders(contentType: string): Record<string, string> {
+function noCacheHeaders(contentType: string, extra: Record<string, string> = {}): Record<string, string> {
   return {
+    ...extra,
     "content-type": contentType,
     "cache-control": "no-store, max-age=0"
   };

@@ -1,5 +1,7 @@
 node_modules/
 dist/
+apps/**/dist/
+apps/web/app-config.js
 .env
 .DS_Store
 npm-debug.log*

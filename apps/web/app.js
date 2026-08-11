@@ -1,3 +1,5 @@
+import { apiFetch } from "./apiClient.js";
+
 const $ = (id) => document.getElementById(id);
 const chartState = {
   instance: null,
@@ -5,7 +7,7 @@ const chartState = {
   module: null,
 };
 const defaultSettings = {
-  watchlist: "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT",
+  watchlist: "",
   positionSizingMode: "fixed-margin",
   marginPerTrade: "200",
   leverage: "5",
@@ -52,8 +54,8 @@ window.addEventListener("resize", () => resizeChart());
 
 async function load() {
   const [snapshotResponse, watchlistResponse] = await Promise.all([
-    fetch("/api/snapshot"),
-    fetch("/api/watchlist/status"),
+    apiFetch("/api/snapshot"),
+    apiFetch("/api/watchlist/status"),
   ]);
   const snapshot = await snapshotResponse.json();
   const watchlist = await watchlistResponse.json();
@@ -353,7 +355,7 @@ async function loadAnalysis() {
   $("analysis-run").disabled = true;
 
   try {
-    const response = await fetch(`/api/analysis?symbol=${encodeURIComponent(symbol)}`);
+    const response = await apiFetch(`/api/analysis?symbol=${encodeURIComponent(symbol)}`);
     if (!response.ok) throw new Error(`Analysis request failed: ${response.status}`);
     renderAnalysis(await response.json());
   } catch (error) {
@@ -415,14 +417,20 @@ function analysisStatusClass(status) {
 
 async function loadSettings() {
   try {
-    const [response, symbolsResponse] = await Promise.all([
-      fetch("/api/settings"),
-      fetch("/api/market/symbols"),
+    const [response, symbolsResponse, watchlistResponse] = await Promise.all([
+      apiFetch("/api/settings"),
+      apiFetch("/api/market/symbols"),
+      apiFetch("/api/watchlist"),
     ]);
     if (!response.ok) throw new Error(`Settings request failed: ${response.status}`);
     if (!symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
+    if (!watchlistResponse.ok) throw new Error(`Watchlist request failed: ${watchlistResponse.status}`);
     marketSymbols = await symbolsResponse.json();
     Object.assign(settingsState, defaultSettings, settingsFromApi(await response.json()));
+    const watchlist = await watchlistResponse.json();
+    if (Array.isArray(watchlist.watchlist)) {
+      settingsState.watchlist = watchlist.watchlist.join(",");
+    }
   } catch {
     Object.assign(settingsState, defaultSettings);
     marketSymbols = [];
@@ -502,7 +510,7 @@ function updateSettingFromInput(event) {
 async function saveSettings() {
   $("settings-status").textContent = "Saving";
   const payload = settingsPayload();
-  const response = await fetch("/api/settings", {
+  const response = await apiFetch("/api/settings", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),

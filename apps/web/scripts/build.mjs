@@ -4,7 +4,10 @@ import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dist = join(root, "dist");
-const apiBaseUrl = process.env.VITE_API_BASE_URL ?? process.env.API_BASE_URL ?? "http://localhost:8787";
+const apiBaseUrl =
+  process.env.VITE_API_BASE_URL ??
+  process.env.API_BASE_URL ??
+  (process.env.VERCEL || process.env.NODE_ENV === "production" ? "" : "http://localhost:8787");
 
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });

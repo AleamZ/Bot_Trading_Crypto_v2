@@ -45,6 +45,8 @@ export function startHttpServer(params: {
       : null;
   let accountCache: BinanceFuturesWalletStatus | null = null;
   let accountCacheAt = 0;
+  let openPositionsCache: BinanceFuturesPositionStatus[] | null = null;
+  let openPositionsCacheAt = 0;
 
   const server = createServer(async (request, response) => {
     let requestCorsHeaders: Record<string, string> = {};
@@ -115,8 +117,16 @@ export function startHttpServer(params: {
       }
 
       if (requestUrl.pathname === "/api/watchlist/status") {
+        const positionsStatus = await getCachedOpenPositions(accountClient, openPositionsCache, openPositionsCacheAt, params.logger);
+        openPositionsCache = positionsStatus.positions;
+        openPositionsCacheAt = positionsStatus.cacheAt;
         response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
-        response.end(JSON.stringify({ watchlist: runtimeConfig.watchlist, rows: params.scanner?.getWatchlistStatus() ?? [] }));
+        response.end(
+          JSON.stringify({
+            watchlist: runtimeConfig.watchlist,
+            rows: reconcileWatchlistRows(params.scanner?.getWatchlistStatus() ?? [], positionsStatus.positions, runtimeConfig.executionMode)
+          })
+        );
         return;
       }
 
@@ -517,6 +527,16 @@ function processAnalysisH1Candle(
   h1Candles: readonly Candle[],
   config: AppConfig
 ): { setup: AnalysisSetupContext; invalidated: AnalysisSetupContext | null } {
+  const trend = detectH1Trend(h1Candles, config.emaPeriod);
+  if (trend.direction !== "neutral" && setup.direction && setup.direction !== trend.direction) {
+    setup = {
+      ...createEmptyAnalysisSetup(candle.symbol),
+      state: "WAITING_HTF_FVG",
+      direction: trend.direction,
+      trendReason: trend.reason
+    };
+  }
+
   if (setup.htfFvg && ["WAITING_HTF_MITIGATION", "WAITING_M5_BOS", "WAITING_M5_FVG", "WAITING_M5_PULLBACK"].includes(setup.state)) {
     if (isFvgInvalidated(setup.htfFvg, candle)) {
       const invalidated = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated bởi H1 close phá boundary đối diện");
@@ -525,7 +545,6 @@ function processAnalysisH1Candle(
   }
 
   if (setup.state === "WAITING_HTF_CONTEXT") {
-    const trend = detectH1Trend(h1Candles, config.emaPeriod);
     if (trend.direction === "neutral") {
       setup.trendReason = trend.reason;
       return { setup, invalidated: null };
@@ -1549,6 +1568,52 @@ async function getManualPositions(
     });
     return [];
   }
+}
+
+async function getCachedOpenPositions(
+  accountClient: BinanceFuturesAccountClient | null,
+  cache: BinanceFuturesPositionStatus[] | null,
+  cacheAt: number,
+  logger: DecisionLogger
+): Promise<{ positions: BinanceFuturesPositionStatus[]; cacheAt: number }> {
+  if (!accountClient) return { positions: [], cacheAt: 0 };
+  if (cache && Date.now() - cacheAt < 5_000) return { positions: cache, cacheAt };
+
+  try {
+    return { positions: await accountClient.getOpenPositions(), cacheAt: Date.now() };
+  } catch (error) {
+    logger.warn("Binance watchlist position sync failed", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return { positions: cache ?? [], cacheAt };
+  }
+}
+
+function reconcileWatchlistRows(
+  rows: unknown[],
+  positions: readonly BinanceFuturesPositionStatus[],
+  executionMode: AppConfig["executionMode"]
+): unknown[] {
+  const openSymbols = new Set(positions.map((position) => position.symbol));
+  return rows.map((row) => {
+    if (!isRecord(row) || typeof row.symbol !== "string") return row;
+
+    const hasRealPosition = openSymbols.has(row.symbol);
+    if (hasRealPosition) {
+      return { ...row, position: "Open", status: "Active", positionSource: "binance" };
+    }
+
+    const enginePosition = row.position === "Open" || row.position === "Paper";
+    if (!enginePosition) {
+      return { ...row, position: "None", positionSource: "binance" };
+    }
+
+    if (executionMode === "paper") {
+      return { ...row, rr: null, position: "Paper", status: "Simulated", positionSource: "paper" };
+    }
+
+    return { ...row, rr: null, position: "None", status: "Unsynced", positionSource: "engine" };
+  });
 }
 
 async function getAccountActivity(

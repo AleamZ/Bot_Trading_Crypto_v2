@@ -130,6 +130,8 @@ export class TradingEngine {
 
     const existingFvg = await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1");
     if (existingFvg) {
+      this.syncSetupStateWithHtfFvg(existingFvg);
+
       if (isFvgInvalidated(existingFvg, candle)) {
         const invalidated = { ...existingFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
         await this.repository.updateFvg(invalidated);
@@ -146,7 +148,7 @@ export class TradingEngine {
       if (existingFvg.status === "waiting-mitigation" && isFvgMitigated(existingFvg, candle, this.config.fvgMitigation)) {
         const active = { ...existingFvg, status: "active" as const, activatedAt: candle.closeTime };
         await this.repository.updateFvg(active);
-        this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "MonitoringLTF");
+        this.syncSetupStateWithHtfFvg(active);
         await this.events.publish({
           type: "FVGActivated",
           at: candle.closeTime,
@@ -389,6 +391,17 @@ export class TradingEngine {
       }
     });
   }
+
+  private syncSetupStateWithHtfFvg(fvg: Fvg): void {
+    if (fvg.status === "waiting-mitigation") {
+      this.state.setupState = advanceSetupState(this.state.setupState, "WaitingMitigation");
+      return;
+    }
+
+    if (fvg.status === "active") {
+      this.state.setupState = advanceSetupState(this.state.setupState, "MonitoringLTF");
+    }
+  }
 }
 
 function isDisplacementSignal(
@@ -417,4 +430,33 @@ function transitionSetupStateIfPossible(current: SetupState, next: SetupState): 
   } catch {
     return current;
   }
+}
+
+function advanceSetupState(current: SetupState, target: SetupState): SetupState {
+  const mainFlow: SetupState[] = [
+    "WaitingTrend",
+    "TrendConfirmed",
+    "FVGDetected",
+    "WaitingMitigation",
+    "MonitoringLTF",
+    "WaitingCHOCH",
+    "WaitingLtfFvg",
+    "WaitingLtfMitigation",
+    "ReadyToEnter",
+    "PositionOpened",
+    "ManagingTrade",
+    "Closed",
+    "Archived"
+  ];
+  const currentIndex = mainFlow.indexOf(current);
+  const targetIndex = mainFlow.indexOf(target);
+  if (currentIndex === -1 || targetIndex === -1 || targetIndex <= currentIndex) return current;
+
+  let nextState = current;
+  for (let index = currentIndex + 1; index <= targetIndex; index += 1) {
+    const targetState = mainFlow[index];
+    if (!targetState) return nextState;
+    nextState = transitionSetupStateIfPossible(nextState, targetState);
+  }
+  return nextState;
 }

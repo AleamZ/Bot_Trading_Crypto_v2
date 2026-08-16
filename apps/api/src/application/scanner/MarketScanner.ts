@@ -11,7 +11,7 @@ export interface WatchlistStatus {
   state: string;
   conditions: string;
   rr: number | null;
-  position: "None" | "Open";
+  position: "None" | "Open" | "Paper";
   status: string;
   lastScanAt: string | null;
 }
@@ -54,8 +54,8 @@ export class MarketScanner {
         state: state.setupState,
         conditions: `${passed}/7`,
         rr: pending?.riskReward ?? state.activeRisk?.riskReward ?? null,
-        position: state.openPositions > 0 ? "Open" : "None",
-        status: statusFromState(state.setupState),
+        position: positionFromState(state.openPositions, this.config.executionMode),
+        status: statusFromState(state.setupState, this.config.executionMode),
         lastScanAt: this.lastCloseTime.has(symbol) ? new Date(this.lastCloseTime.get(symbol) ?? 0).toISOString() : null
       };
     });
@@ -147,9 +147,14 @@ function conditionsPassed(state: string): number {
   return rank[state] ?? 0;
 }
 
-function statusFromState(state: string): string {
+function positionFromState(openPositions: number, executionMode: string): "None" | "Open" | "Paper" {
+  if (openPositions <= 0) return "None";
+  return executionMode === "paper" ? "Paper" : "Open";
+}
+
+function statusFromState(state: string, executionMode: string): string {
   if (state === "ReadyToEnter") return "Ready";
-  if (state === "PositionOpened" || state === "ManagingTrade") return "Active";
+  if (state === "PositionOpened" || state === "ManagingTrade") return executionMode === "paper" ? "Simulated" : "Active";
   if (state === "Archived") return "Invalidated";
   return "Monitoring";
 }

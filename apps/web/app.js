@@ -57,6 +57,7 @@ const defaultSettings = {
 const settingsState = { ...defaultSettings };
 let marketSymbols = [];
 let symbolSearchTerm = "";
+let settingsRequestSequence = 0;
 
 $("home-nav").addEventListener("click", () => showView("home"));
 $("chart-nav").addEventListener("click", () => showView("chart"));
@@ -251,12 +252,9 @@ async function initializeTradingAccounts() {
       return;
     }
 
-    accountState.activeAccount = accountState.accounts[0];
     $("account-selector").hidden = false;
-    renderAccountSelector();
-    await loadActiveAccountStatus();
+    await setActiveTradingAccount(accountState.accounts[0]);
     showView("home");
-    loadSettings();
     load();
     authState.dashboardTimer ??= setInterval(load, 5000);
   } catch (error) {
@@ -282,15 +280,21 @@ function renderAccountSelector() {
       button.type = "button";
       button.innerHTML = `<strong>${escapeHtml(item.name)}</strong><span>${item.mode}</span>`;
       button.addEventListener("click", async () => {
-        accountState.activeAccount = item;
         $("account-selector-popover").hidden = true;
-        renderAccountSelector();
-        await loadActiveAccountStatus();
+        await setActiveTradingAccount(item);
         load();
       });
       return button;
     }),
   );
+}
+
+async function setActiveTradingAccount(account) {
+  accountState.activeAccount = account;
+  Object.assign(settingsState, defaultSettings);
+  renderAccountSelector();
+  renderSettings();
+  await Promise.all([loadActiveAccountStatus(), loadSettings(account.id)]);
 }
 
 function startCreateAccount(mode) {
@@ -687,6 +691,10 @@ function showView(view) {
     if (chartSymbol) $("analysis-symbol").value = chartSymbol;
     loadAnalysis();
   }
+
+  if (view === "settings") {
+    loadSettings();
+  }
 }
 
 async function ensureChart() {
@@ -795,13 +803,18 @@ function analysisStatusClass(status) {
   return "waiting";
 }
 
-async function loadSettings() {
+async function loadSettings(accountId = accountState.activeAccount?.id ?? null) {
+  const sequence = ++settingsRequestSequence;
+  const settingsPath = accountId ? `/api/trading-accounts/${accountId}/settings` : "/api/settings";
+  const watchlistPath = accountId ? `/api/trading-accounts/${accountId}/watchlist` : "/api/watchlist";
+  $("settings-status").textContent = "Loading";
   try {
     const [response, symbolsResponse, watchlistResponse] = await Promise.all([
-      apiFetch(accountState.activeAccount ? `/api/trading-accounts/${accountState.activeAccount.id}/settings` : "/api/settings"),
+      apiFetch(settingsPath),
       apiFetch("/api/market/symbols"),
-      apiFetch(accountState.activeAccount ? `/api/trading-accounts/${accountState.activeAccount.id}/watchlist` : "/api/watchlist"),
+      apiFetch(watchlistPath),
     ]);
+    if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
     if (handleUnauthorized(response) || handleUnauthorized(symbolsResponse) || handleUnauthorized(watchlistResponse)) return;
     if (!response.ok) throw new Error(`Settings request failed: ${response.status}`);
     if (!symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
@@ -812,9 +825,12 @@ async function loadSettings() {
     if (Array.isArray(watchlist.watchlist)) {
       settingsState.watchlist = watchlist.watchlist.join(",");
     }
+    $("settings-status").textContent = "Loaded";
   } catch {
+    if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
     Object.assign(settingsState, defaultSettings);
     marketSymbols = [];
+    $("settings-status").textContent = "Load failed";
   }
   renderSettings();
 }
@@ -889,13 +905,16 @@ function updateSettingFromInput(event) {
 }
 
 async function saveSettings() {
+  const accountId = accountState.activeAccount?.id ?? null;
+  const settingsPath = accountId ? `/api/trading-accounts/${accountId}/settings` : "/api/settings";
   $("settings-status").textContent = "Saving";
   const payload = settingsPayload();
-  const response = await apiFetch(accountState.activeAccount ? `/api/trading-accounts/${accountState.activeAccount.id}/settings` : "/api/settings", {
+  const response = await apiFetch(settingsPath, {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (accountId !== (accountState.activeAccount?.id ?? null)) return;
   if (handleUnauthorized(response)) return;
   if (!response.ok) {
     $("settings-status").textContent = `Save failed: ${response.status}`;

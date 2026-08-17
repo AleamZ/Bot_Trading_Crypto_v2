@@ -174,6 +174,32 @@ describe("trading account HTTP flow", () => {
     expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, settingsA, cookieA)).status).toBe(404);
   });
 
+  it("keeps settings isolated between accounts owned by the same user", async () => {
+    const cookie = await register("a@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "test2", mode: "DEMO" }, cookie)).json()).account;
+
+    const settingsA = { ...testConfig(), marginPerTrade: 10000, leverage: 100, watchlist: ["BTCUSDT"] };
+    const settingsB = { ...testConfig(), marginPerTrade: 200, leverage: 5, watchlist: ["ETHUSDT"] };
+    expect((await putJson(`/api/trading-accounts/${accountA.id}/settings`, settingsA, cookie)).status).toBe(200);
+    expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, settingsB, cookie)).status).toBe(200);
+
+    const loadedA = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/settings`, { headers: { cookie } })).json();
+    const loadedB = await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/settings`, { headers: { cookie } })).json();
+    expect(loadedA.marginPerTrade).toBe(10000);
+    expect(loadedA.leverage).toBe(100);
+    expect(loadedB.marginPerTrade).toBe(200);
+    expect(loadedB.leverage).toBe(5);
+
+    expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...settingsB, marginPerTrade: 333, leverage: 3 }, cookie)).status).toBe(200);
+    const reloadedA = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/settings`, { headers: { cookie } })).json();
+    const reloadedB = await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/settings`, { headers: { cookie } })).json();
+    expect(reloadedA.marginPerTrade).toBe(10000);
+    expect(reloadedA.leverage).toBe(100);
+    expect(reloadedB.marginPerTrade).toBe(333);
+    expect(reloadedB.leverage).toBe(3);
+  });
+
   it("does not share engine instances for the same symbol across accounts", async () => {
     const cookieA = await register("a@example.com");
     const cookieB = await register("b@example.com");

@@ -14,6 +14,10 @@ export class MemoryTradingAccountRepository implements TradingAccountRepository 
     return [...this.accounts.values()].filter((account) => account.userId === userId).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
+  async listAllTradingAccounts(): Promise<TradingAccount[]> {
+    return [...this.accounts.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
   async findTradingAccountById(id: string): Promise<TradingAccount | null> {
     return this.accounts.get(id) ?? null;
   }

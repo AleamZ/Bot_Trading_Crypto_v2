@@ -1,4 +1,5 @@
 import pg from "pg";
+import { getPostgresPool } from "../persistence/PgPoolFactory.js";
 import type { AuthRepository } from "../../application/auth/AuthRepository.js";
 import { DuplicateEmailError } from "../../application/auth/AuthRepository.js";
 import type { User, UserSession } from "../../domain/auth/User.js";
@@ -8,8 +9,7 @@ export class PostgresAuthRepository implements AuthRepository {
   private readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
-    const ssl = shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined;
-    this.pool = ssl ? new pg.Pool({ connectionString, ssl }) : new pg.Pool({ connectionString });
+    this.pool = getPostgresPool(connectionString);
   }
 
   async migrate(): Promise<void> {
@@ -193,8 +193,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isUniqueViolation(error: unknown): boolean {
   return isRecord(error) && error.code === "23505";
-}
-
-function shouldUseSsl(connectionString: string): boolean {
-  return !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
 }

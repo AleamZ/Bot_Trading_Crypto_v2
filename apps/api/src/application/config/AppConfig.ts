@@ -54,11 +54,29 @@ const schema = z.object({
   binanceCredentialEncryptionKey: z.string().optional(),
   binanceApiKey: z.string().optional(),
   binanceApiSecret: z.string().optional(),
-  binanceTestnet: z.coerce.boolean().default(true)
+  binanceTestnet: z.coerce.boolean().default(true),
+  reconciliationIntervalMs: z.coerce.number().int().positive().default(30_000),
+  binanceRetryMaxAttempts: z.coerce.number().int().positive().default(3),
+  binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500)
 });
 
 export type AppConfig = z.infer<typeof schema>;
-export type TradingSettings = Omit<AppConfig, "port" | "executionMode" | "logLevel" | "corsOrigins" | "databaseUrl" | "sessionSecret" | "binanceCredentialEncryptionKey" | "binanceApiKey" | "binanceApiSecret" | "binanceTestnet">;
+export type TradingSettings = Omit<
+  AppConfig,
+  | "port"
+  | "executionMode"
+  | "logLevel"
+  | "corsOrigins"
+  | "databaseUrl"
+  | "sessionSecret"
+  | "binanceCredentialEncryptionKey"
+  | "binanceApiKey"
+  | "binanceApiSecret"
+  | "binanceTestnet"
+  | "reconciliationIntervalMs"
+  | "binanceRetryMaxAttempts"
+  | "binanceRetryBaseDelayMs"
+>;
 
 export const defaultTradingSettings: TradingSettings = {
   symbol: "BTCUSDT",
@@ -108,7 +126,10 @@ const tradingSettingsSchema = schema.omit({
   binanceCredentialEncryptionKey: true,
   binanceApiKey: true,
   binanceApiSecret: true,
-  binanceTestnet: true
+  binanceTestnet: true,
+  reconciliationIntervalMs: true,
+  binanceRetryMaxAttempts: true,
+  binanceRetryBaseDelayMs: true
 });
 
 export function validateTradingSettings(input: unknown): TradingSettings {
@@ -145,7 +166,10 @@ export function loadConfig(): AppConfig {
       process.env.BINANCE_CREDENTIAL_ENCRYPTION_KEY || (process.env.NODE_ENV === "production" ? undefined : "0000000000000000000000000000000000000000000000000000000000000000"),
     binanceApiKey: process.env.BINANCE_API_KEY,
     binanceApiSecret: process.env.BINANCE_API_SECRET,
-    binanceTestnet: process.env.BINANCE_TESTNET
+    binanceTestnet: process.env.BINANCE_TESTNET,
+    reconciliationIntervalMs: process.env.RECONCILIATION_INTERVAL_MS,
+    binanceRetryMaxAttempts: process.env.BINANCE_RETRY_MAX_ATTEMPTS,
+    binanceRetryBaseDelayMs: process.env.BINANCE_RETRY_BASE_DELAY_MS
   });
 }
 

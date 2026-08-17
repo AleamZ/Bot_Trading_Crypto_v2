@@ -29,6 +29,7 @@ export interface BinanceFuturesOpenOrderStatus {
   id: string;
   symbol: string;
   orderId: string;
+  clientOrderId: string | null;
   side: string;
   type: string;
   price: number | null;
@@ -268,6 +269,7 @@ function toOpenOrderStatus(order: OpenOrder): BinanceFuturesOpenOrderStatus {
     id: `binance:open-order:${order.symbol}:${orderId}`,
     symbol: order.symbol,
     orderId,
+    clientOrderId: order.clientOrderId ? String(order.clientOrderId) : null,
     side: order.side ?? "-",
     type: order.type ?? "-",
     price: numberOrNull(order.price),

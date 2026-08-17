@@ -1,12 +1,18 @@
 import crypto from "node:crypto";
-import type { ExecutionGateway, SubmittedOrder } from "../../application/ports/ExecutionGateway.js";
+import type {
+  ExecutionOrderContext,
+  ExecutionOrderLookupResult,
+  ProtectionOrderRequest,
+  RecoverableExecutionGateway,
+  SubmittedOrder
+} from "../../application/ports/ExecutionGateway.js";
 import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 
 type BinanceOrderSide = "BUY" | "SELL";
 type EntryMode = "limit" | "market";
 
-export class BinanceFuturesExecutionGateway implements ExecutionGateway {
+export class BinanceFuturesExecutionGateway implements RecoverableExecutionGateway {
   private readonly baseUrl: string;
   private readonly symbolRules = new Map<string, SymbolRules>();
 
@@ -20,7 +26,7 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
     this.baseUrl = mode === "testnet" ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
   }
 
-  async submitBracketOrder(plan: EntryPlan, risk: RiskDecision): Promise<SubmittedOrder> {
+  async submitBracketOrder(plan: EntryPlan, risk: RiskDecision, context?: ExecutionOrderContext): Promise<SubmittedOrder> {
     const symbol = risk.symbol;
     const rules = await this.getSymbolRules(symbol);
     const quantity = formatByStep(risk.quantity, rules.stepSize);
@@ -30,19 +36,62 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
 
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
-    const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatByStep(plan.entry, rules.tickSize));
-    const stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatByStep(plan.stopLoss, rules.tickSize));
-    const takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatByStep(plan.takeProfit, rules.tickSize));
+    const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatByStep(plan.entry, rules.tickSize), context?.clientEntryOrderId);
+    const stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatByStep(plan.stopLoss, rules.tickSize), context?.clientStopOrderId);
+    const takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatByStep(plan.takeProfit, rules.tickSize), context?.clientTakeProfitOrderId);
 
     return {
       orderId: String(entry.orderId),
       stopLossOrderId: String(stopLoss.orderId),
       takeProfitOrderId: String(takeProfit.orderId),
+      ...(context?.clientEntryOrderId ? { clientEntryOrderId: context.clientEntryOrderId } : {}),
+      ...(context?.clientStopOrderId ? { clientStopOrderId: context.clientStopOrderId } : {}),
+      ...(context?.clientTakeProfitOrderId ? { clientTakeProfitOrderId: context.clientTakeProfitOrderId } : {}),
       mode: this.mode
     };
   }
 
-  private async submitEntryOrder(symbol: string, side: BinanceOrderSide, quantity: string, price: string): Promise<BinanceOrderResponse> {
+  async findOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<ExecutionOrderLookupResult | null> {
+    try {
+      const order = await this.signedGet<BinanceOrderResponse>("/fapi/v1/order", {
+        symbol,
+        origClientOrderId: clientOrderId
+      });
+      return toExecutionOrderLookupResult(order, symbol, clientOrderId);
+    } catch (error) {
+      if (isOrderNotFound(error)) return null;
+      throw error;
+    }
+  }
+
+  async submitProtectionOrder(request: ProtectionOrderRequest): Promise<ExecutionOrderLookupResult> {
+    const rules = await this.getSymbolRules(request.symbol);
+    const order = await this.submitTriggerOrder(
+      request.symbol,
+      request.type,
+      request.side,
+      formatByStep(request.quantity, rules.stepSize),
+      formatByStep(request.stopPrice, rules.tickSize),
+      request.clientOrderId
+    );
+    return toExecutionOrderLookupResult(order, request.symbol, request.clientOrderId);
+  }
+
+  async cancelOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<void> {
+    const params = new URLSearchParams({
+      symbol,
+      origClientOrderId: clientOrderId,
+      timestamp: String(Date.now()),
+      recvWindow: "5000"
+    });
+    try {
+      await this.signedDelete("/fapi/v1/order", params, "Binance order cancel failed");
+    } catch (error) {
+      if (!isOrderNotFound(error)) throw error;
+    }
+  }
+
+  private async submitEntryOrder(symbol: string, side: BinanceOrderSide, quantity: string, price: string, clientOrderId?: string): Promise<BinanceOrderResponse> {
     const params = new URLSearchParams({
       symbol,
       side,
@@ -50,6 +99,7 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
       quantity,
       timestamp: String(Date.now())
     });
+    if (clientOrderId) params.set("newClientOrderId", clientOrderId);
 
     if (this.entryMode === "limit") {
       params.set("timeInForce", "GTC");
@@ -64,7 +114,8 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
     type: "STOP_MARKET" | "TAKE_PROFIT_MARKET",
     side: BinanceOrderSide,
     quantity: string,
-    stopPrice: string
+    stopPrice: string,
+    clientOrderId?: string
   ): Promise<BinanceOrderResponse> {
     const params = new URLSearchParams({
       symbol,
@@ -76,6 +127,7 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
       workingType: "CONTRACT_PRICE",
       timestamp: String(Date.now())
     });
+    if (clientOrderId) params.set("newClientOrderId", clientOrderId);
 
     return this.signedPost("/fapi/v1/order", params, `Binance ${type} order failed`);
   }
@@ -95,6 +147,34 @@ export class BinanceFuturesExecutionGateway implements ExecutionGateway {
       method: "POST",
       headers: { "X-MBX-APIKEY": this.apiKey },
       body: params
+    });
+
+    if (!response.ok) {
+      throw new Error(`${label} ${response.status}: ${await response.text()}`);
+    }
+
+    return (await response.json()) as BinanceOrderResponse;
+  }
+
+  private async signedGet<T>(path: string, queryParams: Record<string, string>): Promise<T> {
+    const params = new URLSearchParams({ ...queryParams, timestamp: String(Date.now()), recvWindow: "5000" });
+    params.set("signature", this.sign(params.toString()));
+    const response = await fetch(`${this.baseUrl}${path}?${params.toString()}`, {
+      headers: { "X-MBX-APIKEY": this.apiKey }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Binance signed GET ${path} failed ${response.status}: ${await response.text()}`);
+    }
+
+    return (await response.json()) as T;
+  }
+
+  private async signedDelete(path: string, params: URLSearchParams, label: string): Promise<BinanceOrderResponse> {
+    params.set("signature", this.sign(params.toString()));
+    const response = await fetch(`${this.baseUrl}${path}?${params.toString()}`, {
+      method: "DELETE",
+      headers: { "X-MBX-APIKEY": this.apiKey }
     });
 
     if (!response.ok) {
@@ -140,6 +220,15 @@ interface SymbolRules {
 
 interface BinanceOrderResponse {
   orderId?: number | string;
+  clientOrderId?: string;
+  symbol?: string;
+  side?: string;
+  type?: string;
+  status?: string;
+  reduceOnly?: boolean | string;
+  origQty?: string;
+  executedQty?: string;
+  avgPrice?: string;
 }
 
 interface BinanceExchangeInfo {
@@ -171,4 +260,29 @@ function decimalPlaces(value: number): number {
   const text = value.toString();
   if (text.includes("e-")) return Number(text.split("e-")[1] ?? 8);
   return text.includes(".") ? text.split(".")[1]?.length ?? 0 : 0;
+}
+
+function toExecutionOrderLookupResult(order: BinanceOrderResponse, fallbackSymbol: string, fallbackClientOrderId: string): ExecutionOrderLookupResult {
+  return {
+    orderId: String(order.orderId ?? fallbackClientOrderId),
+    clientOrderId: String(order.clientOrderId ?? fallbackClientOrderId),
+    symbol: String(order.symbol ?? fallbackSymbol),
+    side: String(order.side ?? "-"),
+    type: String(order.type ?? "-"),
+    status: String(order.status ?? "NEW"),
+    reduceOnly: order.reduceOnly === true || order.reduceOnly === "true",
+    originalQuantity: Number(order.origQty ?? 0),
+    executedQuantity: Number(order.executedQty ?? 0),
+    averagePrice: numberOrNull(order.avgPrice)
+  };
+}
+
+function numberOrNull(value: string | undefined): number | null {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function isOrderNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("-2013") || message.includes("Order does not exist") || message.includes("Unknown order sent") || message.includes(" 404:");
 }

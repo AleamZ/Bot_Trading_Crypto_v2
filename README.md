@@ -181,4 +181,41 @@ This architecture refactor does not change strategy logic:
 
 The account-scoped runtime uses shared public market data plus per-account scanners, engines, repositories, settings, watchlists, risk state, and execution gateways. Trading records written by the account runtime include `trading_account_id`; legacy rows may keep this field `NULL`.
 
-Known limitation: chart overlay routes and some legacy compatibility endpoints still exist while the frontend migrates fully to account-scoped endpoints. Future hardening should add runtime recovery, order reconciliation, observability, and an explicit Mainnet execution approval flow.
+## Phase 4 Testnet Hardening
+
+DEMO execution is protected by durable execution intents keyed by `trading_account_id + setup_key`. The `execution_intents` table has a unique `(trading_account_id, setup_key)` constraint and records Binance order IDs, deterministic client order IDs, lifecycle status, version, and safe errors. Execution audit events are stored separately in `execution_audit_events`.
+
+REAL automatic execution remains locked with `REAL_EXECUTION_LOCKED`.
+
+Runtime health is returned in account-scoped snapshots:
+
+- `READY`, `RECOVERING`, `DEGRADED`, `DISCONNECTED`, `ERROR`
+- reconciliation status and last reconciliation timestamp
+- last reconciliation error when a scan is degraded
+- execution enabled/disabled state
+
+On backend startup the runtime eagerly loads trading accounts, enters `RECOVERING`, reads Binance Testnet positions/orders, reconciles unfinished execution intents, repairs missing bot-owned SL/TP protection orders when safe, and only then moves to `READY`. DEMO execution is blocked while the runtime is `RECOVERING`, `DEGRADED`, `DISCONNECTED`, or waiting for manual reconciliation.
+
+Recovery rules:
+
+- Entry submission timeouts are looked up by deterministic Binance `clientOrderId` before another submit attempt.
+- `ENTRY_SUBMITTED`, `ENTRY_FILLED`, `PROTECTION_INCOMPLETE`, and `RECONCILIATION_REQUIRED` intents are reconciled against Binance order/position state.
+- If only SL or only TP is missing, reconciliation submits only the missing bot-owned protection order.
+- If both protective orders already exist, no duplicate protection order is submitted.
+- If a bot-owned DB position is open but Binance position size is zero, the intent is marked `CLOSED` and only bot-owned stale protection orders are cancelled.
+- Manual/external positions are audited separately and are not attached to bot execution intents.
+
+Manual Testnet checklist:
+
+1. Confirm the trading account is `DEMO`.
+2. Confirm Binance Testnet credentials are connected.
+3. Keep `tradingEnabled=false` until intentionally testing execution.
+4. Enable DEMO trading only for a controlled Testnet account.
+5. Wait for a valid strategy setup; do not force production thresholds.
+6. Confirm exactly one entry, one stop, and one take-profit order are created.
+7. Restart the backend and confirm no duplicate entry/protection orders are created.
+8. Confirm position/order state reconciles after restart.
+9. Close the Testnet position and confirm the execution intent becomes `CLOSED`.
+10. Confirm runtime health returns to `READY`.
+
+Known limitation: chart overlay routes and some legacy compatibility endpoints still exist while the frontend migrates fully to account-scoped endpoints. REAL/Mainnet automatic execution still requires an explicit future approval flow and remains locked.

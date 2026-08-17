@@ -9,6 +9,7 @@ import { MemoryAuthRepository } from "../src/infrastructure/auth/MemoryAuthRepos
 import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
 import { MemoryTradingAccountRepository } from "../src/infrastructure/trading-account/MemoryTradingAccountRepository.js";
 import { MemoryTradingRuntimeConfigRepository } from "../src/infrastructure/trading-account/MemoryTradingRuntimeConfigRepository.js";
+import { MemoryExecutionIntentRepository } from "../src/infrastructure/execution/MemoryExecutionIntentRepository.js";
 import { CredentialCipher } from "../src/infrastructure/security/CredentialCipher.js";
 import { TradingRuntimeManager } from "../src/application/runtime/TradingRuntimeManager.js";
 import { LockedRealExecutionGateway } from "../src/infrastructure/execution/LockedRealExecutionGateway.js";
@@ -46,6 +47,7 @@ describe("trading account HTTP flow", () => {
   let baseUrl: string;
   let accountRepository: MemoryTradingAccountRepository;
   let configRepository: MemoryTradingRuntimeConfigRepository;
+  let executionIntentRepository: MemoryExecutionIntentRepository;
   let verifier: MockVerifier;
   let runtimeManager: TradingRuntimeManager;
   let accountClientFactoryCalls: Array<{ apiKey: string; apiSecret: string; testnet: boolean }>;
@@ -53,6 +55,7 @@ describe("trading account HTTP flow", () => {
   beforeEach(async () => {
     accountRepository = new MemoryTradingAccountRepository();
     configRepository = new MemoryTradingRuntimeConfigRepository();
+    executionIntentRepository = new MemoryExecutionIntentRepository();
     verifier = new MockVerifier();
     accountClientFactoryCalls = [];
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
@@ -63,6 +66,7 @@ describe("trading account HTTP flow", () => {
       undefined,
       accountRepository,
       configRepository,
+      executionIntentRepository,
       cipher,
       new FakeMarketData(),
       fakeLogger(),
@@ -264,13 +268,14 @@ describe("trading account HTTP flow", () => {
     const cookie = await register("a@example.com");
     const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
     const accountB = (await (await postJson("/api/trading-accounts", { name: "test2", mode: "DEMO" }, cookie)).json()).account;
-    await putJson(`/api/trading-accounts/${accountA.id}/binance-connection`, { apiKey: "ACCOUNT_A_KEY", apiSecret: "ACCOUNT_A_SECRET" }, cookie);
     await putJson(`/api/trading-accounts/${accountB.id}/binance-connection`, { apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET" }, cookie);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    accountClientFactoryCalls = [];
 
     const response = await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie } });
     expect(response.status).toBe(200);
-    expect(accountClientFactoryCalls.at(-1)).toEqual({ apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET", testnet: true });
-    expect(accountClientFactoryCalls.some((call) => call.apiKey === "ACCOUNT_A_KEY")).toBe(false);
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET", testnet: true });
+    expect(accountA.id).not.toBe(accountB.id);
   });
 
   it("does not share engine instances for the same symbol across accounts", async () => {

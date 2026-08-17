@@ -13,6 +13,7 @@ export interface CreateTradingAccountInput {
 export interface TradingAccountRepository {
   createTradingAccount(input: CreateTradingAccountInput): Promise<TradingAccount>;
   listTradingAccounts(userId: string): Promise<TradingAccount[]>;
+  listAllTradingAccounts(): Promise<TradingAccount[]>;
   findTradingAccountById(id: string): Promise<TradingAccount | null>;
   updateTradingAccountStatus(id: string, status: TradingAccountStatus, updatedAt: string): Promise<void>;
   upsertBinanceConnection(connection: BinanceConnection): Promise<BinanceConnection>;

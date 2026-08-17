@@ -444,6 +444,7 @@ async function load() {
   const db = store.databaseStatus ?? {};
   const account = snapshot.binanceAccount ?? runtime.account ?? {};
   const connection = snapshot.connection ?? {};
+  const runtimeHealth = snapshot.runtimeHealth ?? {};
   accountState.lastConnection = connection;
   accountState.lastBinanceAccount = account;
   const marketData = runtime.marketData ?? {};
@@ -484,8 +485,9 @@ async function load() {
   $("market-data-detail").textContent = marketData.label ?? "-";
 
   $("engine-state").textContent = engine.setupState ?? "-";
+  const reconciliationError = runtimeHealth.lastReconciliationError ? ` · Error ${runtimeHealth.lastReconciliationError}` : "";
   $("engine-detail").textContent =
-    `Margin ${formatUsdt(runtime.risk?.marginPerTrade)} · Leverage ${runtime.risk?.leverage ?? "-"}x`;
+    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${runtimeHealth.executionEnabled ? "ENABLED" : "DISABLED"}${reconciliationError} · Margin ${formatUsdt(runtime.risk?.marginPerTrade)} · Leverage ${runtime.risk?.leverage ?? "-"}x`;
 
   $("trend").textContent = engine.trend ?? "-";
   $("symbol").textContent = runtime.symbol ?? "-";

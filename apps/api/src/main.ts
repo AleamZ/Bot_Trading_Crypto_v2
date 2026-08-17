@@ -13,6 +13,7 @@ import { CredentialCipher } from "./infrastructure/security/CredentialCipher.js"
 import { BinanceFuturesAccountVerifier } from "./infrastructure/trading-account/BinanceFuturesAccountVerifier.js";
 import { createTradingAccountRepository } from "./infrastructure/trading-account/PostgresTradingAccountRepository.js";
 import { createTradingRuntimeConfigRepository } from "./infrastructure/trading-account/PostgresTradingRuntimeConfigRepository.js";
+import { createExecutionIntentRepository } from "./infrastructure/execution/PostgresExecutionIntentRepository.js";
 import { startHttpServer } from "./presentation/http/Server.js";
 
 let config = loadConfig();
@@ -26,6 +27,7 @@ const authRepository = await createAuthRepository(config.databaseUrl);
 const auth = new AuthService(authRepository, config.sessionSecret ?? "development-session-secret-change-before-production");
 const tradingAccountRepository = await createTradingAccountRepository(config.databaseUrl);
 const tradingRuntimeConfigRepository = await createTradingRuntimeConfigRepository(config.databaseUrl);
+const executionIntentRepository = await createExecutionIntentRepository(config.databaseUrl);
 const credentialCipher = new CredentialCipher(config.binanceCredentialEncryptionKey ?? "0000000000000000000000000000000000000000000000000000000000000000");
 const tradingAccounts = new TradingAccountService(
   tradingAccountRepository,
@@ -50,7 +52,7 @@ const availableBalanceProvider = async () => {
   return status?.connected ? status.availableBalance : null;
 };
 const marketData = new BinanceFuturesMarketData(config.binanceTestnet);
-const runtimeManager = new TradingRuntimeManager(config, config.databaseUrl, tradingAccountRepository, tradingRuntimeConfigRepository, credentialCipher, marketData, logger);
+const runtimeManager = new TradingRuntimeManager(config, config.databaseUrl, tradingAccountRepository, tradingRuntimeConfigRepository, executionIntentRepository, credentialCipher, marketData, logger);
 const scanner = new MarketScanner(config, repository, execution, logger, marketData, availableBalanceProvider);
 const engine = scanner.getPrimaryEngine();
 

@@ -1,4 +1,5 @@
 import pg from "pg";
+import { getPostgresPool } from "../persistence/PgPoolFactory.js";
 import type { CreateTradingAccountInput, TradingAccountRepository } from "../../application/trading-account/TradingAccountRepository.js";
 import type { BinanceConnection, TradingAccount, TradingAccountStatus } from "../../domain/trading-account/TradingAccount.js";
 import { MemoryTradingAccountRepository } from "./MemoryTradingAccountRepository.js";
@@ -7,8 +8,7 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
   private readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
-    const ssl = shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined;
-    this.pool = ssl ? new pg.Pool({ connectionString, ssl }) : new pg.Pool({ connectionString });
+    this.pool = getPostgresPool(connectionString);
   }
 
   async migrate(): Promise<void> {
@@ -72,6 +72,14 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
       `select id, user_id, name, mode, status, created_at, updated_at
        from trading_accounts where user_id = $1 order by created_at asc`,
       [userId]
+    );
+    return result.rows.map(toTradingAccount).filter((account): account is TradingAccount => account !== null);
+  }
+
+  async listAllTradingAccounts(): Promise<TradingAccount[]> {
+    const result = await this.pool.query(
+      `select id, user_id, name, mode, status, created_at, updated_at
+       from trading_accounts order by created_at asc`
     );
     return result.rows.map(toTradingAccount).filter((account): account is TradingAccount => account !== null);
   }
@@ -199,8 +207,4 @@ function toIso(value: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function shouldUseSsl(connectionString: string): boolean {
-  return !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
 }

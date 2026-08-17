@@ -1,5 +1,6 @@
 import pg from "pg";
 import crypto from "node:crypto";
+import { getPostgresPool } from "../persistence/PgPoolFactory.js";
 import type { TradingSettings } from "../../application/config/AppConfig.js";
 import type { TradingRuntimeConfigRepository } from "../../application/trading-account/TradingRuntimeConfigRepository.js";
 import { MemoryTradingRuntimeConfigRepository } from "./MemoryTradingRuntimeConfigRepository.js";
@@ -8,8 +9,7 @@ export class PostgresTradingRuntimeConfigRepository implements TradingRuntimeCon
   private readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
-    const ssl = shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined;
-    this.pool = ssl ? new pg.Pool({ connectionString, ssl }) : new pg.Pool({ connectionString });
+    this.pool = getPostgresPool(connectionString);
   }
 
   async migrate(): Promise<void> {
@@ -109,8 +109,4 @@ export async function createTradingRuntimeConfigRepository(databaseUrl?: string)
   const repository = new PostgresTradingRuntimeConfigRepository(databaseUrl);
   await repository.migrate();
   return repository;
-}
-
-function shouldUseSsl(connectionString: string): boolean {
-  return !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
 }

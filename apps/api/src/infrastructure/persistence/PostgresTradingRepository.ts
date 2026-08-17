@@ -1,4 +1,5 @@
 import pg from "pg";
+import { getPostgresPool } from "./PgPoolFactory.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
 import type { DomainEvent } from "../../domain/events/DomainEvent.js";
 import type { Fvg } from "../../domain/fvg/Fvg.js";
@@ -22,8 +23,7 @@ export class PostgresTradingRepository implements TradingRepository {
     connectionString: string,
     private readonly tradingAccountId: string | null = null
   ) {
-    const ssl = shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined;
-    this.pool = ssl ? new pg.Pool({ connectionString, ssl }) : new pg.Pool({ connectionString });
+    this.pool = getPostgresPool(connectionString);
   }
 
   async migrate(): Promise<void> {
@@ -156,9 +156,6 @@ export async function createRepository(databaseUrl?: string): Promise<TradingRep
   }
 }
 
-function shouldUseSsl(connectionString: string): boolean {
-  return !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
-}
 
 function sanitizeDatabaseError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);

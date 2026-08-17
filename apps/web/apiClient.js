@@ -12,6 +12,10 @@ export function apiUrl(path) {
   return `${API_BASE_URL}${normalizedPath}`;
 }
 
-export function apiFetch(path, options) {
-  return fetch(apiUrl(path), options);
+export async function apiFetch(path, options) {
+  const response = await fetch(apiUrl(path), { credentials: "include", ...(options ?? {}) });
+  if (response.status === 401 && !path.startsWith("/api/auth/")) {
+    window.dispatchEvent(new CustomEvent("auth:unauthorized"));
+  }
+  return response;
 }

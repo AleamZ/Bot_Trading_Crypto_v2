@@ -6,6 +6,18 @@ const chartState = {
   timer: null,
   module: null,
 };
+const authState = {
+  user: null,
+  dashboardTimer: null,
+};
+const accountState = {
+  accounts: [],
+  activeAccount: null,
+  pendingMode: null,
+  testedCredentials: null,
+  lastConnection: null,
+  lastBinanceAccount: null,
+};
 const defaultSettings = {
   watchlist: "",
   positionSizingMode: "fixed-margin",
@@ -50,35 +62,397 @@ $("home-nav").addEventListener("click", () => showView("home"));
 $("chart-nav").addEventListener("click", () => showView("chart"));
 $("analysis-nav").addEventListener("click", () => showView("analysis"));
 $("settings-nav").addEventListener("click", () => showView("settings"));
+$("account-nav").addEventListener("click", () => {
+  $("user-menu-popover").hidden = true;
+  showView("account");
+});
+$("account-selector-trigger").addEventListener("click", () => {
+  $("account-selector-popover").hidden = !$("account-selector-popover").hidden;
+});
+$("add-account-button").addEventListener("click", () => {
+  $("account-selector-popover").hidden = true;
+  showView("onboarding");
+});
+document.querySelectorAll("[data-create-account-mode]").forEach((button) => {
+  button.addEventListener("click", () => startCreateAccount(button.dataset.createAccountMode));
+});
+$("account-create-submit").addEventListener("click", createTradingAccount);
+$("connect-test-button").addEventListener("click", testBinanceConnection);
+$("connect-save-button").addEventListener("click", saveBinanceConnection);
+$("user-menu-trigger").addEventListener("click", () => {
+  $("user-menu-popover").hidden = !$("user-menu-popover").hidden;
+});
+$("logout-button").addEventListener("click", logout);
+$("show-register").addEventListener("click", () => showAuthForm("register"));
+$("show-login").addEventListener("click", () => showAuthForm("login"));
+$("login-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  login();
+});
+$("register-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  register();
+});
 window.addEventListener("resize", () => resizeChart());
+window.addEventListener("auth:unauthorized", () => {
+  showLoggedOut();
+  $("login-message").textContent = "Please login to continue";
+});
+
+boot();
+
+async function boot() {
+  showLoggedOut();
+  try {
+    const response = await apiFetch("/api/auth/me");
+    if (response.ok) {
+      const payload = await response.json();
+      showLoggedIn(payload.user);
+      return;
+    }
+  } catch {
+    // Keep login visible when the API is temporarily unavailable.
+  }
+  showLoggedOut();
+}
+
+async function login() {
+  await submitAuth({
+    form: "login",
+    path: "/api/auth/login",
+    payload: {
+      email: $("login-email").value,
+      password: $("login-password").value,
+    },
+  });
+}
+
+async function register() {
+  const password = $("register-password").value;
+  if (password !== $("register-confirm-password").value) {
+    $("register-message").textContent = "Passwords do not match";
+    return;
+  }
+
+  await submitAuth({
+    form: "register",
+    path: "/api/auth/register",
+    payload: {
+      email: $("register-email").value,
+      password,
+    },
+  });
+}
+
+async function submitAuth({ form, path, payload }) {
+  const submit = $(`${form}-submit`);
+  const message = $(`${form}-message`);
+  submit.disabled = true;
+  message.textContent = "Loading";
+
+  try {
+    const response = await apiFetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.error ?? `Authentication failed: ${response.status}`);
+    message.textContent = "";
+    showLoggedIn(body.user);
+  } catch (error) {
+    message.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function logout() {
+  $("logout-button").disabled = true;
+  try {
+    await apiFetch("/api/auth/logout", { method: "POST" });
+  } finally {
+    $("logout-button").disabled = false;
+    showLoggedOut();
+  }
+}
+
+function showLoggedIn(user) {
+  authState.user = user;
+  $("auth-view").hidden = true;
+  document.querySelector(".nav-tabs").hidden = false;
+  $("user-menu").hidden = false;
+  $("user-menu-trigger").textContent = `${user?.email ?? "Account"} ▼`;
+  renderAccount(user);
+  initializeTradingAccounts();
+}
+
+function showLoggedOut() {
+  authState.user = null;
+  if (authState.dashboardTimer) {
+    clearInterval(authState.dashboardTimer);
+    authState.dashboardTimer = null;
+  }
+  if (chartState.timer) {
+    clearInterval(chartState.timer);
+    chartState.timer = null;
+  }
+  $("auth-view").hidden = false;
+  document.querySelector(".nav-tabs").hidden = true;
+  $("account-selector").hidden = true;
+  $("account-selector-popover").hidden = true;
+  $("user-menu").hidden = true;
+  $("user-menu-popover").hidden = true;
+  document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
+  Object.assign(accountState, {
+    accounts: [],
+    activeAccount: null,
+    pendingMode: null,
+    testedCredentials: null,
+    lastConnection: null,
+    lastBinanceAccount: null,
+  });
+}
+
+function showAuthForm(form) {
+  $("login-form").hidden = form !== "login";
+  $("register-form").hidden = form !== "register";
+  $("login-message").textContent = "";
+  $("register-message").textContent = "";
+}
+
+function renderAccount(user) {
+  $("account-email").textContent = user?.email ?? "-";
+  $("account-id").textContent = user?.id ?? "-";
+  $("account-created-at").textContent = user?.createdAt ? new Date(user.createdAt).toLocaleString() : "-";
+}
+
+async function safeJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+}
+
+function handleUnauthorized(response) {
+  if (response.status !== 401) return false;
+  showLoggedOut();
+  $("login-message").textContent = "Please login to continue";
+  return true;
+}
+
+async function initializeTradingAccounts() {
+  try {
+    await refreshTradingAccounts();
+    if (accountState.accounts.length === 0) {
+      $("account-selector").hidden = true;
+      showView("onboarding");
+      return;
+    }
+
+    accountState.activeAccount = accountState.accounts[0];
+    $("account-selector").hidden = false;
+    renderAccountSelector();
+    await loadActiveAccountStatus();
+    showView("home");
+    loadSettings();
+    load();
+    authState.dashboardTimer ??= setInterval(load, 5000);
+  } catch (error) {
+    $("login-message").textContent = error instanceof Error ? error.message : String(error);
+    showLoggedOut();
+  }
+}
+
+async function refreshTradingAccounts() {
+  const response = await apiFetch("/api/trading-accounts");
+  if (handleUnauthorized(response)) return;
+  if (!response.ok) throw new Error(`Trading accounts request failed: ${response.status}`);
+  accountState.accounts = (await response.json()).accounts ?? [];
+}
+
+function renderAccountSelector() {
+  const account = accountState.activeAccount;
+  $("account-selector-trigger").textContent = account ? `${account.name} ▼` : "Select Account";
+  $("account-selector-list").replaceChildren(
+    ...accountState.accounts.map((item) => {
+      const button = document.createElement("button");
+      button.className = "account-selector-row";
+      button.type = "button";
+      button.innerHTML = `<strong>${escapeHtml(item.name)}</strong><span>${item.mode}</span>`;
+      button.addEventListener("click", async () => {
+        accountState.activeAccount = item;
+        $("account-selector-popover").hidden = true;
+        renderAccountSelector();
+        await loadActiveAccountStatus();
+        load();
+      });
+      return button;
+    }),
+  );
+}
+
+function startCreateAccount(mode) {
+  accountState.pendingMode = mode === "REAL" ? "REAL" : "DEMO";
+  $("account-create-title").textContent = accountState.pendingMode === "REAL" ? "Create Real Account" : "Create Demo Account";
+  $("account-create-environment").textContent = accountEnvironmentLabel(accountState.pendingMode);
+  $("account-create-name").value = accountState.pendingMode === "REAL" ? "My Binance" : "My Testnet";
+  $("account-create-message").textContent = "";
+  showView("account-create");
+}
+
+async function createTradingAccount() {
+  const mode = accountState.pendingMode ?? "DEMO";
+  $("account-create-submit").disabled = true;
+  $("account-create-message").textContent = "Creating";
+  try {
+    const response = await apiFetch("/api/trading-accounts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: $("account-create-name").value, mode }),
+    });
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.error ?? `Create account failed: ${response.status}`);
+    await refreshTradingAccounts();
+    accountState.activeAccount = body.account;
+    accountState.pendingMode = null;
+    $("account-selector").hidden = false;
+    renderAccountSelector();
+    openConnectView();
+  } catch (error) {
+    $("account-create-message").textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    $("account-create-submit").disabled = false;
+  }
+}
+
+function openConnectView() {
+  const account = accountState.activeAccount;
+  if (!account) return;
+  $("connect-account-label").textContent = `Account: ${account.name}`;
+  $("connect-environment-label").textContent = `Environment: ${accountEnvironmentLabel(account.mode)}`;
+  $("real-connection-warning").hidden = account.mode !== "REAL";
+  $("connect-api-key").value = "";
+  $("connect-api-secret").value = "";
+  $("connect-save-button").disabled = true;
+  $("connect-status").textContent = "Connection Status: Not connected";
+  $("connect-message").textContent = "";
+  accountState.testedCredentials = null;
+  showView("connect");
+}
+
+async function testBinanceConnection() {
+  const account = accountState.activeAccount;
+  if (!account) return;
+  const credentials = { apiKey: $("connect-api-key").value, apiSecret: $("connect-api-secret").value };
+  $("connect-test-button").disabled = true;
+  $("connect-message").textContent = "Testing connection";
+  try {
+    const response = await apiFetch(`/api/trading-accounts/${account.id}/binance-connection/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(credentials),
+    });
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.error ?? `Connection test failed: ${response.status}`);
+    accountState.testedCredentials = credentials;
+    accountState.lastConnection = body.connection;
+    accountState.lastBinanceAccount = body.account;
+    $("connect-api-secret").value = "";
+    $("connect-save-button").disabled = false;
+    $("connect-status").textContent = `✓ ${accountEnvironmentLabel(account.mode)} connected · ${body.connection.apiKeyMasked} · Wallet ${formatUsdt(body.account.walletBalance)}`;
+    $("connect-message").textContent = "";
+  } catch (error) {
+    accountState.testedCredentials = null;
+    $("connect-save-button").disabled = true;
+    $("connect-message").textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    $("connect-test-button").disabled = false;
+  }
+}
+
+async function saveBinanceConnection() {
+  const account = accountState.activeAccount;
+  if (!account || !accountState.testedCredentials) return;
+  $("connect-save-button").disabled = true;
+  $("connect-message").textContent = "Saving connection";
+  try {
+    const response = await apiFetch(`/api/trading-accounts/${account.id}/binance-connection`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(accountState.testedCredentials),
+    });
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.error ?? `Save connection failed: ${response.status}`);
+    accountState.lastConnection = body.connection;
+    accountState.lastBinanceAccount = body.account;
+    accountState.testedCredentials = null;
+    await refreshTradingAccounts();
+    accountState.activeAccount = accountState.accounts.find((item) => item.id === account.id) ?? account;
+    renderAccountSelector();
+    showView("home");
+    load();
+    authState.dashboardTimer ??= setInterval(load, 5000);
+  } catch (error) {
+    $("connect-message").textContent = error instanceof Error ? error.message : String(error);
+    $("connect-save-button").disabled = false;
+  }
+}
+
+async function loadActiveAccountStatus() {
+  const account = accountState.activeAccount;
+  if (!account) return;
+  const [connectionResponse, accountResponse] = await Promise.all([
+    apiFetch(`/api/trading-accounts/${account.id}/binance-connection`),
+    apiFetch(`/api/trading-accounts/${account.id}/binance-account`),
+  ]);
+  if (handleUnauthorized(connectionResponse) || handleUnauthorized(accountResponse)) return;
+  accountState.lastConnection = connectionResponse.ok ? (await connectionResponse.json()).connection : null;
+  accountState.lastBinanceAccount = accountResponse.ok ? (await accountResponse.json()).account : null;
+}
+
+function accountEnvironmentLabel(mode) {
+  return mode === "REAL" ? "Binance Futures Mainnet" : "Binance Futures Testnet";
+}
+
+function escapeHtml(value) {
+  const element = document.createElement("span");
+  element.textContent = value;
+  return element.innerHTML;
+}
 
 async function load() {
-  const [snapshotResponse, watchlistResponse] = await Promise.all([
-    apiFetch("/api/snapshot"),
-    apiFetch("/api/watchlist/status"),
-  ]);
+  if (!accountState.activeAccount) return;
+  const snapshotResponse = await apiFetch(`/api/trading-accounts/${accountState.activeAccount.id}/snapshot`);
+  if (handleUnauthorized(snapshotResponse)) return;
+  if (!snapshotResponse.ok) throw new Error(`Snapshot request failed: ${snapshotResponse.status}`);
   const snapshot = await snapshotResponse.json();
-  const watchlist = await watchlistResponse.json();
   const engine = snapshot.engine ?? {};
   const runtime = snapshot.runtime ?? {};
   const store = snapshot.store ?? {};
   const db = store.databaseStatus ?? {};
-  const account = runtime.account ?? {};
+  const account = snapshot.binanceAccount ?? runtime.account ?? {};
+  const connection = snapshot.connection ?? {};
+  accountState.lastConnection = connection;
+  accountState.lastBinanceAccount = account;
   const marketData = runtime.marketData ?? {};
 
   $("connection").textContent =
     `${runtime.symbol ?? "-"} · H1 ${engine.candleCounts?.H1 ?? 0} / M5 ${engine.candleCounts?.M5 ?? 0}`;
   setHeroBadge(
     "account-pill",
-    account.connected ? "CONNECTED" : "DISCONNECTED",
+    connection.status === "CONNECTED" || account.connected ? "CONNECTED" : "DISCONNECTED",
     account.connected,
   );
   setHeroBadge(
     "network-pill",
-    String(account.environment ?? "-").toUpperCase(),
-    account.connected,
+    accountState.activeAccount ? `${accountState.activeAccount.mode} · ${account.environment ?? "-"}` : String(account.environment ?? "-").toUpperCase(),
+    connection.status === "CONNECTED" || account.connected,
   );
-  $("mode-detail").textContent = getModeDetail(runtime.executionMode);
+  $("mode-detail").textContent = accountState.activeAccount
+    ? `${accountState.activeAccount.name} · ${accountEnvironmentLabel(accountState.activeAccount.mode)}`
+    : getModeDetail(runtime.executionMode);
   setPill(
     "db-pill",
     `DB: ${db.database ?? "unknown"}`,
@@ -87,9 +461,10 @@ async function load() {
 
   $("account").textContent = account.connected ? "Connected" : "Not connected";
   $("account-detail").textContent =
-    `${account.environment ?? "-"} · ${account.label ?? "-"}`;
+    accountState.activeAccount ? `${accountState.activeAccount.name} · ${connection.apiKeyMasked ?? "No API key saved"}` : `${account.environment ?? "-"} · ${account.label ?? "-"}`;
   $("wallet-balance").textContent = formatUsdt(account.walletBalance);
   $("available-balance").textContent = formatUsdt(account.availableBalance);
+  $("connect-binance-button").hidden = connection.status === "CONNECTED";
 
   $("database").textContent =
     db.database === "postgres" ? "Postgres" : "Memory";
@@ -145,7 +520,7 @@ async function load() {
     }),
   );
 
-  renderWatchlist(watchlist.rows ?? []);
+  renderWatchlist(snapshot.watchlistRows ?? []);
 }
 
 function setPill(id, text, ok) {
@@ -227,6 +602,7 @@ function tableCell(value) {
 }
 
 $("refresh").addEventListener("click", load);
+$("connect-binance-button").addEventListener("click", openConnectView);
 $("chart-refresh").addEventListener("click", loadChart);
 $("chart-symbol").addEventListener("change", loadChart);
 $("chart-interval").addEventListener("change", loadChart);
@@ -283,15 +659,15 @@ document.querySelectorAll("[data-setting-group]").forEach((group) => {
     saveSettings();
   });
 });
-loadSettings();
-setInterval(load, 1000);
-load();
-
 function showView(view) {
   $("home-view").classList.toggle("active", view === "home");
   $("chart-view").classList.toggle("active", view === "chart");
   $("analysis-view").classList.toggle("active", view === "analysis");
   $("settings-view").classList.toggle("active", view === "settings");
+  $("account-view").classList.toggle("active", view === "account");
+  $("onboarding-view").classList.toggle("active", view === "onboarding");
+  $("account-create-view").classList.toggle("active", view === "account-create");
+  $("connect-view").classList.toggle("active", view === "connect");
   $("home-nav").classList.toggle("active", view === "home");
   $("chart-nav").classList.toggle("active", view === "chart");
   $("analysis-nav").classList.toggle("active", view === "analysis");
@@ -355,7 +731,11 @@ async function loadAnalysis() {
   $("analysis-run").disabled = true;
 
   try {
-    const response = await apiFetch(`/api/analysis?symbol=${encodeURIComponent(symbol)}`);
+    const path = accountState.activeAccount
+      ? `/api/trading-accounts/${accountState.activeAccount.id}/analysis?symbol=${encodeURIComponent(symbol)}`
+      : `/api/analysis?symbol=${encodeURIComponent(symbol)}`;
+    const response = await apiFetch(path);
+    if (handleUnauthorized(response)) return;
     if (!response.ok) throw new Error(`Analysis request failed: ${response.status}`);
     renderAnalysis(await response.json());
   } catch (error) {
@@ -418,10 +798,11 @@ function analysisStatusClass(status) {
 async function loadSettings() {
   try {
     const [response, symbolsResponse, watchlistResponse] = await Promise.all([
-      apiFetch("/api/settings"),
+      apiFetch(accountState.activeAccount ? `/api/trading-accounts/${accountState.activeAccount.id}/settings` : "/api/settings"),
       apiFetch("/api/market/symbols"),
-      apiFetch("/api/watchlist"),
+      apiFetch(accountState.activeAccount ? `/api/trading-accounts/${accountState.activeAccount.id}/watchlist` : "/api/watchlist"),
     ]);
+    if (handleUnauthorized(response) || handleUnauthorized(symbolsResponse) || handleUnauthorized(watchlistResponse)) return;
     if (!response.ok) throw new Error(`Settings request failed: ${response.status}`);
     if (!symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
     if (!watchlistResponse.ok) throw new Error(`Watchlist request failed: ${watchlistResponse.status}`);
@@ -510,11 +891,12 @@ function updateSettingFromInput(event) {
 async function saveSettings() {
   $("settings-status").textContent = "Saving";
   const payload = settingsPayload();
-  const response = await apiFetch("/api/settings", {
+  const response = await apiFetch(accountState.activeAccount ? `/api/trading-accounts/${accountState.activeAccount.id}/settings` : "/api/settings", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (handleUnauthorized(response)) return;
   if (!response.ok) {
     $("settings-status").textContent = `Save failed: ${response.status}`;
     return;

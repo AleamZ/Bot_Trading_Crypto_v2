@@ -9,15 +9,129 @@
   <body>
     <header class="app-header">
       <div class="brand">SMC Futures Bot</div>
-      <nav class="nav-tabs" aria-label="Main navigation">
+      <nav class="nav-tabs" aria-label="Main navigation" hidden>
         <button class="nav-tab active" id="home-nav" type="button">Home</button>
         <button class="nav-tab" id="chart-nav" type="button">Chart</button>
         <button class="nav-tab" id="analysis-nav" type="button">Analysis</button>
         <button class="nav-tab" id="settings-nav" type="button">Setting</button>
       </nav>
+      <div class="account-selector" id="account-selector" hidden>
+        <button class="user-menu-trigger" id="account-selector-trigger" type="button">Select Account</button>
+        <div class="user-menu-popover account-selector-popover" id="account-selector-popover" hidden>
+          <div id="account-selector-list"></div>
+          <button id="add-account-button" type="button">+ Add Account</button>
+        </div>
+      </div>
+      <div class="user-menu" id="user-menu" hidden>
+        <button class="user-menu-trigger" id="user-menu-trigger" type="button">Account</button>
+        <div class="user-menu-popover" id="user-menu-popover" hidden>
+          <button id="account-nav" type="button">Account</button>
+          <button id="logout-button" type="button">Logout</button>
+        </div>
+      </div>
     </header>
 
     <main class="shell">
+      <section class="auth-view" id="auth-view">
+        <form class="auth-panel" id="login-form">
+          <h1>Login</h1>
+          <label for="login-email">Email</label>
+          <input id="login-email" autocomplete="email" type="email" />
+          <label for="login-password">Password</label>
+          <input id="login-password" autocomplete="current-password" type="password" />
+          <button id="login-submit" type="submit">Login</button>
+          <p class="auth-message" id="login-message"></p>
+          <p class="auth-switch">Don't have an account? <button id="show-register" type="button">Register</button></p>
+        </form>
+
+        <form class="auth-panel" id="register-form" hidden>
+          <h1>Create Account</h1>
+          <label for="register-email">Email</label>
+          <input id="register-email" autocomplete="email" type="email" />
+          <label for="register-password">Password</label>
+          <input id="register-password" autocomplete="new-password" type="password" />
+          <label for="register-confirm-password">Confirm Password</label>
+          <input id="register-confirm-password" autocomplete="new-password" type="password" />
+          <button id="register-submit" type="submit">Create account</button>
+          <p class="auth-message" id="register-message"></p>
+          <p class="auth-switch">Already have an account? <button id="show-login" type="button">Login</button></p>
+        </form>
+      </section>
+
+      <section class="view" id="onboarding-view">
+        <section class="onboarding-panel">
+          <h1>Welcome</h1>
+          <p>Choose your trading account environment.</p>
+          <div class="mode-choice-grid">
+            <button class="mode-choice" type="button" data-create-account-mode="DEMO">
+              <strong>DEMO</strong>
+              <span>Binance Futures Testnet</span>
+              <small>Safe test environment</small>
+            </button>
+            <button class="mode-choice real" type="button" data-create-account-mode="REAL">
+              <strong>REAL</strong>
+              <span>Binance Futures Mainnet</span>
+              <small>Live account</small>
+            </button>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="account-create-view">
+        <section class="auth-panel account-form-panel">
+          <h1 id="account-create-title">Create Account</h1>
+          <p id="account-create-environment">Environment</p>
+          <label for="account-create-name">Name</label>
+          <input id="account-create-name" value="My Testnet" />
+          <button id="account-create-submit" type="button">Continue</button>
+          <p class="auth-message" id="account-create-message"></p>
+        </section>
+      </section>
+
+      <section class="view" id="connect-view">
+        <section class="auth-panel connect-panel">
+          <h1>Connect Binance</h1>
+          <p id="connect-account-label">Account</p>
+          <p id="connect-environment-label">Environment</p>
+          <small>Never enter your Binance password. Only API credentials are accepted here.</small>
+          <small id="real-connection-warning" hidden>Use an API key with only the permissions needed by the bot. Do not enable withdrawal permission.</small>
+          <label for="connect-api-key">API Key</label>
+          <input id="connect-api-key" autocomplete="off" />
+          <label for="connect-api-secret">Secret Key</label>
+          <input id="connect-api-secret" autocomplete="off" type="password" />
+          <button id="connect-test-button" type="button">Test Connection</button>
+          <button id="connect-save-button" type="button" disabled>Save & Continue</button>
+          <p id="connect-status">Connection Status: Not connected</p>
+          <p class="auth-message" id="connect-message"></p>
+        </section>
+      </section>
+
+      <section class="view" id="account-view">
+        <section class="settings-toolbar">
+          <div>
+            <h1>Account</h1>
+            <p id="account-view-status">Authenticated</p>
+          </div>
+        </section>
+        <section class="status-grid account-grid">
+          <article class="status-card">
+            <span>Email</span>
+            <strong id="account-email">-</strong>
+            <small>Signed in user</small>
+          </article>
+          <article class="status-card">
+            <span>User ID</span>
+            <strong id="account-id">-</strong>
+            <small>Phase 1 identity</small>
+          </article>
+          <article class="status-card">
+            <span>Created At</span>
+            <strong id="account-created-at">-</strong>
+            <small>UTC session profile</small>
+          </article>
+        </section>
+      </section>
+
       <section class="view active" id="home-view">
         <section class="wallet-hero">
           <div>
@@ -40,6 +154,7 @@
           </div>
           <div class="hero-actions">
             <span class="pill" id="db-pill">DB: -</span>
+            <button id="connect-binance-button" type="button">Connect Binance</button>
             <button id="refresh" title="Refresh snapshot" aria-label="Refresh snapshot">Refresh</button>
           </div>
         </section>

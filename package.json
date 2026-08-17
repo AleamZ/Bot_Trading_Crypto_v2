@@ -19,6 +19,7 @@
     "typecheck": "npm run typecheck -w @smc-futures-bot/api && npm run typecheck -w @smc-futures-bot/web"
   },
   "dependencies": {
+    "argon2": "^0.45.1",
     "dotenv": "^16.4.7",
     "pg": "^8.13.1",
     "zod": "^3.24.1"

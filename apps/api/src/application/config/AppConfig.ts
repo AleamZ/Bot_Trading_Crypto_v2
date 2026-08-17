@@ -50,13 +50,15 @@ const schema = z.object({
   takeProfitMode: z.enum(["external-liquidity", "fixed-rr"]).default("external-liquidity"),
   fixedRr: z.coerce.number().positive().default(2),
   databaseUrl: z.string().optional(),
+  sessionSecret: z.string().min(32).optional(),
+  binanceCredentialEncryptionKey: z.string().optional(),
   binanceApiKey: z.string().optional(),
   binanceApiSecret: z.string().optional(),
   binanceTestnet: z.coerce.boolean().default(true)
 });
 
 export type AppConfig = z.infer<typeof schema>;
-export type TradingSettings = Omit<AppConfig, "port" | "executionMode" | "logLevel" | "corsOrigins" | "databaseUrl" | "binanceApiKey" | "binanceApiSecret" | "binanceTestnet">;
+export type TradingSettings = Omit<AppConfig, "port" | "executionMode" | "logLevel" | "corsOrigins" | "databaseUrl" | "sessionSecret" | "binanceCredentialEncryptionKey" | "binanceApiKey" | "binanceApiSecret" | "binanceTestnet">;
 
 export const defaultTradingSettings: TradingSettings = {
   symbol: "BTCUSDT",
@@ -102,6 +104,8 @@ const tradingSettingsSchema = schema.omit({
   logLevel: true,
   corsOrigins: true,
   databaseUrl: true,
+  sessionSecret: true,
+  binanceCredentialEncryptionKey: true,
   binanceApiKey: true,
   binanceApiSecret: true,
   binanceTestnet: true
@@ -136,6 +140,9 @@ export function loadConfig(): AppConfig {
     symbol: normalizeWatchlist(process.env.DEFAULT_WATCHLIST ?? defaultTradingSettings.watchlist)[0],
     watchlist: normalizeWatchlist(process.env.DEFAULT_WATCHLIST ?? defaultTradingSettings.watchlist),
     databaseUrl: process.env.DATABASE_URL,
+    sessionSecret: process.env.SESSION_SECRET || (process.env.NODE_ENV === "production" ? undefined : "development-session-secret-change-before-production"),
+    binanceCredentialEncryptionKey:
+      process.env.BINANCE_CREDENTIAL_ENCRYPTION_KEY || (process.env.NODE_ENV === "production" ? undefined : "0000000000000000000000000000000000000000000000000000000000000000"),
     binanceApiKey: process.env.BINANCE_API_KEY,
     binanceApiSecret: process.env.BINANCE_API_SECRET,
     binanceTestnet: process.env.BINANCE_TESTNET

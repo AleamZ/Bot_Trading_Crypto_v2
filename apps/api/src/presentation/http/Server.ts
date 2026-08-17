@@ -1,4 +1,10 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AuthService } from "../../application/auth/AuthService.js";
+import { InvalidAuthInputError, InvalidCredentialsError, isDuplicateEmailError } from "../../application/auth/AuthService.js";
+import type { TradingAccountService } from "../../application/trading-account/TradingAccountService.js";
+import { InvalidTradingAccountInputError, TradingAccountNotFoundError } from "../../application/trading-account/TradingAccountService.js";
+import { BinanceVerificationError } from "../../application/trading-account/BinanceAccountVerifier.js";
+import type { TradingRuntimeManager } from "../../application/runtime/TradingRuntimeManager.js";
 import type { TradingEngine } from "../../application/engine/TradingEngine.js";
 import type { MarketScanner } from "../../application/scanner/MarketScanner.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
@@ -29,14 +35,19 @@ import type { MarketStructureSignal } from "../../domain/market-structure/Market
 import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 
-export function startHttpServer(params: {
+export interface HttpServerParams {
   port: number;
   config: AppConfig;
   engine: TradingEngine;
   repository: TradingRepository;
   logger: DecisionLogger;
   scanner?: MarketScanner;
-}): void {
+  auth: AuthService;
+  tradingAccounts?: TradingAccountService;
+  runtimeManager?: TradingRuntimeManager;
+}
+
+export function createHttpHandler(params: HttpServerParams): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
   let runtimeConfig = params.config;
   const marketData = new BinanceFuturesMarketData(runtimeConfig.binanceTestnet);
   const accountClient =
@@ -48,7 +59,7 @@ export function startHttpServer(params: {
   let openPositionsCache: BinanceFuturesPositionStatus[] | null = null;
   let openPositionsCacheAt = 0;
 
-  const server = createServer(async (request, response) => {
+  return async (request, response) => {
     let requestCorsHeaders: Record<string, string> = {};
     try {
       requestCorsHeaders = corsHeadersFor(request, runtimeConfig);
@@ -59,6 +70,37 @@ export function startHttpServer(params: {
       }
 
       const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+
+      if (requestUrl.pathname.startsWith("/api/auth/")) {
+        await handleAuthRoute({ request, response, requestUrl, corsHeaders: requestCorsHeaders, auth: params.auth, config: runtimeConfig });
+        return;
+      }
+
+      const authenticatedUser = await params.auth.currentUser(readCookie(request, sessionCookieName));
+      if (!authenticatedUser) {
+        sendJson(response, 401, { error: "Unauthorized" }, requestCorsHeaders);
+        return;
+      }
+
+      if (requestUrl.pathname.startsWith("/api/trading-accounts")) {
+        if (!params.tradingAccounts) {
+          sendJson(response, 503, { error: "Trading account service is unavailable" }, requestCorsHeaders);
+          return;
+        }
+        await handleTradingAccountRoute({
+          request,
+          response,
+          requestUrl,
+          corsHeaders: requestCorsHeaders,
+          userId: authenticatedUser.id,
+          service: params.tradingAccounts,
+          config: runtimeConfig,
+          marketData,
+          ...(params.runtimeManager ? { runtimeManager: params.runtimeManager } : {})
+        });
+        return;
+      }
+      // TODO Phase 3: Scope trading resources by authenticated tradingAccountId.
 
       if (requestUrl.pathname === "/api/snapshot") {
         const store = await params.repository.getDashboardSnapshot();
@@ -187,12 +229,38 @@ export function startHttpServer(params: {
       response.writeHead(404, noCacheHeaders("application/json", requestCorsHeaders));
       response.end(JSON.stringify({ error: "API route not found" }));
     } catch (error) {
+      const duplicateEmail = isDuplicateEmailError(error);
+      const status =
+        error instanceof InvalidAuthInputError || error instanceof InvalidTradingAccountInputError
+          ? 400
+          : duplicateEmail
+            ? 409
+            : error instanceof InvalidCredentialsError
+              ? 401
+              : error instanceof TradingAccountNotFoundError
+                ? 404
+                : error instanceof BinanceVerificationError
+                  ? binanceErrorStatus(error)
+                  : 400;
+      const message =
+        error instanceof InvalidAuthInputError ||
+        error instanceof InvalidTradingAccountInputError ||
+        duplicateEmail ||
+        error instanceof InvalidCredentialsError ||
+        error instanceof TradingAccountNotFoundError ||
+        error instanceof BinanceVerificationError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
       params.logger.error("HTTP request failed", { error: error instanceof Error ? error.message : String(error) });
-      response.writeHead(400, noCacheHeaders("application/json", requestCorsHeaders));
-      response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+      sendJson(response, status, { error: message }, requestCorsHeaders);
     }
-  });
+  };
+}
 
+export function startHttpServer(params: HttpServerParams): void {
+  const server = createServer(createHttpHandler(params));
   server.listen(params.port, "0.0.0.0", () => {
     params.logger.info(`API listening on http://localhost:${params.port}`);
   });
@@ -230,6 +298,8 @@ function toTradingSettings(config: AppConfig): TradingSettings {
     logLevel: _logLevel,
     corsOrigins: _corsOrigins,
     databaseUrl: _databaseUrl,
+    sessionSecret: _sessionSecret,
+    binanceCredentialEncryptionKey: _binanceCredentialEncryptionKey,
     binanceApiKey: _binanceApiKey,
     binanceApiSecret: _binanceApiSecret,
     binanceTestnet: _binanceTestnet,
@@ -245,10 +315,262 @@ function corsHeadersFor(request: IncomingMessage, config: AppConfig): Record<str
   };
   if (typeof origin === "string" && config.corsOrigins.includes(origin)) {
     headers["access-control-allow-origin"] = origin;
-    headers["access-control-allow-methods"] = "GET, PUT, OPTIONS";
+    headers["access-control-allow-methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
     headers["access-control-allow-headers"] = "content-type";
+    headers["access-control-allow-credentials"] = "true";
   }
   return headers;
+}
+
+const sessionCookieName = "smc_session";
+const authLimiters = new Map<string, { count: number; resetAt: number }>();
+
+async function handleAuthRoute(params: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  requestUrl: URL;
+  corsHeaders: Record<string, string>;
+  auth: AuthService;
+  config: AppConfig;
+}): Promise<void> {
+  const { request, response, requestUrl, corsHeaders, auth, config } = params;
+
+  if (requestUrl.pathname === "/api/auth/me" && request.method === "GET") {
+    const user = await auth.currentUser(readCookie(request, sessionCookieName));
+    if (!user) {
+      sendJson(response, 401, { user: null }, corsHeaders);
+      return;
+    }
+    sendJson(response, 200, { user }, corsHeaders);
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/auth/logout" && request.method === "POST") {
+    await auth.logout(readCookie(request, sessionCookieName));
+    sendJson(response, 200, { ok: true }, corsHeaders, [clearSessionCookie(config)]);
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/auth/register" && request.method === "POST") {
+    assertAuthRateLimit(request, "register");
+    const result = await auth.register(await readJsonBody(request));
+    sendJson(response, 201, { user: result.user }, corsHeaders, [setSessionCookie(result.sessionToken, result.expiresAt, config)]);
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/auth/login" && request.method === "POST") {
+    assertAuthRateLimit(request, "login");
+    const result = await auth.login(await readJsonBody(request));
+    sendJson(response, 200, { user: result.user }, corsHeaders, [setSessionCookie(result.sessionToken, result.expiresAt, config)]);
+    return;
+  }
+
+  sendJson(response, 404, { error: "Auth route not found" }, corsHeaders);
+}
+
+async function handleTradingAccountRoute(params: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  requestUrl: URL;
+  corsHeaders: Record<string, string>;
+  userId: string;
+  service: TradingAccountService;
+  runtimeManager?: TradingRuntimeManager;
+  config: AppConfig;
+  marketData: BinanceFuturesMarketData;
+}): Promise<void> {
+  const { request, response, requestUrl, corsHeaders, userId, service, runtimeManager, config, marketData } = params;
+  const parts = requestUrl.pathname.split("/").filter(Boolean);
+  const accountId = parts[2] ?? null;
+  const child = parts[3] ?? null;
+
+  if (parts.length === 2 && request.method === "GET") {
+    sendJson(response, 200, { accounts: await service.listAccounts(userId) }, corsHeaders);
+    return;
+  }
+
+  if (parts.length === 2 && request.method === "POST") {
+    sendJson(response, 201, { account: await service.createAccount(userId, await readJsonBody(request)) }, corsHeaders);
+    return;
+  }
+
+  if (!accountId) {
+    sendJson(response, 404, { error: "Trading account route not found" }, corsHeaders);
+    return;
+  }
+
+  if (parts.length === 3 && request.method === "GET") {
+    sendJson(response, 200, { account: await service.getAccount(userId, accountId) }, corsHeaders);
+    return;
+  }
+
+  if (child === "settings" && parts.length === 4 && request.method === "GET") {
+    sendJson(response, 200, await service.getSettings(userId, accountId), corsHeaders);
+    return;
+  }
+
+  if (child === "settings" && parts.length === 4 && request.method === "PUT") {
+    const settings = await service.saveSettings(userId, accountId, await readJsonBody(request));
+    await runtimeManager?.refreshRuntime(accountId);
+    sendJson(response, 200, settings, corsHeaders);
+    return;
+  }
+
+  if (child === "watchlist" && parts.length === 4 && request.method === "GET") {
+    sendJson(response, 200, { watchlist: await service.getWatchlist(userId, accountId) }, corsHeaders);
+    return;
+  }
+
+  if (child === "watchlist" && parts.length === 4 && request.method === "PUT") {
+    const watchlist = await service.saveWatchlist(userId, accountId, await readJsonBody(request));
+    await runtimeManager?.refreshRuntime(accountId);
+    sendJson(response, 200, { watchlist }, corsHeaders);
+    return;
+  }
+
+  if (child === "snapshot" && parts.length === 4 && request.method === "GET") {
+    await service.getOwnedAccount(userId, accountId);
+    const account = await service.getAccount(userId, accountId);
+    const [connection, binanceAccount, snapshot] = await Promise.all([
+      service.getConnection(userId, accountId),
+      service.getBinanceAccount(userId, accountId),
+      runtimeManager?.getSnapshot(accountId)
+    ]);
+    sendJson(
+      response,
+      200,
+      {
+        account,
+        connection,
+        binanceAccount,
+        engine: snapshot?.engine ?? null,
+        runtime: getRuntimeStatus({ ...config, executionMode: account.mode === "DEMO" ? "testnet" : "live" }, {
+          connected: binanceAccount.connected,
+          environment: binanceAccount.environment === "TESTNET" ? "testnet" : "live",
+          label: connection.status,
+          walletBalance: binanceAccount.walletBalance,
+          availableBalance: binanceAccount.availableBalance,
+          asset: "USDT",
+          checkedAt: binanceAccount.checkedAt
+        }),
+        store: snapshot?.store ?? {},
+        watchlistRows: snapshot?.watchlistStatus ?? []
+      },
+      corsHeaders
+    );
+    return;
+  }
+
+  if (child === "watchlist" && parts[4] === "status" && parts.length === 5 && request.method === "GET") {
+    await service.getOwnedAccount(userId, accountId);
+    sendJson(response, 200, { rows: (await runtimeManager?.getSnapshot(accountId))?.watchlistStatus ?? [] }, corsHeaders);
+    return;
+  }
+
+  if (child === "analysis" && parts.length === 4 && request.method === "GET") {
+    await service.getOwnedAccount(userId, accountId);
+    const query = parseAccountActivityQuery(requestUrl, config.symbol);
+    const settings = await service.getSettings(userId, accountId);
+    sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketData), corsHeaders);
+    return;
+  }
+
+  if (child === "binance-connection" && parts.length === 4 && request.method === "GET") {
+    sendJson(response, 200, { connection: await service.getConnection(userId, accountId) }, corsHeaders);
+    return;
+  }
+
+  if (child === "binance-connection" && parts.length === 4 && request.method === "PUT") {
+    sendJson(response, 200, await service.saveConnection(userId, accountId, await readJsonBody(request)), corsHeaders);
+    await runtimeManager?.disableExecution(accountId);
+    await runtimeManager?.ensureRuntime(accountId);
+    return;
+  }
+
+  if (child === "binance-connection" && parts.length === 4 && request.method === "DELETE") {
+    sendJson(response, 200, { connection: await service.disconnect(userId, accountId) }, corsHeaders);
+    await runtimeManager?.disableExecution(accountId);
+    return;
+  }
+
+  if (child === "binance-connection" && parts[4] === "test" && parts.length === 5 && request.method === "POST") {
+    sendJson(response, 200, await service.testConnection(userId, accountId, await readJsonBody(request)), corsHeaders);
+    return;
+  }
+
+  if (child === "binance-account" && parts.length === 4 && request.method === "GET") {
+    sendJson(response, 200, { account: await service.getBinanceAccount(userId, accountId) }, corsHeaders);
+    return;
+  }
+
+  sendJson(response, 404, { error: "Trading account route not found" }, corsHeaders);
+}
+
+function binanceErrorStatus(error: BinanceVerificationError): number {
+  if (error.code === "BINANCE_UNAVAILABLE") return 503;
+  if (error.code === "INVALID_ACCOUNT_MODE") return 400;
+  return 422;
+}
+
+function assertAuthRateLimit(request: IncomingMessage, action: string): void {
+  const key = `${action}:${request.headers["x-forwarded-for"] ?? request.socket.remoteAddress ?? "unknown"}`;
+  const now = Date.now();
+  const current = authLimiters.get(key);
+  if (!current || current.resetAt <= now) {
+    authLimiters.set(key, { count: 1, resetAt: now + 15 * 60_000 });
+    return;
+  }
+
+  current.count += 1;
+  if (current.count > 20) {
+    throw new InvalidAuthInputError("Too many authentication attempts. Please try again later.");
+  }
+}
+
+function readCookie(request: IncomingMessage, name: string): string | null {
+  const header = request.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const [rawKey, ...rawValue] = part.trim().split("=");
+    if (rawKey === name) return decodeURIComponent(rawValue.join("="));
+  }
+  return null;
+}
+
+function setSessionCookie(token: string, expiresAt: string, config: AppConfig): string {
+  const maxAge = Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000));
+  return [
+    `${sessionCookieName}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    sameSiteAttribute(),
+    secureCookieAttribute(config),
+    `Max-Age=${maxAge}`,
+    `Expires=${new Date(expiresAt).toUTCString()}`
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
+function clearSessionCookie(config: AppConfig): string {
+  return [`${sessionCookieName}=`, "Path=/", "HttpOnly", sameSiteAttribute(), secureCookieAttribute(config), "Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"]
+    .filter(Boolean)
+    .join("; ");
+}
+
+function sameSiteAttribute(): string {
+  return "SameSite=Lax";
+}
+
+function secureCookieAttribute(config: AppConfig): string {
+  return process.env.NODE_ENV === "production" || config.corsOrigins.some((origin) => origin.startsWith("https://")) ? "Secure" : "";
+}
+
+function sendJson(response: ServerResponse, status: number, body: unknown, corsHeaders: Record<string, string>, cookies: string[] = []): void {
+  const headers: Record<string, string | string[]> = noCacheHeaders("application/json", corsHeaders);
+  if (cookies.length > 0) headers["set-cookie"] = cookies;
+  response.writeHead(status, headers);
+  response.end(JSON.stringify(body));
 }
 
 async function assertValidWatchlistSymbols(watchlist: string[], marketData: BinanceFuturesMarketData): Promise<void> {

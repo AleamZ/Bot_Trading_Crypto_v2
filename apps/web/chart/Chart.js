@@ -199,6 +199,10 @@ export class TradingChart {
     this.refreshDomOverlays();
   }
 
+  cancelPendingLoad() {
+    this.loadSequence += 1;
+  }
+
   resetChart() {
     this.chart.remove();
     this.overlayRoot.replaceChildren();

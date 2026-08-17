@@ -57,8 +57,7 @@ const engine = scanner.getPrimaryEngine();
 startHttpServer({ port: config.port, config, engine, repository, logger, scanner, auth, tradingAccounts, runtimeManager });
 
 async function bootstrap(): Promise<void> {
-  await scanner.bootstrap();
-  scanner.start();
+  logger.warn("Legacy global scanner is disabled; authenticated UI uses account-scoped TradingRuntimeManager");
   await runtimeManager.start();
 }
 

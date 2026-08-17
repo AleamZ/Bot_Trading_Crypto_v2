@@ -1,6 +1,8 @@
 import { apiFetch } from "./apiClient.js";
 
 const $ = (id) => document.getElementById(id);
+const HOME_POLL_INTERVAL_MS = 10_000;
+const CHART_POLL_INTERVAL_MS = 10_000;
 const chartState = {
   instance: null,
   timer: null,
@@ -59,6 +61,8 @@ let marketSymbols = [];
 let symbolSearchTerm = "";
 let settingsRequestSequence = 0;
 let analysisRequestSequence = 0;
+let dashboardRequestSequence = 0;
+let activeView = null;
 
 $("home-nav").addEventListener("click", () => showView("home"));
 $("chart-nav").addEventListener("click", () => showView("chart"));
@@ -191,14 +195,12 @@ function showLoggedIn(user) {
 
 function showLoggedOut() {
   authState.user = null;
-  if (authState.dashboardTimer) {
-    clearInterval(authState.dashboardTimer);
-    authState.dashboardTimer = null;
-  }
-  if (chartState.timer) {
-    clearInterval(chartState.timer);
-    chartState.timer = null;
-  }
+  stopHomePolling();
+  stopChartPolling();
+  settingsRequestSequence += 1;
+  analysisRequestSequence += 1;
+  dashboardRequestSequence += 1;
+  activeView = null;
   $("auth-view").hidden = false;
   document.querySelector(".nav-tabs").hidden = true;
   $("account-selector").hidden = true;
@@ -256,8 +258,6 @@ async function initializeTradingAccounts() {
     $("account-selector").hidden = false;
     await setActiveTradingAccount(accountState.accounts[0]);
     showView("home");
-    load();
-    authState.dashboardTimer ??= setInterval(load, 5000);
   } catch (error) {
     $("login-message").textContent = error instanceof Error ? error.message : String(error);
     showLoggedOut();
@@ -283,7 +283,6 @@ function renderAccountSelector() {
       button.addEventListener("click", async () => {
         $("account-selector-popover").hidden = true;
         await setActiveTradingAccount(item);
-        load();
       });
       return button;
     }),
@@ -296,8 +295,10 @@ async function setActiveTradingAccount(account) {
   renderAccountSelector();
   renderSettings();
   await Promise.all([loadActiveAccountStatus(), loadSettings(account.id)]);
+  dashboardRequestSequence += 1;
   if ($("chart-view").classList.contains("active")) loadChart();
   if ($("analysis-view").classList.contains("active")) loadAnalysis();
+  if ($("home-view").classList.contains("active")) load();
 }
 
 function startCreateAccount(mode) {
@@ -399,8 +400,6 @@ async function saveBinanceConnection() {
     accountState.activeAccount = accountState.accounts.find((item) => item.id === account.id) ?? account;
     renderAccountSelector();
     showView("home");
-    load();
-    authState.dashboardTimer ??= setInterval(load, 5000);
   } catch (error) {
     $("connect-message").textContent = error instanceof Error ? error.message : String(error);
     $("connect-save-button").disabled = false;
@@ -430,11 +429,15 @@ function escapeHtml(value) {
 }
 
 async function load() {
-  if (!accountState.activeAccount) return;
-  const snapshotResponse = await apiFetch(`/api/trading-accounts/${accountState.activeAccount.id}/snapshot`);
+  const accountId = accountState.activeAccount?.id;
+  if (!accountId) return;
+  const sequence = ++dashboardRequestSequence;
+  const snapshotResponse = await apiFetch(`/api/trading-accounts/${accountId}/snapshot`);
+  if (sequence !== dashboardRequestSequence || accountId !== accountState.activeAccount?.id || activeView !== "home") return;
   if (handleUnauthorized(snapshotResponse)) return;
   if (!snapshotResponse.ok) throw new Error(`Snapshot request failed: ${snapshotResponse.status}`);
   const snapshot = await snapshotResponse.json();
+  if (sequence !== dashboardRequestSequence || accountId !== accountState.activeAccount?.id || activeView !== "home") return;
   const engine = snapshot.engine ?? {};
   const runtime = snapshot.runtime ?? {};
   const store = snapshot.store ?? {};
@@ -528,6 +531,45 @@ async function load() {
   );
 
   renderWatchlist(snapshot.watchlistRows ?? []);
+}
+
+function startHomePolling() {
+  stopHomePolling();
+  pollHomeOnce();
+  authState.dashboardTimer = setInterval(pollHomeOnce, HOME_POLL_INTERVAL_MS);
+}
+
+function stopHomePolling() {
+  if (!authState.dashboardTimer) return;
+  clearInterval(authState.dashboardTimer);
+  authState.dashboardTimer = null;
+  dashboardRequestSequence += 1;
+}
+
+function startChartPolling() {
+  stopChartPolling();
+  pollChartOnce();
+  chartState.timer = setInterval(pollChartOnce, CHART_POLL_INTERVAL_MS);
+}
+
+function stopChartPolling() {
+  if (chartState.timer) {
+    clearInterval(chartState.timer);
+    chartState.timer = null;
+  }
+  chartState.instance?.cancelPendingLoad();
+}
+
+function pollHomeOnce() {
+  load().catch((error) => {
+    if (activeView === "home") $("connection").textContent = error instanceof Error ? error.message : String(error);
+  });
+}
+
+function pollChartOnce() {
+  loadChart().catch((error) => {
+    if (activeView === "chart") $("chart-status").textContent = error instanceof Error ? error.message : String(error);
+  });
 }
 
 function setPill(id, text, ok) {
@@ -667,6 +709,7 @@ document.querySelectorAll("[data-setting-group]").forEach((group) => {
   });
 });
 function showView(view) {
+  activeView = view;
   $("home-view").classList.toggle("active", view === "home");
   $("chart-view").classList.toggle("active", view === "chart");
   $("analysis-view").classList.toggle("active", view === "analysis");
@@ -680,13 +723,17 @@ function showView(view) {
   $("analysis-nav").classList.toggle("active", view === "analysis");
   $("settings-nav").classList.toggle("active", view === "settings");
 
+  if (view === "home") {
+    startHomePolling();
+  } else {
+    stopHomePolling();
+  }
+
   if (view === "chart") {
-    loadChart();
-    chartState.timer ??= setInterval(loadChart, 5000);
+    startChartPolling();
     requestAnimationFrame(resizeChart);
-  } else if (chartState.timer) {
-    clearInterval(chartState.timer);
-    chartState.timer = null;
+  } else {
+    stopChartPolling();
   }
 
   if (view === "analysis") {
@@ -722,6 +769,7 @@ async function ensureChart() {
 async function loadChart() {
   try {
     await ensureChart();
+    if (activeView !== "chart") return;
     const accountId = accountState.activeAccount?.id;
     if (!accountId) {
       $("chart-status").textContent = "Select a trading account";
@@ -732,6 +780,7 @@ async function loadChart() {
     $("chart-symbol").value = symbol;
     await chartState.instance.load({ accountId, symbol, interval, limit: 300 });
   } catch (error) {
+    if (activeView !== "chart") return;
     $("chart-status").textContent = error instanceof Error ? error.message : String(error);
   }
 }
@@ -818,9 +867,10 @@ function analysisStatusClass(status) {
 }
 
 async function loadSettings(accountId = accountState.activeAccount?.id ?? null) {
+  if (!accountId) return;
   const sequence = ++settingsRequestSequence;
-  const settingsPath = accountId ? `/api/trading-accounts/${accountId}/settings` : "/api/settings";
-  const watchlistPath = accountId ? `/api/trading-accounts/${accountId}/watchlist` : "/api/watchlist";
+  const settingsPath = `/api/trading-accounts/${accountId}/settings`;
+  const watchlistPath = `/api/trading-accounts/${accountId}/watchlist`;
   $("settings-status").textContent = "Loading";
   try {
     const [response, symbolsResponse, watchlistResponse] = await Promise.all([
@@ -920,7 +970,11 @@ function updateSettingFromInput(event) {
 
 async function saveSettings() {
   const accountId = accountState.activeAccount?.id ?? null;
-  const settingsPath = accountId ? `/api/trading-accounts/${accountId}/settings` : "/api/settings";
+  if (!accountId) {
+    $("settings-status").textContent = "Select a trading account";
+    return;
+  }
+  const settingsPath = `/api/trading-accounts/${accountId}/settings`;
   $("settings-status").textContent = "Saving";
   const payload = settingsPayload();
   const response = await apiFetch(settingsPath, {

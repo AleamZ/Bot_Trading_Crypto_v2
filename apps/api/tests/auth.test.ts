@@ -130,14 +130,14 @@ describe("auth HTTP flow", () => {
   });
 
   it("protects existing trading endpoints", async () => {
-    const blocked = await fetch(`${baseUrl}/api/snapshot`);
+    const blocked = await fetch(`${baseUrl}/api/trading-accounts`);
     expect(blocked.status).toBe(401);
 
     const cookie = await register();
-    const allowed = await fetch(`${baseUrl}/api/snapshot`, {
+    const allowed = await fetch(`${baseUrl}/api/trading-accounts`, {
       headers: { cookie }
     });
-    expect(allowed.status).toBe(200);
+    expect(allowed.status).not.toBe(401);
   });
 
   async function register(): Promise<string> {

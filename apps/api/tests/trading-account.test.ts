@@ -48,15 +48,29 @@ describe("trading account HTTP flow", () => {
   let configRepository: MemoryTradingRuntimeConfigRepository;
   let verifier: MockVerifier;
   let runtimeManager: TradingRuntimeManager;
+  let accountClientFactoryCalls: Array<{ apiKey: string; apiSecret: string; testnet: boolean }>;
 
   beforeEach(async () => {
     accountRepository = new MemoryTradingAccountRepository();
     configRepository = new MemoryTradingRuntimeConfigRepository();
     verifier = new MockVerifier();
+    accountClientFactoryCalls = [];
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
     const cipher = new CredentialCipher(encryptionKey);
     const tradingAccounts = new TradingAccountService(accountRepository, cipher, verifier, configRepository, testConfig());
-    runtimeManager = new TradingRuntimeManager(testConfig(), undefined, accountRepository, configRepository, cipher, new FakeMarketData(), fakeLogger());
+    runtimeManager = new TradingRuntimeManager(
+      testConfig(),
+      undefined,
+      accountRepository,
+      configRepository,
+      cipher,
+      new FakeMarketData(),
+      fakeLogger(),
+      (apiKey, apiSecret, testnet) => {
+        accountClientFactoryCalls.push({ apiKey, apiSecret, testnet });
+        return new FakeAccountClient();
+      }
+    );
     server = createServer(
       createHttpHandler({
         port: 0,
@@ -246,6 +260,19 @@ describe("trading account HTTP flow", () => {
     expect(readSnapshotSettings(reloadedB.store).leverage).toBe(3);
   });
 
+  it("uses credentials from the requested account for chart account activity", async () => {
+    const cookie = await register("a@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "test2", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${accountA.id}/binance-connection`, { apiKey: "ACCOUNT_A_KEY", apiSecret: "ACCOUNT_A_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/binance-connection`, { apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET" }, cookie);
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie } });
+    expect(response.status).toBe(200);
+    expect(accountClientFactoryCalls.at(-1)).toEqual({ apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET", testnet: true });
+    expect(accountClientFactoryCalls.some((call) => call.apiKey === "ACCOUNT_A_KEY")).toBe(false);
+  });
+
   it("does not share engine instances for the same symbol across accounts", async () => {
     const cookieA = await register("a@example.com");
     const cookieB = await register("b@example.com");
@@ -327,6 +354,24 @@ class FakeMarketData {
 
   async getFuturesSymbols() {
     return [{ symbol: "BTCUSDT" }, { symbol: "ETHUSDT" }];
+  }
+}
+
+class FakeAccountClient {
+  async getOpenPositions() {
+    return [];
+  }
+
+  async getOpenOrders() {
+    return [];
+  }
+
+  async getOrderHistory() {
+    return [];
+  }
+
+  async getTradeHistory() {
+    return [];
   }
 }
 

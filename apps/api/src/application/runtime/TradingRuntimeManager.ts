@@ -36,6 +36,15 @@ export interface AccountActivitySnapshot {
   tradeHistory: BinanceFuturesTradeHistoryStatus[];
 }
 
+interface AccountRuntimeClient {
+  getOpenPositions(symbol?: string): Promise<BinanceFuturesPositionStatus[]>;
+  getOpenOrders(symbol?: string): Promise<BinanceFuturesOpenOrderStatus[]>;
+  getOrderHistory(symbol?: string, limit?: number): Promise<BinanceFuturesOrderHistoryStatus[]>;
+  getTradeHistory(symbol?: string, limit?: number): Promise<BinanceFuturesTradeHistoryStatus[]>;
+}
+
+type AccountRuntimeClientFactory = (apiKey: string, apiSecret: string, testnet: boolean) => AccountRuntimeClient;
+
 export class TradingRuntimeManager {
   private readonly runtimes = new Map<string, AccountRuntime>();
 
@@ -46,7 +55,8 @@ export class TradingRuntimeManager {
     private readonly configRepository: TradingRuntimeConfigRepository,
     private readonly cipher: CredentialCipher,
     private readonly marketData: BinanceFuturesMarketData,
-    private readonly logger: DecisionLogger
+    private readonly logger: DecisionLogger,
+    private readonly accountClientFactory: AccountRuntimeClientFactory = (apiKey, apiSecret, testnet) => new BinanceFuturesAccountClient(apiKey, apiSecret, testnet)
   ) {}
 
   async start(): Promise<void> {
@@ -144,14 +154,14 @@ export class TradingRuntimeManager {
     return new BinanceFuturesExecutionGateway(apiKey, apiSecret, "testnet", entryMode, leverage);
   }
 
-  private async createAccountClient(accountId: string): Promise<BinanceFuturesAccountClient | null> {
+  private async createAccountClient(accountId: string): Promise<AccountRuntimeClient | null> {
     const account = await this.accountRepository.findTradingAccountById(accountId);
     if (!account) throw new Error("ACCOUNT_NOT_FOUND");
     const connection = await this.accountRepository.findBinanceConnection(account.id);
     if (!connection || connection.status !== "CONNECTED") return null;
     const apiKey = this.cipher.decrypt(connection.apiKeyEncrypted);
     const apiSecret = this.cipher.decrypt(connection.apiSecretEncrypted);
-    return new BinanceFuturesAccountClient(apiKey, apiSecret, account.mode === "DEMO");
+    return this.accountClientFactory(apiKey, apiSecret, account.mode === "DEMO");
   }
 
   private async loadAllAccountsBestEffort(): Promise<TradingAccount[]> {

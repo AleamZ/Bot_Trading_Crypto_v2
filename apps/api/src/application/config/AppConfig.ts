@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
+import { parseKey } from "../../infrastructure/security/CredentialCipher.js";
 
 for (const envFile of [resolve(process.cwd(), ".env"), resolve(process.cwd(), "../../.env")]) {
   if (existsSync(envFile)) {
@@ -10,6 +11,7 @@ for (const envFile of [resolve(process.cwd(), ".env"), resolve(process.cwd(), ".
 }
 
 const schema = z.object({
+  nodeEnv: z.enum(["development", "test", "production"]).default("development"),
   port: z.coerce.number().int().positive().default(8787),
   executionMode: z.enum(["paper", "testnet", "live"]).default("paper"),
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -57,13 +59,15 @@ const schema = z.object({
   binanceTestnet: z.coerce.boolean().default(true),
   reconciliationIntervalMs: z.coerce.number().int().positive().default(30_000),
   binanceRetryMaxAttempts: z.coerce.number().int().positive().default(3),
-  binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500)
+  binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500),
+  postgresPoolMax: z.coerce.number().int().positive().max(10).default(2)
 });
 
 export type AppConfig = z.infer<typeof schema>;
 export type TradingSettings = Omit<
   AppConfig,
   | "port"
+  | "nodeEnv"
   | "executionMode"
   | "logLevel"
   | "corsOrigins"
@@ -76,6 +80,7 @@ export type TradingSettings = Omit<
   | "reconciliationIntervalMs"
   | "binanceRetryMaxAttempts"
   | "binanceRetryBaseDelayMs"
+  | "postgresPoolMax"
 >;
 
 export const defaultTradingSettings: TradingSettings = {
@@ -118,6 +123,7 @@ export const defaultTradingSettings: TradingSettings = {
 
 const tradingSettingsSchema = schema.omit({
   port: true,
+  nodeEnv: true,
   executionMode: true,
   logLevel: true,
   corsOrigins: true,
@@ -129,7 +135,8 @@ const tradingSettingsSchema = schema.omit({
   binanceTestnet: true,
   reconciliationIntervalMs: true,
   binanceRetryMaxAttempts: true,
-  binanceRetryBaseDelayMs: true
+  binanceRetryBaseDelayMs: true,
+  postgresPoolMax: true
 });
 
 export function validateTradingSettings(input: unknown): TradingSettings {
@@ -152,8 +159,9 @@ export function applyTradingSettings(config: AppConfig, settings: TradingSetting
 }
 
 export function loadConfig(): AppConfig {
-  return schema.parse({
+  const parsed = schema.parse({
     ...defaultTradingSettings,
+    nodeEnv: process.env.NODE_ENV,
     port: process.env.PORT,
     executionMode: process.env.EXECUTION_MODE,
     logLevel: process.env.LOG_LEVEL,
@@ -169,8 +177,34 @@ export function loadConfig(): AppConfig {
     binanceTestnet: process.env.BINANCE_TESTNET,
     reconciliationIntervalMs: process.env.RECONCILIATION_INTERVAL_MS,
     binanceRetryMaxAttempts: process.env.BINANCE_RETRY_MAX_ATTEMPTS,
-    binanceRetryBaseDelayMs: process.env.BINANCE_RETRY_BASE_DELAY_MS
+    binanceRetryBaseDelayMs: process.env.BINANCE_RETRY_BASE_DELAY_MS,
+    postgresPoolMax: process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX
   });
+  validateProductionConfig(parsed);
+  return parsed;
+}
+
+export function validateProductionConfig(config: AppConfig): void {
+  if (config.nodeEnv !== "production") return;
+  const missing: string[] = [];
+  if (!process.env.PORT) missing.push("PORT");
+  if (!config.databaseUrl) missing.push("DATABASE_URL");
+  if (!config.sessionSecret) missing.push("SESSION_SECRET");
+  if (!config.binanceCredentialEncryptionKey) missing.push("BINANCE_CREDENTIAL_ENCRYPTION_KEY");
+  if (!process.env.CORS_ORIGINS) missing.push("CORS_ORIGINS");
+  if (!process.env.RECONCILIATION_INTERVAL_MS) missing.push("RECONCILIATION_INTERVAL_MS");
+  if (!process.env.BINANCE_RETRY_MAX_ATTEMPTS) missing.push("BINANCE_RETRY_MAX_ATTEMPTS");
+  if (!process.env.BINANCE_RETRY_BASE_DELAY_MS) missing.push("BINANCE_RETRY_BASE_DELAY_MS");
+  if (!process.env.POSTGRES_POOL_MAX && !process.env.PG_POOL_MAX) missing.push("POSTGRES_POOL_MAX");
+  if (missing.length > 0) throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
+
+  if ((config.sessionSecret ?? "").length < 32) throw new Error("SESSION_SECRET must be at least 32 characters in production");
+  if (config.corsOrigins.length === 0) throw new Error("CORS_ORIGINS must include at least one allowed production origin");
+  for (const origin of config.corsOrigins) {
+    assertValidOrigin(origin);
+    if (!origin.startsWith("https://")) throw new Error(`Production CORS origin must use https: ${origin}`);
+  }
+  parseKey(config.binanceCredentialEncryptionKey as string);
 }
 
 function normalizeWatchlist(value: unknown): string[] {
@@ -185,4 +219,13 @@ function normalizeWatchlist(value: unknown): string[] {
 function normalizeCsv(value: unknown): string[] {
   const source = Array.isArray(value) ? value.join(",") : String(value ?? "");
   return [...new Set(source.split(",").map((item) => item.trim()).filter(Boolean))];
+}
+
+function assertValidOrigin(value: string): void {
+  try {
+    const origin = new URL(value);
+    if (origin.origin !== value.replace(/\/+$/, "")) throw new Error("Origin must not include a path");
+  } catch {
+    throw new Error(`Invalid CORS origin: ${value}`);
+  }
 }

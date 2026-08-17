@@ -219,3 +219,9 @@ Manual Testnet checklist:
 10. Confirm runtime health returns to `READY`.
 
 Known limitation: chart overlay routes and some legacy compatibility endpoints still exist while the frontend migrates fully to account-scoped endpoints. REAL/Mainnet automatic execution still requires an explicit future approval flow and remains locked.
+
+## Phase 5 Production Operations
+
+Production deployment guidance lives in [docs/production-deployment.md](docs/production-deployment.md). The backend now includes strict production environment validation, `/health/live`, `/health/ready`, graceful shutdown, request IDs, production-safe error bodies, shared PostgreSQL pool cleanup, and an authenticated `/api/system/status` endpoint.
+
+Production must run as a single active backend bot process. Do not enable PM2 cluster mode, multiple Node workers, or horizontal replicas until runtime ownership is distributed safely.

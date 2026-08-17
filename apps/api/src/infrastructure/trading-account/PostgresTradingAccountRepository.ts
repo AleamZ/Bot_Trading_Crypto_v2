@@ -1,5 +1,6 @@
 import pg from "pg";
 import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { CreateTradingAccountInput, TradingAccountRepository } from "../../application/trading-account/TradingAccountRepository.js";
 import type { BinanceConnection, TradingAccount, TradingAccountStatus } from "../../domain/trading-account/TradingAccount.js";
 import { MemoryTradingAccountRepository } from "./MemoryTradingAccountRepository.js";
@@ -12,6 +13,7 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
   }
 
   async migrate(): Promise<void> {
+    await recordSchemaMigration(this.pool, "002_trading_accounts", "trading accounts and binance connections");
     await this.ensureCompatibleTable("trading_accounts", ["id", "user_id", "name", "mode", "status", "created_at", "updated_at"]);
     await this.pool.query(`
       create table if not exists trading_accounts (

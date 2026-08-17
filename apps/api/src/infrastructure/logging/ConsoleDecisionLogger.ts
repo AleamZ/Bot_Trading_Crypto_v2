@@ -16,6 +16,15 @@ export class ConsoleDecisionLogger implements DecisionLogger {
 
 function formatLog(level: "info" | "warn" | "error", message: string, context?: Record<string, unknown>): string {
   const at = new Date().toISOString();
+  if (process.env.NODE_ENV === "production") {
+    return JSON.stringify({
+      timestamp: at,
+      level,
+      component: "api",
+      message,
+      ...sanitizeContext(context)
+    });
+  }
   const reason = getReason(context);
   return reason ? `[${at}] ${level.toUpperCase()} ${message}: ${reason}` : `[${at}] ${level.toUpperCase()} ${message}`;
 }
@@ -31,4 +40,19 @@ function getReason(context?: Record<string, unknown>): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function sanitizeContext(context?: Record<string, unknown>): Record<string, unknown> {
+  if (!context) return {};
+  const output: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(context)) {
+    if (/secret|token|password|credential|apiKey|apiSecret/i.test(key)) {
+      output[key] = "configured";
+    } else if (value instanceof Error) {
+      output[key] = value.message;
+    } else {
+      output[key] = value;
+    }
+  }
+  return output;
 }

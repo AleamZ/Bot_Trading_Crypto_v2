@@ -1,6 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
+
+APP_NAME="${APP_NAME:-smc-futures-api}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8787/health/ready}"
 
 echo "==> Pulling latest code..."
 git pull
@@ -8,16 +11,30 @@ git pull
 echo "==> Installing dependencies..."
 npm ci
 
-echo "==> Building API..."
-npm run build:api
+echo "==> Typechecking..."
+npm run typecheck
+
+echo "==> Running tests..."
+npm test
+
+echo "==> Building..."
+npm run build
 
 echo "==> Restarting API..."
-pm2 restart binance-api
+pm2 restart "$APP_NAME" --update-env
 
 echo "==> Checking PM2..."
 pm2 status
 
-echo "==> Checking API..."
-curl -f http://127.0.0.1:8787/api/settings
+echo "==> Waiting for readiness..."
+for attempt in {1..30}; do
+  if curl -fsS "$HEALTH_URL" >/dev/null; then
+    echo "==> API is ready"
+    echo "==> Deploy completed successfully!"
+    exit 0
+  fi
+  sleep 2
+done
 
-echo "==> Deploy completed successfully!"
+echo "API did not become ready: $HEALTH_URL" >&2
+exit 1

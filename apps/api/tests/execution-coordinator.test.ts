@@ -133,6 +133,32 @@ describe("ExecutionCoordinator", () => {
     expect(isRecoverableExecutionGateway(new LockedRealExecutionGateway())).toBe(false);
   });
 
+  it("keeps REAL execution locked in production even when trading is enabled and runtime is ready", async () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      const repository = new MemoryExecutionIntentRepository();
+      const delegate = new RecordingGateway();
+      const coordinator = new ExecutionCoordinator({
+        tradingAccountId: "account-real",
+        mode: "REAL",
+        entryType: "market",
+        repository,
+        delegate,
+        logger: fakeLogger(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        runtimeReady: () => true
+      });
+
+      await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("REAL_EXECUTION_LOCKED");
+      expect(delegate.calls).toHaveLength(0);
+      expect(await repository.listByAccount("account-real")).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+    }
+  });
+
   it("blocks execution while runtime is not ready", async () => {
     const repository = new MemoryExecutionIntentRepository();
     const delegate = new RecordingGateway();

@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthService } from "../src/application/auth/AuthService.js";
-import { defaultTradingSettings, type AppConfig } from "../src/application/config/AppConfig.js";
+import { defaultTradingSettings, loadConfig, type AppConfig } from "../src/application/config/AppConfig.js";
 import { createHttpHandler } from "../src/presentation/http/Server.js";
 import { MemoryAuthRepository } from "../src/infrastructure/auth/MemoryAuthRepository.js";
 import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
@@ -25,6 +25,39 @@ describe("AuthService password hashing", () => {
     expect(repository.createdUser?.email).toBe("user@example.com");
     expect(repository.createdUser?.passwordHash).toMatch(/^\$argon2id\$/);
     expect(repository.createdUser?.passwordHash).not.toContain("password123");
+  });
+});
+
+describe("production configuration validation", () => {
+  it("fails fast when required production env is missing", () => {
+    withEnv({ NODE_ENV: "production", PORT: undefined, DATABASE_URL: undefined, SESSION_SECRET: undefined }, () => {
+      expect(() => loadConfig()).toThrow(/Missing required production environment variables/);
+    });
+  });
+
+  it("accepts strict production env without legacy global Binance keys", () => {
+    withEnv(
+      {
+        NODE_ENV: "production",
+        PORT: "8787",
+        DATABASE_URL: "postgres://user:pass@example.com:5432/db",
+        SESSION_SECRET: "production-session-secret-with-more-than-32-chars",
+        BINANCE_CREDENTIAL_ENCRYPTION_KEY: "1111111111111111111111111111111111111111111111111111111111111111",
+        CORS_ORIGINS: "https://bot.example.com",
+        RECONCILIATION_INTERVAL_MS: "30000",
+        BINANCE_RETRY_MAX_ATTEMPTS: "3",
+        BINANCE_RETRY_BASE_DELAY_MS: "500",
+        POSTGRES_POOL_MAX: "2",
+        BINANCE_API_KEY: undefined,
+        BINANCE_API_SECRET: undefined
+      },
+      () => {
+        const config = loadConfig();
+        expect(config.nodeEnv).toBe("production");
+        expect(config.binanceApiKey).toBeUndefined();
+        expect(config.postgresPoolMax).toBe(2);
+      }
+    );
   });
 });
 
@@ -140,6 +173,64 @@ describe("auth HTTP flow", () => {
     expect(allowed.status).not.toBe(401);
   });
 
+  it("serves live and readiness health without authentication", async () => {
+    const live = await fetch(`${baseUrl}/health/live`);
+    expect(live.status).toBe(200);
+    expect(live.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await live.json()).toMatchObject({ status: "ok", service: "smc-futures-api" });
+
+    const ready = await fetch(`${baseUrl}/health/ready`);
+    expect(ready.status).toBe(503);
+    expect(await ready.json()).toMatchObject({ status: "not_ready" });
+  });
+
+  it("returns request correlation id and rejects oversized JSON bodies", async () => {
+    const requestId = "test-request-id-123";
+    const response = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-request-id": requestId },
+      body: JSON.stringify({ email: "large@example.com", password: "x".repeat(70_000) })
+    });
+
+    expect(response.status).toBe(413);
+    expect(response.headers.get("x-request-id")).toBe(requestId);
+    expect(await response.json()).toMatchObject({ code: "PAYLOAD_TOO_LARGE", requestId });
+  });
+
+  it("uses secure cross-site session cookie attributes in production", async () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      const productionAuth = new AuthService(new MemoryAuthRepository(), sessionSecret);
+      const productionServer = createServer(
+        createHttpHandler({
+          port: 0,
+          config: { ...testConfig(), nodeEnv: "production", corsOrigins: ["https://bot.example.com"] },
+          engine: fakeEngine(),
+          repository: new MemoryTradingRepository(),
+          logger: fakeLogger(),
+          auth: productionAuth
+        })
+      );
+      await new Promise<void>((resolve) => productionServer.listen(0, "127.0.0.1", resolve));
+      const address = productionServer.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/auth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "https://bot.example.com" },
+        body: JSON.stringify({ email: "prod@example.com", password: "password123" })
+      });
+      await new Promise<void>((resolve, reject) => productionServer.close((error) => (error ? reject(error) : resolve())));
+      expect(response.status).toBe(201);
+      expect(response.headers.get("set-cookie")).toContain("SameSite=None");
+      expect(response.headers.get("set-cookie")).toContain("Secure");
+      expect(response.headers.get("access-control-allow-origin")).toBe("https://bot.example.com");
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+    }
+  });
+
   async function register(): Promise<string> {
     const response = await postJson("/api/auth/register", {
       email: "user@example.com",
@@ -197,6 +288,7 @@ class CapturingAuthRepository implements AuthRepository {
 function testConfig(): AppConfig {
   return {
     ...defaultTradingSettings,
+    nodeEnv: "test",
     port: 8787,
     executionMode: "paper",
     logLevel: "info",
@@ -206,7 +298,11 @@ function testConfig(): AppConfig {
     binanceCredentialEncryptionKey: "1111111111111111111111111111111111111111111111111111111111111111",
     binanceApiKey: undefined,
     binanceApiSecret: undefined,
-    binanceTestnet: true
+    binanceTestnet: true,
+    reconciliationIntervalMs: 30_000,
+    binanceRetryMaxAttempts: 3,
+    binanceRetryBaseDelayMs: 500,
+    postgresPoolMax: 2
   };
 }
 
@@ -230,4 +326,22 @@ function fakeLogger(): DecisionLogger {
     warn: () => undefined,
     error: () => undefined
   };
+}
+
+function withEnv(overrides: Record<string, string | undefined>, callback: () => void): void {
+  const previous = new Map<string, string | undefined>();
+  for (const key of Object.keys(overrides)) {
+    previous.set(key, process.env[key]);
+    const value = overrides[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    callback();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }

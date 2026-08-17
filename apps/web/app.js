@@ -419,7 +419,7 @@ async function loadActiveAccountStatus() {
 }
 
 function accountEnvironmentLabel(mode) {
-  return mode === "REAL" ? "Binance Futures Mainnet" : "Binance Futures Testnet";
+  return mode === "REAL" ? "REAL · MAINNET · EXECUTION LOCKED" : "DEMO · TESTNET";
 }
 
 function escapeHtml(value) {
@@ -564,14 +564,21 @@ function stopChartPolling() {
 
 function pollHomeOnce() {
   load().catch((error) => {
-    if (activeView === "home") $("connection").textContent = error instanceof Error ? error.message : String(error);
+    if (activeView === "home") $("connection").textContent = userFacingApiError(error);
   });
 }
 
 function pollChartOnce() {
   loadChart().catch((error) => {
-    if (activeView === "chart") $("chart-status").textContent = error instanceof Error ? error.message : String(error);
+    if (activeView === "chart") $("chart-status").textContent = userFacingApiError(error);
   });
+}
+
+function userFacingApiError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("503")) return "Bot runtime is recovering. Please wait.";
+  if (message.includes("Failed to fetch")) return "API is offline. Reconnecting...";
+  return message;
 }
 
 function setPill(id, text, ok) {

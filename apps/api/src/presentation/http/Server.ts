@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import crypto from "node:crypto";
 import type { AuthService } from "../../application/auth/AuthService.js";
 import { InvalidAuthInputError, InvalidCredentialsError, isDuplicateEmailError } from "../../application/auth/AuthService.js";
 import type { TradingAccountService } from "../../application/trading-account/TradingAccountService.js";
@@ -46,7 +47,28 @@ export interface HttpServerParams {
   tradingAccounts?: TradingAccountService;
   runtimeManager?: TradingRuntimeManager;
   marketData?: BinanceFuturesMarketData;
+  appState?: OperationalAppState;
+  readinessCheck?: () => Promise<boolean>;
+  buildInfo?: BuildInfo;
 }
+
+export interface OperationalAppState {
+  shuttingDown: boolean;
+  bootstrapComplete: boolean;
+  startedAt: number;
+}
+
+export interface BuildInfo {
+  version: string;
+  gitSha: string | null;
+  buildTime: string | null;
+}
+
+const metrics = {
+  requests: 0,
+  errors: 0,
+  startedAt: Date.now()
+};
 
 export function createHttpHandler(params: HttpServerParams): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
   let runtimeConfig = params.config;
@@ -62,8 +84,15 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
 
   return async (request, response) => {
     let requestCorsHeaders: Record<string, string> = {};
+    const requestId = requestIdFor(request);
+    const startedAt = Date.now();
     try {
       requestCorsHeaders = corsHeadersFor(request, runtimeConfig);
+      requestCorsHeaders["x-request-id"] = requestId;
+      if (runtimeConfig.nodeEnv === "production" && request.headers.origin && !requestCorsHeaders["access-control-allow-origin"]) {
+        sendJson(response, 403, { error: "CORS_ORIGIN_NOT_ALLOWED", message: "Origin is not allowed.", requestId }, requestCorsHeaders);
+        return;
+      }
       if (request.method === "OPTIONS") {
         response.writeHead(204, requestCorsHeaders);
         response.end();
@@ -71,6 +100,20 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
       }
 
       const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+      metrics.requests += 1;
+      params.logger.info("HTTP request", { requestId, method: request.method, path: requestUrl.pathname });
+
+      if (requestUrl.pathname === "/health/live" && request.method === "GET") {
+        sendJson(response, params.appState?.shuttingDown ? 503 : 200, healthLive(params), requestCorsHeaders);
+        return;
+      }
+
+      if (requestUrl.pathname === "/health/ready" && request.method === "GET") {
+        const dbReady = params.readinessCheck ? await params.readinessCheck() : true;
+        const ready = Boolean(dbReady && params.appState?.bootstrapComplete && !params.appState.shuttingDown);
+        sendJson(response, ready ? 200 : 503, healthReady(params, dbReady, ready), requestCorsHeaders);
+        return;
+      }
 
       if (requestUrl.pathname.startsWith("/api/auth/")) {
         await handleAuthRoute({ request, response, requestUrl, corsHeaders: requestCorsHeaders, auth: params.auth, config: runtimeConfig });
@@ -79,7 +122,12 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
 
       const authenticatedUser = await params.auth.currentUser(readCookie(request, sessionCookieName));
       if (!authenticatedUser) {
-        sendJson(response, 401, { error: "Unauthorized" }, requestCorsHeaders);
+        sendJson(response, 401, { error: "UNAUTHORIZED", message: "Unauthorized", requestId }, requestCorsHeaders);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/system/status" && request.method === "GET") {
+        sendJson(response, 200, systemStatus(params), requestCorsHeaders);
         return;
       }
 
@@ -228,11 +276,14 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
       }
 
       response.writeHead(404, noCacheHeaders("application/json", requestCorsHeaders));
-      response.end(JSON.stringify({ error: "API route not found" }));
+      response.end(JSON.stringify({ error: "NOT_FOUND", message: "API route not found", requestId }));
     } catch (error) {
+      metrics.errors += 1;
       const duplicateEmail = isDuplicateEmailError(error);
       const status =
-        error instanceof InvalidAuthInputError || error instanceof InvalidTradingAccountInputError
+        error instanceof PayloadTooLargeError
+          ? 413
+          : error instanceof InvalidAuthInputError || error instanceof InvalidTradingAccountInputError
           ? 400
           : duplicateEmail
             ? 409
@@ -246,6 +297,7 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
       const message =
         error instanceof InvalidAuthInputError ||
         error instanceof InvalidTradingAccountInputError ||
+        error instanceof PayloadTooLargeError ||
         duplicateEmail ||
         error instanceof InvalidCredentialsError ||
         error instanceof TradingAccountNotFoundError ||
@@ -254,17 +306,23 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
           : error instanceof Error
             ? error.message
             : String(error);
-      params.logger.error("HTTP request failed", { error: error instanceof Error ? error.message : String(error) });
-      sendJson(response, status, { error: message }, requestCorsHeaders);
+      params.logger.error("HTTP request failed", {
+        requestId,
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error),
+        stack: runtimeConfig.nodeEnv === "production" ? undefined : error instanceof Error ? error.stack : undefined
+      });
+      sendJson(response, status, errorBody(errorCodeForStatus(status, error), message, requestId, runtimeConfig), requestCorsHeaders);
     }
   };
 }
 
-export function startHttpServer(params: HttpServerParams): void {
+export function startHttpServer(params: HttpServerParams): ReturnType<typeof createServer> {
   const server = createServer(createHttpHandler(params));
   server.listen(params.port, "0.0.0.0", () => {
     params.logger.info(`API listening on http://localhost:${params.port}`);
   });
+  return server;
 }
 
 function parseKlineQuery(url: URL, defaultSymbol: string): { symbol: string; interval: string; limit: number } {
@@ -285,8 +343,12 @@ function parseKlineQuery(url: URL, defaultSymbol: string): { symbol: string; int
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 64 * 1024) throw new PayloadTooLargeError("Request body is too large");
+    chunks.push(buffer);
   }
   const body = Buffer.concat(chunks).toString("utf8");
   return body.length > 0 ? JSON.parse(body) : {};
@@ -295,6 +357,7 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
 function toTradingSettings(config: AppConfig): TradingSettings {
   const {
     port: _port,
+    nodeEnv: _nodeEnv,
     executionMode: _executionMode,
     logLevel: _logLevel,
     corsOrigins: _corsOrigins,
@@ -304,6 +367,10 @@ function toTradingSettings(config: AppConfig): TradingSettings {
     binanceApiKey: _binanceApiKey,
     binanceApiSecret: _binanceApiSecret,
     binanceTestnet: _binanceTestnet,
+    reconciliationIntervalMs: _reconciliationIntervalMs,
+    binanceRetryMaxAttempts: _binanceRetryMaxAttempts,
+    binanceRetryBaseDelayMs: _binanceRetryBaseDelayMs,
+    postgresPoolMax: _postgresPoolMax,
     ...settings
   } = config;
   return settings;
@@ -317,7 +384,7 @@ function corsHeadersFor(request: IncomingMessage, config: AppConfig): Record<str
   if (typeof origin === "string" && config.corsOrigins.includes(origin)) {
     headers["access-control-allow-origin"] = origin;
     headers["access-control-allow-methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
-    headers["access-control-allow-headers"] = "content-type";
+    headers["access-control-allow-headers"] = "content-type,x-request-id";
     headers["access-control-allow-credentials"] = "true";
   }
   return headers;
@@ -325,6 +392,86 @@ function corsHeadersFor(request: IncomingMessage, config: AppConfig): Record<str
 
 const sessionCookieName = "smc_session";
 const authLimiters = new Map<string, { count: number; resetAt: number }>();
+
+class PayloadTooLargeError extends Error {}
+
+function requestIdFor(request: IncomingMessage): string {
+  const incoming = request.headers["x-request-id"];
+  const value = Array.isArray(incoming) ? incoming[0] : incoming;
+  if (typeof value === "string" && /^[A-Za-z0-9._:-]{8,96}$/.test(value)) return value;
+  return crypto.randomUUID();
+}
+
+function healthLive(params: HttpServerParams): Record<string, unknown> {
+  return {
+    status: params.appState?.shuttingDown ? "shutting_down" : "ok",
+    service: "smc-futures-api",
+    uptimeSeconds: Math.floor(process.uptime()),
+    version: params.buildInfo?.version ?? "0.0.0",
+    gitSha: params.buildInfo?.gitSha ?? null
+  };
+}
+
+function healthReady(params: HttpServerParams, dbReady: boolean, ready: boolean): Record<string, unknown> {
+  return {
+    status: ready ? "ok" : "not_ready",
+    service: "smc-futures-api",
+    uptimeSeconds: Math.floor(process.uptime()),
+    dependencies: {
+      database: dbReady ? "ok" : "unavailable",
+      bootstrap: params.appState?.bootstrapComplete ? "complete" : "pending",
+      shutdown: params.appState?.shuttingDown ? "active" : "inactive"
+    }
+  };
+}
+
+function systemStatus(params: HttpServerParams): Record<string, unknown> {
+  const runtime = params.runtimeManager?.getOperationalStatus();
+  return {
+    status: params.appState?.shuttingDown ? "shutting_down" : "ok",
+    service: "smc-futures-api",
+    uptimeSeconds: Math.floor(process.uptime()),
+    version: params.buildInfo?.version ?? "0.0.0",
+    gitSha: params.buildInfo?.gitSha ?? null,
+    buildTime: params.buildInfo?.buildTime ?? null,
+    http: {
+      requests: metrics.requests,
+      errors: metrics.errors,
+      startedAt: new Date(metrics.startedAt).toISOString()
+    },
+    runtime: runtime ?? {
+      runtimeCount: 0,
+      readyAccounts: 0,
+      degradedAccounts: 0,
+      disconnectedAccounts: 0,
+      recoveringAccounts: 0,
+      shuttingDown: Boolean(params.appState?.shuttingDown),
+      reconciliationSuccess: 0,
+      reconciliationFailure: 0
+    }
+  };
+}
+
+function errorCodeForStatus(status: number, error: unknown): string {
+  if (error instanceof PayloadTooLargeError) return "PAYLOAD_TOO_LARGE";
+  if (status === 401) return "UNAUTHORIZED";
+  if (status === 404) return "NOT_FOUND";
+  if (status === 409) return "CONFLICT";
+  if (status === 413) return "PAYLOAD_TOO_LARGE";
+  if (status >= 500) return "INTERNAL_ERROR";
+  return "BAD_REQUEST";
+}
+
+function errorBody(code: string, message: string, requestId: string, config: AppConfig): Record<string, unknown> {
+  if (config.nodeEnv !== "production") {
+    return { error: message, code, message, requestId };
+  }
+  return {
+    error: code,
+    message: code === "INTERNAL_ERROR" ? "Internal server error" : message,
+    requestId
+  };
+}
 
 async function handleAuthRoute(params: {
   request: IncomingMessage;
@@ -633,6 +780,7 @@ function clearSessionCookie(config: AppConfig): string {
 }
 
 function sameSiteAttribute(): string {
+  if (process.env.NODE_ENV === "production") return "SameSite=None";
   return "SameSite=Lax";
 }
 
@@ -2065,6 +2213,9 @@ function noCacheHeaders(contentType: string, extra: Record<string, string> = {})
   return {
     ...extra,
     "content-type": contentType,
-    "cache-control": "no-store, max-age=0"
+    "cache-control": "no-store, max-age=0",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "x-frame-options": "DENY"
   };
 }

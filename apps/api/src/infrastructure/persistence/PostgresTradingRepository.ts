@@ -1,5 +1,6 @@
 import pg from "pg";
 import { getPostgresPool } from "./PgPoolFactory.js";
+import { recordSchemaMigration } from "./SchemaMigrations.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
 import type { DomainEvent } from "../../domain/events/DomainEvent.js";
 import type { Fvg } from "../../domain/fvg/Fvg.js";
@@ -27,6 +28,7 @@ export class PostgresTradingRepository implements TradingRepository {
   }
 
   async migrate(): Promise<void> {
+    await recordSchemaMigration(this.pool, "005_trading_records", "account scoped trading records");
     await this.pool.query(`
       create table if not exists trading_records (
         id text primary key,

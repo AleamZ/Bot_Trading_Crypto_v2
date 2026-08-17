@@ -1,5 +1,6 @@
 import pg from "pg";
 import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { CreateExecutionIntentInput, ExecutionAuditEvent, ExecutionIntent, ExecutionIntentStatus } from "../../application/execution/ExecutionIntent.js";
 import type { ExecutionIntentRepository } from "../../application/execution/ExecutionIntentRepository.js";
 import { MemoryExecutionIntentRepository } from "./MemoryExecutionIntentRepository.js";
@@ -12,6 +13,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
   }
 
   async migrate(): Promise<void> {
+    await recordSchemaMigration(this.pool, "004_execution_intents", "execution intents and audit events");
     await this.pool.query(`
       create table if not exists execution_intents (
         id uuid primary key,

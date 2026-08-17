@@ -1,6 +1,7 @@
 import pg from "pg";
 import crypto from "node:crypto";
 import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { TradingSettings } from "../../application/config/AppConfig.js";
 import type { TradingRuntimeConfigRepository } from "../../application/trading-account/TradingRuntimeConfigRepository.js";
 import { MemoryTradingRuntimeConfigRepository } from "./MemoryTradingRuntimeConfigRepository.js";
@@ -13,6 +14,7 @@ export class PostgresTradingRuntimeConfigRepository implements TradingRuntimeCon
   }
 
   async migrate(): Promise<void> {
+    await recordSchemaMigration(this.pool, "003_trading_runtime_config", "account scoped settings and watchlists");
     await this.pool.query(`
       create table if not exists trading_settings (
         id uuid primary key,

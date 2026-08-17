@@ -91,6 +91,11 @@ export class MarketScanner {
     }, intervalMs);
   }
 
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
   async scan(): Promise<void> {
     if (this.scanning) return;
     this.scanning = true;

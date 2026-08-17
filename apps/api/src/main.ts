@@ -14,14 +14,19 @@ import { BinanceFuturesAccountVerifier } from "./infrastructure/trading-account/
 import { createTradingAccountRepository } from "./infrastructure/trading-account/PostgresTradingAccountRepository.js";
 import { createTradingRuntimeConfigRepository } from "./infrastructure/trading-account/PostgresTradingRuntimeConfigRepository.js";
 import { createExecutionIntentRepository } from "./infrastructure/execution/PostgresExecutionIntentRepository.js";
+import { closeAllPostgresPools } from "./infrastructure/persistence/PgPoolFactory.js";
 import { startHttpServer } from "./presentation/http/Server.js";
 
 let config = loadConfig();
-if (process.env.NODE_ENV === "production") {
-  if (!config.sessionSecret) throw new Error("SESSION_SECRET must be configured in production");
-  if (!config.binanceCredentialEncryptionKey) throw new Error("BINANCE_CREDENTIAL_ENCRYPTION_KEY must be configured in production");
-}
 const logger = new ConsoleDecisionLogger();
+logger.info("Production configuration state", {
+  nodeEnv: config.nodeEnv,
+  databaseUrl: config.databaseUrl ? "configured" : "not_configured",
+  sessionSecret: config.sessionSecret ? "configured" : "not_configured",
+  binanceCredentialEncryptionKey: config.binanceCredentialEncryptionKey ? "configured" : "not_configured",
+  corsOrigins: config.corsOrigins,
+  postgresPoolMax: config.postgresPoolMax
+});
 const repository = await createRepository(config.databaseUrl);
 const authRepository = await createAuthRepository(config.databaseUrl);
 const auth = new AuthService(authRepository, config.sessionSecret ?? "development-session-secret-change-before-production");
@@ -55,14 +60,78 @@ const marketData = new BinanceFuturesMarketData(config.binanceTestnet);
 const runtimeManager = new TradingRuntimeManager(config, config.databaseUrl, tradingAccountRepository, tradingRuntimeConfigRepository, executionIntentRepository, credentialCipher, marketData, logger);
 const scanner = new MarketScanner(config, repository, execution, logger, marketData, availableBalanceProvider);
 const engine = scanner.getPrimaryEngine();
+const appState = { shuttingDown: false, bootstrapComplete: false, startedAt: Date.now() };
+const buildInfo = {
+  version: process.env.APP_VERSION ?? "0.1.0",
+  gitSha: process.env.GIT_SHA ?? null,
+  buildTime: process.env.BUILD_TIME ?? null
+};
 
-startHttpServer({ port: config.port, config, engine, repository, logger, scanner, auth, tradingAccounts, runtimeManager });
+const server = startHttpServer({
+  port: config.port,
+  config,
+  engine,
+  repository,
+  logger,
+  scanner,
+  auth,
+  tradingAccounts,
+  runtimeManager,
+  appState,
+  buildInfo,
+  readinessCheck: async () => {
+    if (!config.databaseUrl) return true;
+    await repository.getDashboardSnapshot();
+    return true;
+  }
+});
 
 async function bootstrap(): Promise<void> {
   logger.warn("Legacy global scanner is disabled; authenticated UI uses account-scoped TradingRuntimeManager");
   await runtimeManager.start();
+  appState.bootstrapComplete = true;
+  logger.info("Runtime bootstrap complete", runtimeManager.getOperationalStatus());
 }
 
 bootstrap().catch((error: unknown) => {
+  appState.bootstrapComplete = false;
   logger.error("Bootstrap failed", { error: error instanceof Error ? error.message : String(error) });
+});
+
+async function shutdown(reason: string, exitCode: number): Promise<void> {
+  if (appState.shuttingDown) return;
+  appState.shuttingDown = true;
+  logger.warn("Graceful shutdown started", { reason });
+  await runtimeManager.shutdown();
+  scanner.stop();
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  });
+  await closeAllPostgresPools();
+  logger.warn("Graceful shutdown complete", { reason });
+  process.exit(exitCode);
+}
+
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM", 0).catch((error: unknown) => {
+    logger.error("Graceful shutdown failed", { error: error instanceof Error ? error.message : String(error) });
+    process.exit(1);
+  });
+});
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT", 0).catch((error: unknown) => {
+    logger.error("Graceful shutdown failed", { error: error instanceof Error ? error.message : String(error) });
+    process.exit(1);
+  });
+});
+
+process.on("unhandledRejection", (error) => {
+  logger.error("Unhandled promise rejection", { error: error instanceof Error ? error.message : String(error) });
+  shutdown("unhandledRejection", 1).catch(() => process.exit(1));
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", { error: error.message });
+  shutdown("uncaughtException", 1).catch(() => process.exit(1));
 });

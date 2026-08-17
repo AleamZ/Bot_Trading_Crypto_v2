@@ -34,7 +34,7 @@ export interface AccountSnapshot {
 }
 
 export interface RuntimeHealth {
-  state: "RECOVERING" | "READY" | "DEGRADED" | "DISCONNECTED" | "ERROR";
+  state: "RECOVERING" | "READY" | "DEGRADED" | "DISCONNECTED" | "ERROR" | "SHUTTING_DOWN";
   lastScanAt: string | null;
   lastReconciliationAt: string | null;
   lastReconciliationError: string | null;
@@ -68,6 +68,7 @@ type AccountRuntimeClientFactory = (apiKey: string, apiSecret: string, testnet: 
 export class TradingRuntimeManager {
   private readonly runtimes = new Map<string, AccountRuntime>();
   private readonly runtimeLoads = new Map<string, Promise<AccountRuntime>>();
+  private shuttingDown = false;
 
   constructor(
     private readonly baseConfig: AppConfig,
@@ -82,6 +83,7 @@ export class TradingRuntimeManager {
   ) {}
 
   async start(): Promise<void> {
+    if (this.shuttingDown) return;
     const accounts = await this.loadAllAccountsBestEffort();
     for (const account of accounts) {
       await this.ensureRuntime(account.id);
@@ -91,6 +93,7 @@ export class TradingRuntimeManager {
   async ensureRuntime(accountId: string): Promise<AccountRuntime> {
     const existing = this.runtimes.get(accountId);
     if (existing) return existing;
+    if (this.shuttingDown) throw new Error("SHUTTING_DOWN");
     const loading = this.runtimeLoads.get(accountId);
     if (loading) return loading;
 
@@ -123,7 +126,7 @@ export class TradingRuntimeManager {
             delegate: rawExecution,
             logger: this.logger,
             retry: { maxAttempts: this.baseConfig.binanceRetryMaxAttempts, baseDelayMs: this.baseConfig.binanceRetryBaseDelayMs },
-            runtimeReady: () => health.state === "READY" && config.tradingEnabled && !config.killSwitch
+            runtimeReady: () => !this.shuttingDown && health.state === "READY" && config.tradingEnabled && !config.killSwitch
           })
         : rawExecution;
     const scanner = new MarketScanner(config, repository, execution, this.logger, this.marketData, null);
@@ -171,6 +174,20 @@ export class TradingRuntimeManager {
     this.runtimeLoads.delete(accountId);
   }
 
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    for (const runtime of this.runtimes.values()) {
+      runtime.health.state = "SHUTTING_DOWN";
+      runtime.health.executionEnabled = false;
+      if (runtime.reconciliationTimer) clearInterval(runtime.reconciliationTimer);
+      runtime.reconciliationTimer = null;
+      runtime.scanner.stop();
+    }
+    await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.reconciliationInFlight));
+    this.runtimes.clear();
+    this.runtimeLoads.clear();
+  }
+
   async getSnapshot(accountId: string): Promise<AccountSnapshot> {
     const runtime = await this.ensureRuntime(accountId);
     return {
@@ -187,6 +204,29 @@ export class TradingRuntimeManager {
 
   async listExecutionAuditEvents(accountId: string, executionIntentId?: string, limit = 100): Promise<unknown[]> {
     return this.executionIntentRepository.listAuditEvents(accountId, executionIntentId, limit);
+  }
+
+  getOperationalStatus(): {
+    runtimeCount: number;
+    readyAccounts: number;
+    degradedAccounts: number;
+    disconnectedAccounts: number;
+    recoveringAccounts: number;
+    shuttingDown: boolean;
+    reconciliationSuccess: number;
+    reconciliationFailure: number;
+  } {
+    const runtimes = [...this.runtimes.values()];
+    return {
+      runtimeCount: runtimes.length,
+      readyAccounts: runtimes.filter((runtime) => runtime.health.state === "READY").length,
+      degradedAccounts: runtimes.filter((runtime) => runtime.health.state === "DEGRADED" || runtime.health.state === "ERROR").length,
+      disconnectedAccounts: runtimes.filter((runtime) => runtime.health.state === "DISCONNECTED").length,
+      recoveringAccounts: runtimes.filter((runtime) => runtime.health.state === "RECOVERING").length,
+      shuttingDown: this.shuttingDown,
+      reconciliationSuccess: runtimes.reduce((sum, runtime) => sum + runtime.health.reconciliationSuccess, 0),
+      reconciliationFailure: runtimes.reduce((sum, runtime) => sum + runtime.health.reconciliationFailure, 0)
+    };
   }
 
   async getManualPositions(accountId: string, symbol: string): Promise<BinanceFuturesPositionStatus[]> {

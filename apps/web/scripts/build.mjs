@@ -19,6 +19,6 @@ await Promise.all([
   cp(join(root, "chart"), join(dist, "chart"), { recursive: true })
 ]);
 await writeFile(
-  join(dist, "app-config.js"),
+  join(dist, "config.js"),
   `window.__APP_CONFIG__ = ${JSON.stringify({ API_BASE_URL: apiBaseUrl })};\n`
 );

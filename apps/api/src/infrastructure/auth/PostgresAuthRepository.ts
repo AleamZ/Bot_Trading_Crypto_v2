@@ -1,5 +1,6 @@
 import pg from "pg";
 import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { AuthRepository } from "../../application/auth/AuthRepository.js";
 import { DuplicateEmailError } from "../../application/auth/AuthRepository.js";
 import type { User, UserSession } from "../../domain/auth/User.js";
@@ -13,6 +14,7 @@ export class PostgresAuthRepository implements AuthRepository {
   }
 
   async migrate(): Promise<void> {
+    await recordSchemaMigration(this.pool, "001_auth_foundation", "auth users and sessions");
     await this.ensurePhaseOneUsersTable();
 
     await this.pool.query(`
@@ -64,13 +66,20 @@ export class PostgresAuthRepository implements AuthRepository {
     const legacyName = `users_legacy_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
     await this.pool.query("begin");
     try {
-      await this.pool.query(`drop table if exists user_sessions`);
+      await this.renameTableIfExists("user_sessions");
       await this.pool.query(`alter table users rename to ${legacyName}`);
       await this.pool.query("commit");
     } catch (error) {
       await this.pool.query("rollback");
       throw error;
     }
+  }
+
+  private async renameTableIfExists(tableName: string): Promise<void> {
+    const exists = await this.pool.query(`select to_regclass($1) as table_name`, [`public.${tableName}`]);
+    if (!exists.rows[0]?.table_name) return;
+    const legacyName = `${tableName}_legacy_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+    await this.pool.query(`alter table ${tableName} rename to ${legacyName}`);
   }
 
   private async hasUniqueConstraint(tableName: string, columnNames: string[]): Promise<boolean> {

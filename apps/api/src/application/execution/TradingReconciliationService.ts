@@ -14,6 +14,8 @@ export interface ReconciliationResult {
 }
 
 export class TradingReconciliationService {
+  private readonly recentExternalAudits = new Map<string, number>();
+
   constructor(
     private readonly repository: ExecutionIntentRepository,
     private readonly logger: DecisionLogger
@@ -43,11 +45,7 @@ export class TradingReconciliationService {
         const hasKnownOrder = relatedOpenOrders.some((order) => Boolean(order.clientOrderId && botClientOrderIds.has(order.clientOrderId)));
         if (!knownSymbols.has(position.symbol) && !hasKnownOrder) {
           externalPositions += 1;
-          await this.audit(tradingAccountId, null, position.symbol, "EXTERNAL_POSITION_DETECTED", {
-            side: position.side,
-            quantity: position.quantity,
-            source: "EXTERNAL"
-          });
+          await this.auditExternalPosition(tradingAccountId, position);
         }
       }
 
@@ -247,6 +245,19 @@ export class TradingReconciliationService {
       type,
       metadata,
       createdAt: new Date().toISOString()
+    });
+  }
+
+  private async auditExternalPosition(tradingAccountId: string, position: BinanceFuturesPositionStatus): Promise<void> {
+    const key = `${tradingAccountId}:${position.symbol}:${position.side}`;
+    const now = Date.now();
+    const previous = this.recentExternalAudits.get(key) ?? 0;
+    if (now - previous < 15 * 60 * 1000) return;
+    this.recentExternalAudits.set(key, now);
+    await this.audit(tradingAccountId, null, position.symbol, "EXTERNAL_POSITION_DETECTED", {
+      side: position.side,
+      quantity: position.quantity,
+      source: "EXTERNAL"
     });
   }
 }

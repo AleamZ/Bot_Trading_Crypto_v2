@@ -8,17 +8,19 @@ export async function fetchCandles({ symbol, interval, limit }) {
   return response.json();
 }
 
-export async function fetchOverlays({ symbol, interval, limit }) {
+export async function fetchOverlays({ accountId, symbol, interval, limit }) {
+  if (!accountId) throw new Error("Trading account is required for chart overlays");
   const response = await apiFetch(
-    `/api/chart/overlays?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(interval)}&limit=${limit}`,
+    `/api/trading-accounts/${accountId}/chart/overlays?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(interval)}&limit=${limit}`,
   );
   if (!response.ok) throw new Error(`Overlays request failed: ${response.status}`);
   return response.json();
 }
 
-export async function fetchAccountActivity({ symbol, limit }) {
+export async function fetchAccountActivity({ accountId, symbol, limit }) {
+  if (!accountId) throw new Error("Trading account is required for account activity");
   const response = await apiFetch(
-    `/api/binance/account-activity?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+    `/api/trading-accounts/${accountId}/chart/account-activity?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
   );
   if (!response.ok) throw new Error(`Account activity request failed: ${response.status}`);
   return response.json();

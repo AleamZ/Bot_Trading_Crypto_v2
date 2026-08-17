@@ -58,6 +58,7 @@ const settingsState = { ...defaultSettings };
 let marketSymbols = [];
 let symbolSearchTerm = "";
 let settingsRequestSequence = 0;
+let analysisRequestSequence = 0;
 
 $("home-nav").addEventListener("click", () => showView("home"));
 $("chart-nav").addEventListener("click", () => showView("chart"));
@@ -295,6 +296,8 @@ async function setActiveTradingAccount(account) {
   renderAccountSelector();
   renderSettings();
   await Promise.all([loadActiveAccountStatus(), loadSettings(account.id)]);
+  if ($("chart-view").classList.contains("active")) loadChart();
+  if ($("analysis-view").classList.contains("active")) loadAnalysis();
 }
 
 function startCreateAccount(mode) {
@@ -719,10 +722,15 @@ async function ensureChart() {
 async function loadChart() {
   try {
     await ensureChart();
+    const accountId = accountState.activeAccount?.id;
+    if (!accountId) {
+      $("chart-status").textContent = "Select a trading account";
+      return;
+    }
     const symbol = $("chart-symbol").value.trim().toUpperCase() || "BTCUSDT";
     const interval = $("chart-interval").value;
     $("chart-symbol").value = symbol;
-    await chartState.instance.load({ symbol, interval, limit: 300 });
+    await chartState.instance.load({ accountId, symbol, interval, limit: 300 });
   } catch (error) {
     $("chart-status").textContent = error instanceof Error ? error.message : String(error);
   }
@@ -733,23 +741,29 @@ function resizeChart() {
 }
 
 async function loadAnalysis() {
+  const accountId = accountState.activeAccount?.id;
+  const sequence = ++analysisRequestSequence;
   const symbol = $("analysis-symbol").value.trim().toUpperCase() || "BTCUSDT";
   $("analysis-symbol").value = symbol;
+  if (!accountId) {
+    $("analysis-status").textContent = "Select a trading account";
+    return;
+  }
   $("analysis-status").textContent = `Analyzing ${symbol}`;
   $("analysis-run").disabled = true;
 
   try {
-    const path = accountState.activeAccount
-      ? `/api/trading-accounts/${accountState.activeAccount.id}/analysis?symbol=${encodeURIComponent(symbol)}`
-      : `/api/analysis?symbol=${encodeURIComponent(symbol)}`;
+    const path = `/api/trading-accounts/${accountId}/analysis?symbol=${encodeURIComponent(symbol)}`;
     const response = await apiFetch(path);
+    if (sequence !== analysisRequestSequence || accountId !== accountState.activeAccount?.id) return;
     if (handleUnauthorized(response)) return;
     if (!response.ok) throw new Error(`Analysis request failed: ${response.status}`);
     renderAnalysis(await response.json());
   } catch (error) {
+    if (sequence !== analysisRequestSequence || accountId !== accountState.activeAccount?.id) return;
     $("analysis-status").textContent = error instanceof Error ? error.message : String(error);
   } finally {
-    $("analysis-run").disabled = false;
+    if (sequence === analysisRequestSequence) $("analysis-run").disabled = false;
   }
 }
 

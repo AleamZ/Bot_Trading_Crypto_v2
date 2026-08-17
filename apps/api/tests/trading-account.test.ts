@@ -66,7 +66,8 @@ describe("trading account HTTP flow", () => {
         logger: fakeLogger(),
         auth,
         tradingAccounts,
-        runtimeManager
+        runtimeManager,
+        marketData: new FakeMarketData() as never
       })
     );
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -200,6 +201,51 @@ describe("trading account HTTP flow", () => {
     expect(reloadedB.leverage).toBe(3);
   });
 
+  it("rejects cross-user access to account-scoped runtime routes", async () => {
+    const cookieA = await register("a@example.com");
+    const cookieB = await register("b@example.com");
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "B", mode: "DEMO" }, cookieB)).json()).account;
+
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/snapshot`, { headers: { cookie: cookieA } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/settings`, { headers: { cookie: cookieA } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/watchlist`, { headers: { cookie: cookieA } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/watchlist/status`, { headers: { cookie: cookieA } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/chart/overlays?symbol=BTCUSDT&timeframe=M5`, { headers: { cookie: cookieA } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie: cookieA } })).status).toBe(404);
+  });
+
+  it("keeps same-user runtimes and snapshots isolated for the same symbol", async () => {
+    const cookie = await register("a@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "test2", mode: "DEMO" }, cookie)).json()).account;
+
+    await putJson(`/api/trading-accounts/${accountA.id}/settings`, { ...testConfig(), marginPerTrade: 900, leverage: 9, watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), marginPerTrade: 200, leverage: 5, watchlist: ["BTCUSDT"] }, cookie);
+
+    await runtimeManager.ensureRuntime(accountA.id);
+    await runtimeManager.ensureRuntime(accountB.id);
+    const engineA = runtimeManager.getEngineForTest(accountA.id, "BTCUSDT");
+    const engineB = runtimeManager.getEngineForTest(accountB.id, "BTCUSDT");
+    const snapshotA = await runtimeManager.getSnapshot(accountA.id);
+    const snapshotB = await runtimeManager.getSnapshot(accountB.id);
+
+    expect(engineA).toBeTruthy();
+    expect(engineB).toBeTruthy();
+    expect(engineA).not.toBe(engineB);
+    expect(readSnapshotSettings(snapshotA.store).marginPerTrade).toBe(900);
+    expect(readSnapshotSettings(snapshotA.store).leverage).toBe(9);
+    expect(readSnapshotSettings(snapshotB.store).marginPerTrade).toBe(200);
+    expect(readSnapshotSettings(snapshotB.store).leverage).toBe(5);
+
+    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), marginPerTrade: 333, leverage: 3, watchlist: ["BTCUSDT"] }, cookie);
+    const reloadedA = await runtimeManager.getSnapshot(accountA.id);
+    const reloadedB = await runtimeManager.getSnapshot(accountB.id);
+    expect(readSnapshotSettings(reloadedA.store).marginPerTrade).toBe(900);
+    expect(readSnapshotSettings(reloadedA.store).leverage).toBe(9);
+    expect(readSnapshotSettings(reloadedB.store).marginPerTrade).toBe(333);
+    expect(readSnapshotSettings(reloadedB.store).leverage).toBe(3);
+  });
+
   it("does not share engine instances for the same symbol across accounts", async () => {
     const cookieA = await register("a@example.com");
     const cookieB = await register("b@example.com");
@@ -262,9 +308,32 @@ class MockVerifier implements BinanceAccountVerifier {
 }
 
 class FakeMarketData {
+  async getKlines(symbol: string, interval: string, limit: number) {
+    return Array.from({ length: Math.min(limit, 5) }, (_, index) => ({
+      openTime: 1_000 + index * 60_000,
+      closeTime: 1_000 + (index + 1) * 60_000,
+      time: 1_000 + index * 60_000,
+      open: 100 + index,
+      high: 102 + index,
+      low: 99 + index,
+      close: 101 + index,
+      volume: 10
+    }));
+  }
+
   async getClosedCandles(symbol: string, timeframe: "H1" | "M5", limit: number) {
     return [];
   }
+
+  async getFuturesSymbols() {
+    return [{ symbol: "BTCUSDT" }, { symbol: "ETHUSDT" }];
+  }
+}
+
+function readSnapshotSettings(store: unknown): AppConfig {
+  const settings = (store as { tradingSettings?: AppConfig }).tradingSettings;
+  if (!settings) throw new Error("Expected snapshot trading settings");
+  return settings;
 }
 
 function credentials(): { apiKey: string; apiSecret: string } {

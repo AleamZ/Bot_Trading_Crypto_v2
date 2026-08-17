@@ -40,6 +40,7 @@ export class TradingChart {
       tradeHistory: [],
     };
     this.lastKey = null;
+    this.loadSequence = 0;
     this.createChart();
     this.bindAccountTabs();
 
@@ -136,8 +137,9 @@ export class TradingChart {
     this.chart.subscribeCrosshairMove(() => this.refreshDomOverlays());
   }
 
-  async load({ symbol, interval, limit }) {
-    const key = `${symbol}:${interval}`;
+  async load({ accountId = null, symbol, interval, limit }) {
+    const sequence = ++this.loadSequence;
+    const key = `${accountId ?? "legacy"}:${symbol}:${interval}`;
     const resetRange = this.lastKey !== key;
     if (resetRange && this.lastKey !== null) {
       this.resetChart();
@@ -145,9 +147,10 @@ export class TradingChart {
     const visibleRange = resetRange ? null : this.chart.timeScale().getVisibleLogicalRange();
     const [candlePayload, overlayPayload, accountActivity] = await Promise.all([
       fetchCandles({ symbol, interval, limit }),
-      fetchOverlays({ symbol, interval, limit: 200 }),
-      fetchAccountActivity({ symbol, limit: 100 }),
+      fetchOverlays({ accountId, symbol, interval, limit: 200 }),
+      fetchAccountActivity({ accountId, symbol, limit: 100 }),
     ]);
+    if (sequence !== this.loadSequence) return;
 
     const candles = (candlePayload.klines ?? []).map((kline) => ({
       id: `${candlePayload.symbol}:${candlePayload.interval}:${kline.openTime}`,

@@ -45,11 +45,12 @@ export interface HttpServerParams {
   auth: AuthService;
   tradingAccounts?: TradingAccountService;
   runtimeManager?: TradingRuntimeManager;
+  marketData?: BinanceFuturesMarketData;
 }
 
 export function createHttpHandler(params: HttpServerParams): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
   let runtimeConfig = params.config;
-  const marketData = new BinanceFuturesMarketData(runtimeConfig.binanceTestnet);
+  const marketData = params.marketData ?? new BinanceFuturesMarketData(runtimeConfig.binanceTestnet);
   const accountClient =
     runtimeConfig.binanceApiKey && runtimeConfig.binanceApiSecret
       ? new BinanceFuturesAccountClient(runtimeConfig.binanceApiKey, runtimeConfig.binanceApiSecret, runtimeConfig.binanceTestnet)
@@ -429,12 +430,16 @@ async function handleTradingAccountRoute(params: {
   }
 
   if (child === "snapshot" && parts.length === 4 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
     await service.getOwnedAccount(userId, accountId);
     const account = await service.getAccount(userId, accountId);
     const [connection, binanceAccount, snapshot] = await Promise.all([
       service.getConnection(userId, accountId),
       service.getBinanceAccount(userId, accountId),
-      runtimeManager?.getSnapshot(accountId)
+      runtimeManager.getSnapshot(accountId)
     ]);
     sendJson(
       response,
@@ -453,8 +458,8 @@ async function handleTradingAccountRoute(params: {
           asset: "USDT",
           checkedAt: binanceAccount.checkedAt
         }),
-        store: snapshot?.store ?? {},
-        watchlistRows: snapshot?.watchlistStatus ?? []
+        store: snapshot.store,
+        watchlistRows: snapshot.watchlistStatus
       },
       corsHeaders
     );
@@ -462,8 +467,12 @@ async function handleTradingAccountRoute(params: {
   }
 
   if (child === "watchlist" && parts[4] === "status" && parts.length === 5 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
     await service.getOwnedAccount(userId, accountId);
-    sendJson(response, 200, { rows: (await runtimeManager?.getSnapshot(accountId))?.watchlistStatus ?? [] }, corsHeaders);
+    sendJson(response, 200, { rows: (await runtimeManager.getSnapshot(accountId)).watchlistStatus }, corsHeaders);
     return;
   }
 
@@ -472,6 +481,49 @@ async function handleTradingAccountRoute(params: {
     const query = parseAccountActivityQuery(requestUrl, config.symbol);
     const settings = await service.getSettings(userId, accountId);
     sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketData), corsHeaders);
+    return;
+  }
+
+  if (child === "chart" && parts[4] === "overlays" && parts.length === 5 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    const query = parseKlineQuery(requestUrl, config.symbol);
+    const [settings, snapshot, candles, manualPositions] = await Promise.all([
+      service.getSettings(userId, accountId),
+      runtimeManager.getSnapshot(accountId),
+      marketData.getKlines(query.symbol, query.interval, query.limit),
+      runtimeManager.getManualPositions(accountId, query.symbol)
+    ]);
+    sendJson(
+      response,
+      200,
+      await buildChartOverlays({
+        store: snapshot.store,
+        engineState: snapshot.engine,
+        symbol: query.symbol,
+        timeframe: query.interval,
+        candles,
+        emaPeriod: settings.emaPeriod,
+        marginPerTrade: settings.marginPerTrade,
+        leverage: settings.leverage,
+        manualPositions
+      }),
+      corsHeaders
+    );
+    return;
+  }
+
+  if (child === "chart" && parts[4] === "account-activity" && parts.length === 5 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    const query = parseAccountActivityQuery(requestUrl, config.symbol);
+    sendJson(response, 200, { symbol: query.symbol, limit: query.limit, ...(await runtimeManager.getAccountActivity(accountId, query.symbol, query.limit)) }, corsHeaders);
     return;
   }
 

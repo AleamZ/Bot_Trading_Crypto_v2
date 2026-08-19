@@ -8,6 +8,53 @@ import { detectM5StructureSignal } from "../src/domain/market-structure/Structur
 import { evaluateRisk } from "../src/domain/risk/RiskManager.js";
 import { transitionSetupState } from "../src/domain/setup/SetupStateMachine.js";
 import { LiquidityManager, buildLiquidityState, selectExternalLiquidityTarget } from "../src/domain/liquidity/LiquidityDetector.js";
+import { normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../src/domain/symbol/SymbolRules.js";
+
+describe("Binance symbol rules", () => {
+  it("normalizes quantity down to step size", () => {
+    expect(normalizeQuantity(0.00129, 0.001)).toBe(0.001);
+  });
+
+  it("normalizes price down to tick size", () => {
+    expect(normalizePrice(43123.456, 0.1)).toBe(43123.4);
+  });
+
+  it("rejects quantity below minQty", () => {
+    const result = validateAgainstSymbolRules(symbolRules(), {
+      symbol: "BTCUSDT",
+      orderType: "MARKET",
+      quantity: 0.0009,
+      notional: 100,
+      leverage: 20
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: "MIN_QTY" });
+  });
+
+  it("rejects minimum notional failure", () => {
+    const result = validateAgainstSymbolRules(symbolRules(), {
+      symbol: "BTCUSDT",
+      orderType: "MARKET",
+      quantity: 0.01,
+      notional: 4,
+      leverage: 20
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: "MIN_NOTIONAL" });
+  });
+
+  it("rejects leverage above Binance max", () => {
+    const result = validateAgainstSymbolRules(symbolRules(), {
+      symbol: "BTCUSDT",
+      orderType: "MARKET",
+      quantity: 0.01,
+      notional: 100,
+      leverage: 126
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: "MAX_LEVERAGE" });
+  });
+});
 
 describe("FVG rules", () => {
   it("detects bullish H1 FVG from three closed candles", () => {
@@ -318,5 +365,26 @@ function riskInput(overrides: Partial<RiskInput> = {}): RiskInput {
     killSwitch: false,
     createdAt: 1,
     ...overrides
+  };
+}
+
+function symbolRules(): FuturesSymbolRules {
+  return {
+    symbol: "BTCUSDT",
+    status: "TRADING",
+    contractType: "PERPETUAL",
+    quoteAsset: "USDT",
+    marginAsset: "USDT",
+    pricePrecision: 1,
+    quantityPrecision: 3,
+    tickSize: 0.1,
+    minPrice: 0.1,
+    maxPrice: null,
+    stepSize: 0.001,
+    minQty: 0.001,
+    maxQty: 100,
+    minNotional: 5,
+    maxLeverage: 125,
+    supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
   };
 }

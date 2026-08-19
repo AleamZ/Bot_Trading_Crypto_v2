@@ -16,6 +16,7 @@ import { LockedRealExecutionGateway } from "../src/infrastructure/execution/Lock
 import type { TradingEngine } from "../src/application/engine/TradingEngine.js";
 import type { DecisionLogger } from "../src/application/ports/Logger.js";
 import type { TradingAccountMode } from "../src/domain/trading-account/TradingAccount.js";
+import type { FuturesSymbolRules } from "../src/domain/symbol/SymbolRules.js";
 
 const sessionSecret = "test-session-secret-with-at-least-thirty-two-chars";
 const encryptionKey = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -58,6 +59,8 @@ describe("trading account HTTP flow", () => {
     executionIntentRepository = new MemoryExecutionIntentRepository();
     verifier = new MockVerifier();
     accountClientFactoryCalls = [];
+    FakeAccountClient.nextLeverage = 20;
+    FakeAccountClient.nextMarginType = "ISOLATED";
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
     const cipher = new CredentialCipher(encryptionKey);
     const tradingAccounts = new TradingAccountService(accountRepository, cipher, verifier, configRepository, testConfig());
@@ -73,7 +76,8 @@ describe("trading account HTTP flow", () => {
       (apiKey, apiSecret, testnet) => {
         accountClientFactoryCalls.push({ apiKey, apiSecret, testnet });
         return new FakeAccountClient();
-      }
+      },
+      new FakeSymbolMetadataService()
     );
     server = createServer(
       createHttpHandler({
@@ -161,6 +165,64 @@ describe("trading account HTTP flow", () => {
     expect(verifier.calls.map((call) => call.mode)).toEqual(["DEMO", "REAL"]);
     expect((await (await fetch(`${baseUrl}/api/trading-accounts/${demo.id}/binance-account`, { headers: { cookie } })).json()).account.environment).toBe("TESTNET");
     expect((await (await fetch(`${baseUrl}/api/trading-accounts/${real.id}/binance-account`, { headers: { cookie } })).json()).account.environment).toBe("MAINNET");
+  });
+
+  it("reports REAL readiness while execution remains locked and never returns secrets", async () => {
+    const cookie = await register("real-ready@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, leverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } });
+    expect(response.status).toBe(200);
+    const bodyText = await response.text();
+    const body = JSON.parse(bodyText);
+
+    expect(body.readiness).toMatchObject({
+      accountReady: true,
+      mode: "REAL",
+      executionLocked: true,
+      executionReason: "REAL_EXECUTION_LOCKED",
+      checks: { realExecutionLocked: { ok: false, reason: "REAL_EXECUTION_LOCKED" } }
+    });
+    expect(bodyText).not.toContain("secret-value");
+    expect(bodyText).not.toContain("apiSecret");
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "ABCD1234WXYZ", apiSecret: "secret-value", testnet: false });
+  });
+
+  it("reports REAL leverage and margin mode mismatches", async () => {
+    FakeAccountClient.nextLeverage = 10;
+    FakeAccountClient.nextMarginType = "CROSS";
+    const cookie = await register("real-mismatch@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, leverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
+
+    const body = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(body.readiness).toMatchObject({
+      accountReady: false,
+      binanceLeverage: 10,
+      leverageMatch: false,
+      binanceMarginMode: "CROSS",
+      marginModeMatch: false
+    });
+    expect(body.readiness.checks.leverageValid.reason).toBe("LEVERAGE_MISMATCH");
+    expect(body.readiness.checks.marginModeKnown.reason).toBe("MARGIN_MODE_MISMATCH");
+  });
+
+  it("keeps two REAL readiness checks isolated on the same symbol", async () => {
+    const cookie = await register("two-real@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "Real A", mode: "REAL" }, cookie)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "Real B", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${accountA.id}/binance-connection`, { apiKey: "ACCOUNT_A_KEY", apiSecret: "ACCOUNT_A_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/binance-connection`, { apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET" }, cookie);
+
+    await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/symbol-rules?symbol=BTCUSDT`, { headers: { cookie } });
+    await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } });
+
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "ACCOUNT_A_KEY", apiSecret: "ACCOUNT_A_SECRET", testnet: false });
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET", testnet: false });
   });
 
   it("normalizes invalid credentials, missing futures permission, and unavailable Binance", async () => {
@@ -363,6 +425,21 @@ class FakeMarketData {
 }
 
 class FakeAccountClient {
+  static nextLeverage = 20;
+  static nextMarginType: "CROSS" | "ISOLATED" = "ISOLATED";
+
+  async getWalletStatus() {
+    return {
+      connected: true,
+      environment: "live" as const,
+      label: "Binance Futures account verified",
+      walletBalance: 10_000,
+      availableBalance: 10_000,
+      asset: "USDT" as const,
+      checkedAt: new Date().toISOString()
+    };
+  }
+
   async getOpenPositions() {
     return [];
   }
@@ -377,6 +454,43 @@ class FakeAccountClient {
 
   async getTradeHistory() {
     return [];
+  }
+
+  async getSymbolAccountState(symbol: string) {
+    return {
+      symbol,
+      leverage: FakeAccountClient.nextLeverage,
+      marginType: FakeAccountClient.nextMarginType,
+      positionSide: "BOTH"
+    };
+  }
+
+  async getLeverageBrackets(symbol: string) {
+    return [{ symbol, maxInitialLeverage: 125 }];
+  }
+}
+
+class FakeSymbolMetadataService {
+  async getSymbolRules(symbol: string, _environment: "testnet" | "live", loadLeverageBrackets?: () => Promise<Array<{ symbol: string; maxInitialLeverage: number | null }>>): Promise<FuturesSymbolRules> {
+    const brackets = await loadLeverageBrackets?.();
+    return {
+      symbol,
+      status: "TRADING",
+      contractType: "PERPETUAL",
+      quoteAsset: "USDT",
+      marginAsset: "USDT",
+      pricePrecision: 1,
+      quantityPrecision: 3,
+      tickSize: 0.1,
+      minPrice: 0.1,
+      maxPrice: null,
+      stepSize: 0.001,
+      minQty: 0.001,
+      maxQty: 100,
+      minNotional: 5,
+      maxLeverage: brackets?.find((item) => item.symbol === symbol)?.maxInitialLeverage ?? 125,
+      supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    };
   }
 }
 

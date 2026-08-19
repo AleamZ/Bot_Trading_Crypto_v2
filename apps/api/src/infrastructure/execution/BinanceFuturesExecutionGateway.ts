@@ -8,13 +8,14 @@ import type {
 } from "../../application/ports/ExecutionGateway.js";
 import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
+import { formatRuleNumber, normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../../domain/symbol/SymbolRules.js";
 
 type BinanceOrderSide = "BUY" | "SELL";
 type EntryMode = "limit" | "market";
 
 export class BinanceFuturesExecutionGateway implements RecoverableExecutionGateway {
   private readonly baseUrl: string;
-  private readonly symbolRules = new Map<string, SymbolRules>();
+  private readonly symbolRules = new Map<string, FuturesSymbolRules>();
 
   constructor(
     private readonly apiKey: string,
@@ -29,16 +30,25 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision, context?: ExecutionOrderContext): Promise<SubmittedOrder> {
     const symbol = risk.symbol;
     const rules = await this.getSymbolRules(symbol);
-    const quantity = formatByStep(risk.quantity, rules.stepSize);
-    if (Number(quantity) <= 0) throw new Error("Rounded quantity is zero");
+    const entryOrderType = this.entryMode.toUpperCase();
+    const validation = validateAgainstSymbolRules(rules, {
+      symbol,
+      orderType: entryOrderType,
+      quantity: risk.quantity,
+      price: this.entryMode === "limit" ? plan.entry : null,
+      notional: risk.notional,
+      leverage: risk.leverage
+    });
+    if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
+    const quantity = formatRuleNumber(validation.normalized.quantity);
 
     await this.setLeverage(symbol);
 
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
-    const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatByStep(plan.entry, rules.tickSize), context?.clientEntryOrderId);
-    const stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatByStep(plan.stopLoss, rules.tickSize), context?.clientStopOrderId);
-    const takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatByStep(plan.takeProfit, rules.tickSize), context?.clientTakeProfitOrderId);
+    const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatRuleNumber(normalizePrice(plan.entry, rules.tickSize)), context?.clientEntryOrderId);
+    const stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
+    const takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
 
     return {
       orderId: String(entry.orderId),
@@ -66,12 +76,21 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
 
   async submitProtectionOrder(request: ProtectionOrderRequest): Promise<ExecutionOrderLookupResult> {
     const rules = await this.getSymbolRules(request.symbol);
+    const validation = validateAgainstSymbolRules(rules, {
+      symbol: request.symbol,
+      orderType: request.type,
+      quantity: request.quantity,
+      stopPrice: request.stopPrice,
+      notional: request.quantity * request.stopPrice,
+      leverage: 1
+    });
+    if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
     const order = await this.submitTriggerOrder(
       request.symbol,
       request.type,
       request.side,
-      formatByStep(request.quantity, rules.stepSize),
-      formatByStep(request.stopPrice, rules.tickSize),
+      formatRuleNumber(validation.normalized.quantity),
+      formatRuleNumber(validation.normalized.stopPrice ?? normalizePrice(request.stopPrice, rules.tickSize)),
       request.clientOrderId
     );
     return toExecutionOrderLookupResult(order, request.symbol, request.clientOrderId);
@@ -188,7 +207,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     return crypto.createHmac("sha256", this.apiSecret).update(payload).digest("hex");
   }
 
-  private async getSymbolRules(symbol: string): Promise<SymbolRules> {
+  private async getSymbolRules(symbol: string): Promise<FuturesSymbolRules> {
     const cached = this.symbolRules.get(symbol);
     if (cached) return cached;
 
@@ -204,18 +223,27 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     const lotSize = symbolInfo?.filters.find((filter) => filter.filterType === "LOT_SIZE");
     const priceFilter = symbolInfo?.filters.find((filter) => filter.filterType === "PRICE_FILTER");
     const minNotional = symbolInfo?.filters.find((filter) => filter.filterType === "MIN_NOTIONAL");
-    const stepSize = Number(lotSize?.stepSize ?? 0.001);
-    const tickSize = Number(priceFilter?.tickSize ?? 0.1);
-    const rules = { stepSize, tickSize, minNotional: Number(minNotional?.notional ?? 5) };
+    const rules: FuturesSymbolRules = {
+      symbol,
+      status: symbolInfo?.status ?? "UNKNOWN",
+      contractType: symbolInfo?.contractType ?? null,
+      quoteAsset: symbolInfo?.quoteAsset ?? null,
+      marginAsset: symbolInfo?.marginAsset ?? null,
+      pricePrecision: numberOrNull(symbolInfo?.pricePrecision),
+      quantityPrecision: numberOrNull(symbolInfo?.quantityPrecision),
+      tickSize: Number(priceFilter?.tickSize ?? 0.1),
+      minPrice: numberOrNull(priceFilter?.minPrice),
+      maxPrice: numberOrNull(priceFilter?.maxPrice),
+      stepSize: Number(lotSize?.stepSize ?? 0.001),
+      minQty: Number(lotSize?.minQty ?? 0),
+      maxQty: numberOrNull(lotSize?.maxQty),
+      minNotional: numberOrNull(minNotional?.notional),
+      maxLeverage: null,
+      supportedOrderTypes: symbolInfo?.orderTypes ?? []
+    };
     this.symbolRules.set(symbol, rules);
     return rules;
   }
-}
-
-interface SymbolRules {
-  stepSize: number;
-  tickSize: number;
-  minNotional: number;
 }
 
 interface BinanceOrderResponse {
@@ -234,9 +262,20 @@ interface BinanceOrderResponse {
 interface BinanceExchangeInfo {
   symbols?: Array<{
     symbol: string;
+    status?: string;
+    contractType?: string;
+    quoteAsset?: string;
+    marginAsset?: string;
+    pricePrecision?: number;
+    quantityPrecision?: number;
+    orderTypes?: string[];
     filters: Array<{
       filterType: string;
+      minPrice?: string;
+      maxPrice?: string;
       stepSize?: string;
+      minQty?: string;
+      maxQty?: string;
       tickSize?: string;
       notional?: string;
     }>;
@@ -245,21 +284,6 @@ interface BinanceExchangeInfo {
 
 function oppositeSide(side: BinanceOrderSide): BinanceOrderSide {
   return side === "BUY" ? "SELL" : "BUY";
-}
-
-function formatByStep(value: number, step: number): string {
-  if (!Number.isFinite(value) || value <= 0) return "0";
-  if (!Number.isFinite(step) || step <= 0) return Number(value.toFixed(8)).toString();
-
-  const precision = decimalPlaces(step);
-  const rounded = Math.floor(value / step) * step;
-  return rounded.toFixed(precision).replace(/\.?0+$/, "");
-}
-
-function decimalPlaces(value: number): number {
-  const text = value.toString();
-  if (text.includes("e-")) return Number(text.split("e-")[1] ?? 8);
-  return text.includes(".") ? text.split(".")[1]?.length ?? 0 : 0;
 }
 
 function toExecutionOrderLookupResult(order: BinanceOrderResponse, fallbackSymbol: string, fallbackClientOrderId: string): ExecutionOrderLookupResult {
@@ -277,7 +301,7 @@ function toExecutionOrderLookupResult(order: BinanceOrderResponse, fallbackSymbo
   };
 }
 
-function numberOrNull(value: string | undefined): number | null {
+function numberOrNull(value: string | number | undefined): number | null {
   const number = Number(value ?? 0);
   return Number.isFinite(number) && number > 0 ? number : null;
 }

@@ -485,9 +485,19 @@ async function load() {
   $("market-data-detail").textContent = marketData.label ?? "-";
 
   $("engine-state").textContent = engine.setupState ?? "-";
+  const execution = snapshot.execution ?? runtimeHealth.execution ?? {
+    enabled: Boolean(runtimeHealth.executionEnabled),
+    reason: runtimeHealth.executionEnabled ? "READY" : "RECONCILIATION_REQUIRED",
+  };
+  const executionLabel = execution.enabled ? "ENABLED" : "DISABLED";
+  const executionReason = execution.reason ? ` · ${execution.reason}` : "";
+  const realReadiness = snapshot.realReadiness ?? null;
+  const readinessText = realReadiness
+    ? ` · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"} · Execution LOCKED · ${realReadiness.executionReason}`
+    : "";
   const reconciliationError = runtimeHealth.lastReconciliationError ? ` · Error ${runtimeHealth.lastReconciliationError}` : "";
   $("engine-detail").textContent =
-    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${runtimeHealth.executionEnabled ? "ENABLED" : "DISABLED"}${reconciliationError} · Margin ${formatUsdt(runtime.risk?.marginPerTrade)} · Leverage ${runtime.risk?.leverage ?? "-"}x`;
+    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${executionLabel}${executionReason}${readinessText}${reconciliationError} · Margin ${formatUsdt(runtime.risk?.marginPerTrade)} · Leverage ${runtime.risk?.leverage ?? "-"}x`;
 
   $("trend").textContent = engine.trend ?? "-";
   $("symbol").textContent = runtime.symbol ?? "-";

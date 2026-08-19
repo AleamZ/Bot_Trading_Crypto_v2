@@ -607,10 +607,34 @@ async function handleTradingAccountRoute(params: {
         }),
         store: snapshot.store,
         watchlistRows: snapshot.watchlistStatus,
-        runtimeHealth: snapshot.runtimeHealth
+        runtimeHealth: snapshot.runtimeHealth,
+        execution: snapshot.execution,
+        realReadiness: snapshot.realReadiness
       },
       corsHeaders
     );
+    return;
+  }
+
+  if (child === "readiness" && parts.length === 4 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    const symbol = requestUrl.searchParams.get("symbol") ?? (await service.getSettings(userId, accountId)).symbol;
+    sendJson(response, 200, { readiness: await runtimeManager.getRealReadiness(accountId, symbol) }, corsHeaders);
+    return;
+  }
+
+  if (child === "symbol-rules" && parts.length === 4 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    const symbol = requestUrl.searchParams.get("symbol") ?? (await service.getSettings(userId, accountId)).symbol;
+    sendJson(response, 200, { symbolRules: await runtimeManager.getSymbolRules(accountId, symbol) }, corsHeaders);
     return;
   }
 

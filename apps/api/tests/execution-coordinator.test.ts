@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { ExecutionCoordinator } from "../src/application/execution/ExecutionCoordinator.js";
+import { ExecutionCoordinator, type ExecutionGateState } from "../src/application/execution/ExecutionCoordinator.js";
+import { resolveExecutionGate } from "../src/application/runtime/TradingRuntimeManager.js";
 import { TradingReconciliationService } from "../src/application/execution/TradingReconciliationService.js";
 import type {
   ExecutionGateway,
@@ -14,7 +15,12 @@ import type { ExecutionIntentRepository } from "../src/application/execution/Exe
 import type { DecisionLogger } from "../src/application/ports/Logger.js";
 import type { EntryPlan } from "../src/domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../src/domain/risk/RiskDecision.js";
+import type { AppConfig } from "../src/application/config/AppConfig.js";
+import { defaultTradingSettings } from "../src/application/config/AppConfig.js";
+import { MarketScanner } from "../src/application/scanner/MarketScanner.js";
+import type { BinanceFuturesMarketData } from "../src/infrastructure/market-data/BinanceFuturesMarketData.js";
 import { MemoryExecutionIntentRepository } from "../src/infrastructure/execution/MemoryExecutionIntentRepository.js";
+import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
 import { LockedRealExecutionGateway } from "../src/infrastructure/execution/LockedRealExecutionGateway.js";
 import { isRecoverableExecutionGateway } from "../src/application/ports/ExecutionGateway.js";
 
@@ -133,6 +139,30 @@ describe("ExecutionCoordinator", () => {
     expect(isRecoverableExecutionGateway(new LockedRealExecutionGateway())).toBe(false);
   });
 
+  it("keeps REAL locked before pre-trade validation and creates no intent", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    let validated = false;
+    const coordinator = new ExecutionCoordinator({
+      tradingAccountId: "account-real",
+      mode: "REAL",
+      entryType: "market",
+      repository,
+      delegate,
+      logger: fakeLogger(),
+      retry: { maxAttempts: 1, baseDelayMs: 0 },
+      executionGate: () => ({ enabled: true, reason: "READY" }),
+      preTradeValidation: () => {
+        validated = true;
+      }
+    });
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("REAL_EXECUTION_LOCKED");
+    expect(validated).toBe(false);
+    expect(delegate.calls).toHaveLength(0);
+    expect(await repository.listByAccount("account-real")).toHaveLength(0);
+  });
+
   it("keeps REAL execution locked in production even when trading is enabled and runtime is ready", async () => {
     const previous = process.env.NODE_ENV;
     process.env.NODE_ENV = "production";
@@ -178,6 +208,63 @@ describe("ExecutionCoordinator", () => {
     expect(await repository.listByAccount("account-a")).toHaveLength(0);
   });
 
+  it("prevents submit when trading is disabled and does not create an intent", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    const coordinator = coordinatorFor("account-a", repository, delegate, "DEMO", () => ({ enabled: false, reason: "TRADING_DISABLED" }));
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("TRADING_DISABLED");
+    expect(delegate.calls).toHaveLength(0);
+    expect(await repository.listByAccount("account-a")).toHaveLength(0);
+  });
+
+  it("prevents submit when kill switch is on and does not create an intent", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    const coordinator = coordinatorFor("account-a", repository, delegate, "DEMO", () => ({ enabled: false, reason: "KILL_SWITCH" }));
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("KILL_SWITCH");
+    expect(delegate.calls).toHaveLength(0);
+    expect(await repository.listByAccount("account-a")).toHaveLength(0);
+  });
+
+  it("evaluates execution gate on every submit so saved settings take effect without restart", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    let gate: ExecutionGateState = { enabled: false, reason: "TRADING_DISABLED" };
+    const coordinator = coordinatorFor("account-a", repository, delegate, "DEMO", () => gate);
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("TRADING_DISABLED");
+    gate = { enabled: true, reason: "READY" };
+
+    await coordinator.submitBracketOrder(plan(), risk());
+
+    expect(delegate.calls).toHaveLength(1);
+    expect(await repository.listByAccount("account-a")).toHaveLength(1);
+  });
+
+  it("blocks symbol rule failures before creating an intent or submitting", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    const coordinator = new ExecutionCoordinator({
+      tradingAccountId: "account-a",
+      mode: "DEMO",
+      entryType: "market",
+      repository,
+      delegate,
+      logger: fakeLogger(),
+      retry: { maxAttempts: 1, baseDelayMs: 0 },
+      executionGate: () => ({ enabled: true, reason: "READY" }),
+      preTradeValidation: () => {
+        throw new Error("MIN_QTY");
+      }
+    });
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("MIN_QTY");
+    expect(delegate.calls).toHaveLength(0);
+    expect(await repository.listByAccount("account-a")).toHaveLength(0);
+  });
+
   it("does not submit to Binance when the execution repository is unavailable", async () => {
     const delegate = new RecordingGateway();
     const coordinator = new ExecutionCoordinator({
@@ -193,6 +280,87 @@ describe("ExecutionCoordinator", () => {
 
     await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("DB_DOWN");
     expect(delegate.calls).toHaveLength(0);
+  });
+});
+
+describe("Execution gate", () => {
+  it("gives kill switch priority over trading enabled", () => {
+    expect(
+      resolveExecutionGate({
+        shuttingDown: false,
+        mode: "DEMO",
+        runtimeState: "READY",
+        reconciliationStatus: "OK",
+        tradingEnabled: true,
+        killSwitch: true,
+        binanceConnected: true
+      })
+    ).toEqual({ enabled: false, reason: "KILL_SWITCH" });
+  });
+
+  it("keeps account-scoped disabled settings isolated from another account", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegateA = new RecordingGateway();
+    const delegateB = new RecordingGateway();
+    const accountA = coordinatorFor("account-a", repository, delegateA, "DEMO", () => ({ enabled: false, reason: "TRADING_DISABLED" }));
+    const accountB = coordinatorFor("account-b", repository, delegateB, "DEMO", () => ({ enabled: true, reason: "READY" }));
+
+    await expect(accountA.submitBracketOrder(plan(), risk())).rejects.toThrow("TRADING_DISABLED");
+    await accountB.submitBracketOrder(plan(), risk());
+
+    expect(delegateA.calls).toHaveLength(0);
+    expect(delegateB.calls).toHaveLength(1);
+    expect(await repository.listByAccount("account-a")).toHaveLength(0);
+    expect(await repository.listByAccount("account-b")).toHaveLength(1);
+  });
+
+  it("keeps REAL locked regardless of trading enabled and kill switch settings", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    const coordinator = coordinatorFor("account-real", repository, delegate, "REAL", () => ({ enabled: true, reason: "READY" }));
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("REAL_EXECUTION_LOCKED");
+    expect(delegate.calls).toHaveLength(0);
+    expect(await repository.listByAccount("account-real")).toHaveLength(0);
+  });
+
+  it("does not call Binance in blocked gate cases", async () => {
+    const cases: ExecutionGateState[] = [
+      { enabled: false, reason: "TRADING_DISABLED" },
+      { enabled: false, reason: "KILL_SWITCH" },
+      { enabled: false, reason: "BINANCE_DISCONNECTED" },
+      { enabled: false, reason: "RUNTIME_NOT_READY" },
+      { enabled: false, reason: "RECONCILIATION_REQUIRED" },
+      { enabled: false, reason: "SHUTTING_DOWN" }
+    ];
+
+    for (const gate of cases) {
+      const repository = new MemoryExecutionIntentRepository();
+      const delegate = new RecordingGateway();
+      const coordinator = coordinatorFor(`account-${gate.reason}`, repository, delegate, "DEMO", () => gate);
+
+      await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow(gate.reason);
+      expect(delegate.calls).toHaveLength(0);
+      expect(await repository.listByAccount(`account-${gate.reason}`)).toHaveLength(0);
+    }
+  });
+
+  it("allows scanner analysis to run while execution is disabled", async () => {
+    const marketData = {
+      getClosedCandles: async () => []
+    } as unknown as BinanceFuturesMarketData;
+    const scanner = new MarketScanner(
+      appConfig({ tradingEnabled: false, killSwitch: true, watchlist: ["BTCUSDT"], symbol: "BTCUSDT" }),
+      new MemoryTradingRepository(),
+      new ThrowingExecutionGateway(),
+      fakeLogger(),
+      marketData,
+      null
+    );
+
+    await scanner.bootstrap();
+
+    expect(scanner.getWatchlistStatus()[0]?.symbol).toBe("BTCUSDT");
   });
 });
 
@@ -365,6 +533,22 @@ describe("TradingReconciliationService", () => {
     expect(saved?.binanceStopOrderId).toBeNull();
     expect(saved?.binanceTakeProfitOrderId).toBeNull();
   });
+
+  it("does not submit protection repair orders when execution gate blocks them", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-a");
+    const gateway = new BlockingRecoverableGateway("KILL_SWITCH");
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    await service.reconcile("account-a", activityWithPosition(intent, []), gateway);
+
+    const saved = (await repository.listByAccount("account-a"))[0];
+    expect(gateway.protectionRequests).toHaveLength(0);
+    expect(saved?.status).toBe("RECONCILIATION_REQUIRED");
+    expect(saved?.lastError).toBe("KILL_SWITCH");
+    expect(saved?.binanceStopOrderId).toBeNull();
+    expect(saved?.binanceTakeProfitOrderId).toBeNull();
+  });
 });
 
 class RecordingGateway implements ExecutionGateway {
@@ -435,13 +619,29 @@ class RecoverableRecordingGateway extends RecordingGateway implements Recoverabl
   }
 }
 
+class BlockingRecoverableGateway extends RecoverableRecordingGateway {
+  constructor(private readonly reason: string) {
+    super();
+  }
+
+  override async submitProtectionOrder(): Promise<ExecutionOrderLookupResult> {
+    throw new Error(this.reason);
+  }
+}
+
 class FailingExecutionIntentRepository extends MemoryExecutionIntentRepository implements ExecutionIntentRepository {
   override async createOrGet(): Promise<{ intent: ExecutionIntent; created: boolean }> {
     throw new Error("DB_DOWN");
   }
 }
 
-function coordinatorFor(accountId: string, repository: MemoryExecutionIntentRepository, delegate: ExecutionGateway, mode: "DEMO" | "REAL" = "DEMO"): ExecutionCoordinator {
+function coordinatorFor(
+  accountId: string,
+  repository: MemoryExecutionIntentRepository,
+  delegate: ExecutionGateway,
+  mode: "DEMO" | "REAL" = "DEMO",
+  executionGate?: () => ExecutionGateState
+): ExecutionCoordinator {
   return new ExecutionCoordinator({
     tradingAccountId: accountId,
     mode,
@@ -450,8 +650,37 @@ function coordinatorFor(accountId: string, repository: MemoryExecutionIntentRepo
     delegate,
     logger: fakeLogger(),
     retry: { maxAttempts: 1, baseDelayMs: 0 },
+    executionGate,
     runtimeReady: () => true
   });
+}
+
+class ThrowingExecutionGateway implements ExecutionGateway {
+  async submitBracketOrder(): Promise<SubmittedOrder> {
+    throw new Error("Execution should not be called by scanner bootstrap");
+  }
+}
+
+function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+  return {
+    ...defaultTradingSettings,
+    nodeEnv: "test",
+    port: 8787,
+    executionMode: "testnet",
+    logLevel: "error",
+    corsOrigins: ["http://localhost:5173"],
+    databaseUrl: undefined,
+    sessionSecret: "test-session-secret-change-before-production",
+    binanceCredentialEncryptionKey: "0000000000000000000000000000000000000000000000000000000000000000",
+    binanceApiKey: undefined,
+    binanceApiSecret: undefined,
+    binanceTestnet: true,
+    reconciliationIntervalMs: 30_000,
+    binanceRetryMaxAttempts: 1,
+    binanceRetryBaseDelayMs: 0,
+    postgresPoolMax: 2,
+    ...overrides
+  };
 }
 
 function plan(): EntryPlan {

@@ -61,6 +61,18 @@ export interface BinanceFuturesTradeHistoryStatus {
   createdAt: number | null;
 }
 
+export interface BinanceFuturesSymbolAccountState {
+  symbol: string;
+  leverage: number | null;
+  marginType: "CROSS" | "ISOLATED" | "UNKNOWN";
+  positionSide: string | null;
+}
+
+export interface BinanceFuturesLeverageBracket {
+  symbol: string;
+  maxInitialLeverage: number | null;
+}
+
 type BinanceExitSide = "BUY" | "SELL";
 
 export class BinanceFuturesAccountClient {
@@ -173,6 +185,25 @@ export class BinanceFuturesAccountClient {
     return trades.map(toTradeHistoryStatus).sort((a, b) => Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0));
   }
 
+  async getSymbolAccountState(symbol: string): Promise<BinanceFuturesSymbolAccountState> {
+    const positions = await this.signedGet<PositionRisk[]>("/fapi/v2/positionRisk", { symbol });
+    const position = positions[0];
+    return {
+      symbol,
+      leverage: numberOrNull(position?.leverage),
+      marginType: normalizeMarginType(position?.marginType),
+      positionSide: position?.positionSide ?? null
+    };
+  }
+
+  async getLeverageBrackets(symbol: string): Promise<BinanceFuturesLeverageBracket[]> {
+    const brackets = await this.signedGet<LeverageBracketResponse[]>("/fapi/v1/leverageBracket", { symbol });
+    return brackets.map((item) => ({
+      symbol: item.symbol,
+      maxInitialLeverage: maxInitialLeverage(item.brackets)
+    }));
+  }
+
   private async signedGet<T>(path: string, queryParams: Record<string, string> = {}): Promise<T> {
     const query = new URLSearchParams({ ...queryParams, timestamp: String(Date.now()), recvWindow: "5000" });
     query.set("signature", this.sign(query.toString()));
@@ -263,6 +294,18 @@ interface UserTrade {
   time?: number;
 }
 
+interface PositionRisk {
+  symbol: string;
+  leverage?: string;
+  marginType?: string;
+  positionSide?: string;
+}
+
+interface LeverageBracketResponse {
+  symbol: string;
+  brackets?: Array<{ initialLeverage?: number }>;
+}
+
 function toOpenOrderStatus(order: OpenOrder): BinanceFuturesOpenOrderStatus {
   const orderId = String(order.orderId ?? order.clientOrderId ?? `${order.symbol}:${order.side ?? "-"}:${order.type ?? "-"}:${order.time ?? 0}`);
   return {
@@ -334,6 +377,18 @@ function isTrue(value: boolean | string | undefined): boolean {
 function numberOrNull(value: string | undefined): number | null {
   const number = Number(value ?? 0);
   return number > 0 ? number : null;
+}
+
+function normalizeMarginType(value: string | undefined): "CROSS" | "ISOLATED" | "UNKNOWN" {
+  const normalized = String(value ?? "").toUpperCase();
+  if (normalized === "CROSSED" || normalized === "CROSS") return "CROSS";
+  if (normalized === "ISOLATED") return "ISOLATED";
+  return "UNKNOWN";
+}
+
+function maxInitialLeverage(brackets: Array<{ initialLeverage?: number }> | undefined): number | null {
+  const values = (brackets ?? []).map((item) => Number(item.initialLeverage ?? 0)).filter((value) => Number.isFinite(value) && value > 0);
+  return values.length > 0 ? Math.max(...values) : null;
 }
 
 function toSecondsOrNull(value: number | undefined): number | null {

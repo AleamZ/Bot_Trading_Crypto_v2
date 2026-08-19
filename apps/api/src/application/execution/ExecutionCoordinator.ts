@@ -17,16 +17,46 @@ export interface ExecutionCoordinatorOptions {
   delegate: ExecutionGateway;
   logger: DecisionLogger;
   retry: RetryPolicyOptions;
-  runtimeReady: () => boolean;
+  runtimeReady?: () => boolean;
+  executionGate?: () => ExecutionGateState;
+  preTradeValidation?: (plan: EntryPlan, risk: RiskDecision) => Promise<void> | void;
+}
+
+export type ExecutionGateReason =
+  | "READY"
+  | "TRADING_DISABLED"
+  | "KILL_SWITCH"
+  | "BINANCE_DISCONNECTED"
+  | "RUNTIME_NOT_READY"
+  | "RECONCILIATION_REQUIRED"
+  | "REAL_EXECUTION_LOCKED"
+  | "SHUTTING_DOWN";
+
+export interface ExecutionGateState {
+  enabled: boolean;
+  reason: ExecutionGateReason;
 }
 
 export class ExecutionCoordinator implements ExecutionGateway {
   constructor(private readonly options: ExecutionCoordinatorOptions) {}
 
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision): Promise<SubmittedOrder> {
-    if (this.options.mode !== "DEMO") throw new Error("REAL_EXECUTION_LOCKED");
-    if (!this.options.runtimeReady()) throw new Error("RECONCILIATION_REQUIRED");
+    if (this.options.mode !== "DEMO") {
+      await this.options.repository.saveAuditEvent({
+        id: crypto.randomUUID(),
+        tradingAccountId: this.options.tradingAccountId,
+        executionIntentId: null,
+        symbol: risk.symbol,
+        type: "REAL_EXECUTION_BLOCKED",
+        metadata: { reason: "REAL_EXECUTION_LOCKED" },
+        createdAt: new Date().toISOString()
+      });
+      throw new Error("REAL_EXECUTION_LOCKED");
+    }
+    const gate = this.executionGate();
+    if (!gate.enabled) throw new Error(gate.reason);
     if (!risk.accepted) throw new Error("Risk is not approved");
+    await this.options.preTradeValidation?.(plan, risk);
 
     const setupKey = buildSetupKey(this.options.tradingAccountId, plan, risk);
     const intentId = deterministicUuid(`${this.options.tradingAccountId}:${setupKey}`);
@@ -169,6 +199,12 @@ export class ExecutionCoordinator implements ExecutionGateway {
       metadata,
       createdAt: new Date().toISOString()
     });
+  }
+
+  private executionGate(): ExecutionGateState {
+    if (this.options.executionGate) return this.options.executionGate();
+    if (this.options.runtimeReady?.()) return { enabled: true, reason: "READY" };
+    return { enabled: false, reason: "RECONCILIATION_REQUIRED" };
   }
 }
 

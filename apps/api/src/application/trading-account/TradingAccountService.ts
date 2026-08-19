@@ -38,6 +38,14 @@ export class InvalidTradingAccountInputError extends Error {
   }
 }
 
+export class UnsafeTradingAccountDeletionError extends Error {
+  readonly code = "ACCOUNT_HAS_ACTIVE_TRADING_STATE";
+
+  constructor(message = "Trading account has active trading state") {
+    super(message);
+  }
+}
+
 export class TradingAccountService {
   constructor(
     private readonly repository: TradingAccountRepository,
@@ -164,6 +172,13 @@ export class TradingAccountService {
     await this.repository.deleteBinanceConnection(account.id);
     await this.repository.updateTradingAccountStatus(account.id, "DISCONNECTED", new Date().toISOString());
     return this.toSafeConnection(null);
+  }
+
+  async hardDeleteAccount(userId: string, accountId: string): Promise<void> {
+    await this.getOwnedAccount(userId, accountId);
+    await this.runtimeConfigRepository?.deleteAccountData?.(accountId);
+    const deleted = await this.repository.hardDeleteTradingAccount(accountId, userId);
+    if (!deleted) throw new TradingAccountNotFoundError();
   }
 
   async getBinanceAccount(userId: string, accountId: string): Promise<SafeBinanceAccount> {

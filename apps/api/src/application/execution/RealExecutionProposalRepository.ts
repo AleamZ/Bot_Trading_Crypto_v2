@@ -13,4 +13,5 @@ export interface RealExecutionProposalRepository {
     patch?: Partial<Pick<RealExecutionProposal, "approvedAt" | "approvedByUserId" | "rejectedAt" | "cancelledAt" | "executedAt" | "executionIntentId">>
   ): Promise<RealExecutionProposal | null>;
   expireOpen(nowIso: string): Promise<number>;
+  deleteAccountData?(tradingAccountId: string): Promise<void>;
 }

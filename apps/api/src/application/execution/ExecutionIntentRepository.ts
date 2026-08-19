@@ -9,4 +9,5 @@ export interface ExecutionIntentRepository {
   transitionStatus(id: string, expected: ExecutionIntentStatus[], next: ExecutionIntentStatus, patch?: Partial<ExecutionIntent>): Promise<ExecutionIntent | null>;
   saveAuditEvent(event: ExecutionAuditEvent): Promise<void>;
   listAuditEvents(tradingAccountId: string, executionIntentId?: string, limit?: number): Promise<ExecutionAuditEvent[]>;
+  deleteAccountData?(tradingAccountId: string): Promise<void>;
 }

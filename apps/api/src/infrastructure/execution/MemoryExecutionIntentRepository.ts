@@ -88,6 +88,17 @@ export class MemoryExecutionIntentRepository implements ExecutionIntentRepositor
       .slice(0, limit)
       .map((event) => ({ ...event, metadata: { ...event.metadata } }));
   }
+
+  async deleteAccountData(tradingAccountId: string): Promise<void> {
+    for (const intent of this.intents.values()) {
+      if (intent.tradingAccountId !== tradingAccountId) continue;
+      this.intents.delete(intent.id);
+      this.setupIndex.delete(indexKey(intent.tradingAccountId, intent.setupKey));
+    }
+    for (let index = this.auditEvents.length - 1; index >= 0; index -= 1) {
+      if (this.auditEvents[index]?.tradingAccountId === tradingAccountId) this.auditEvents.splice(index, 1);
+    }
+  }
 }
 
 function indexKey(tradingAccountId: string, setupKey: string): string {

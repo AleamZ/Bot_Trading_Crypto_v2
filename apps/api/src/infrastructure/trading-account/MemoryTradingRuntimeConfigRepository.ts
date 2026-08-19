@@ -26,6 +26,11 @@ export class MemoryTradingRuntimeConfigRepository implements TradingRuntimeConfi
   async saveWatchlist(tradingAccountId: string, symbols: string[]): Promise<void> {
     this.watchlists.set(tradingAccountId, [...new Set(symbols)]);
   }
+
+  async deleteAccountData(tradingAccountId: string): Promise<void> {
+    this.settings.delete(tradingAccountId);
+    this.watchlists.delete(tradingAccountId);
+  }
 }
 
 function cloneSettings(settings: TradingSettings): TradingSettings {

@@ -85,6 +85,10 @@ $("add-account-button").addEventListener("click", () => {
   $("account-selector-popover").hidden = true;
   showView("onboarding");
 });
+$("manage-account-button").addEventListener("click", () => {
+  $("account-selector-popover").hidden = true;
+  showManageAccount();
+});
 document.querySelectorAll("[data-create-account-mode]").forEach((button) => {
   button.addEventListener("click", () => startCreateAccount(button.dataset.createAccountMode));
 });
@@ -95,6 +99,10 @@ $("user-menu-trigger").addEventListener("click", () => {
   $("user-menu-popover").hidden = !$("user-menu-popover").hidden;
 });
 $("logout-button").addEventListener("click", logout);
+$("delete-account-button").addEventListener("click", openDeleteAccountModal);
+$("cancel-delete-account-button").addEventListener("click", closeDeleteAccountModal);
+$("delete-account-confirm-input").addEventListener("input", updateDeleteAccountConfirmState);
+$("confirm-delete-account-button").addEventListener("click", deleteActiveAccount);
 $("show-register").addEventListener("click", () => showAuthForm("register"));
 $("show-login").addEventListener("click", () => showAuthForm("login"));
 $("login-form").addEventListener("submit", (event) => {
@@ -426,6 +434,94 @@ async function loadActiveAccountStatus() {
   accountState.lastBinanceAccount = accountResponse.ok ? (await accountResponse.json()).account : null;
 }
 
+async function showManageAccount() {
+  const account = accountState.activeAccount;
+  if (!account) return;
+  await loadActiveAccountStatus();
+  renderManageAccount();
+  showView("account-manage");
+}
+
+function renderManageAccount() {
+  const account = accountState.activeAccount;
+  const connection = accountState.lastConnection;
+  $("manage-account-name").textContent = account?.name ?? "-";
+  $("manage-account-id").textContent = account?.id ?? "-";
+  $("manage-account-mode").textContent = account?.mode ?? "-";
+  $("manage-account-environment").textContent = account ? accountEnvironmentLabel(account.mode) : "-";
+  $("manage-connection-status").textContent = connection?.status ?? "NOT_CONFIGURED";
+  $("manage-connection-detail").textContent = connection?.apiKeyMasked ?? "No API key saved";
+  $("manage-account-status").textContent = account ? `${account.name} · ${accountEnvironmentLabel(account.mode)}` : "No account selected";
+  $("delete-account-message").textContent = "";
+}
+
+function openDeleteAccountModal() {
+  const account = accountState.activeAccount;
+  if (!account) return;
+  $("delete-account-warning").textContent = `Delete "${account.name}" (${account.mode}) permanently from the bot. Account-scoped settings, watchlist, credentials, execution records, audit events, and bot records will be removed.`;
+  $("delete-account-real-warning").hidden = account.mode !== "REAL";
+  $("delete-account-confirm-label").textContent = `Type "${account.name}" to confirm`;
+  $("delete-account-confirm-input").value = "";
+  $("delete-account-confirm-message").textContent = "";
+  $("confirm-delete-account-button").disabled = true;
+  $("delete-account-modal").hidden = false;
+  $("delete-account-confirm-input").focus();
+}
+
+function closeDeleteAccountModal() {
+  $("delete-account-modal").hidden = true;
+  $("confirm-delete-account-button").disabled = false;
+}
+
+function updateDeleteAccountConfirmState() {
+  const account = accountState.activeAccount;
+  $("confirm-delete-account-button").disabled = !account || $("delete-account-confirm-input").value !== account.name;
+}
+
+async function deleteActiveAccount() {
+  const account = accountState.activeAccount;
+  if (!account || $("delete-account-confirm-input").value !== account.name) return;
+  $("confirm-delete-account-button").disabled = true;
+  $("cancel-delete-account-button").disabled = true;
+  $("delete-account-confirm-message").textContent = "Deleting account";
+  stopHomePolling();
+  stopChartPolling();
+  settingsRequestSequence += 1;
+  analysisRequestSequence += 1;
+  dashboardRequestSequence += 1;
+
+  try {
+    const response = await apiFetch(`/api/trading-accounts/${account.id}`, { method: "DELETE" });
+    const body = response.status === 204 ? {} : await safeJson(response);
+    if (!response.ok) throw new Error(body.code === "ACCOUNT_HAS_ACTIVE_TRADING_STATE" ? body.code : body.error ?? `Delete account failed: ${response.status}`);
+    closeDeleteAccountModal();
+    await handleDeletedAccount(account.id);
+  } catch (error) {
+    $("delete-account-confirm-message").textContent = error instanceof Error ? error.message : String(error);
+    $("confirm-delete-account-button").disabled = $("delete-account-confirm-input").value !== account.name;
+  } finally {
+    $("cancel-delete-account-button").disabled = false;
+  }
+}
+
+async function handleDeletedAccount(deletedAccountId) {
+  accountState.activeAccount = null;
+  accountState.lastConnection = null;
+  accountState.lastBinanceAccount = null;
+  accountState.testedCredentials = null;
+  await refreshTradingAccounts();
+  accountState.accounts = accountState.accounts.filter((item) => item.id !== deletedAccountId);
+  renderAccountSelector();
+  if (accountState.accounts.length === 0) {
+    $("account-selector").hidden = true;
+    showView("onboarding");
+    return;
+  }
+  $("account-selector").hidden = false;
+  await setActiveTradingAccount(accountState.accounts[0]);
+  showView("home");
+}
+
 function accountEnvironmentLabel(mode) {
   return mode === "REAL" ? "REAL · MAINNET · EXECUTION LOCKED" : "DEMO · TESTNET";
 }
@@ -750,6 +846,7 @@ function showView(view) {
   $("analysis-view").classList.toggle("active", view === "analysis");
   $("settings-view").classList.toggle("active", view === "settings");
   $("account-view").classList.toggle("active", view === "account");
+  $("account-manage-view").classList.toggle("active", view === "account-manage");
   $("onboarding-view").classList.toggle("active", view === "onboarding");
   $("account-create-view").classList.toggle("active", view === "account-create");
   $("connect-view").classList.toggle("active", view === "connect");

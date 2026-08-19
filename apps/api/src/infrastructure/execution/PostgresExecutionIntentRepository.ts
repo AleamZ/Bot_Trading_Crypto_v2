@@ -162,6 +162,18 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     );
     return result.rows.map(toAuditEvent);
   }
+
+  async deleteAccountData(tradingAccountId: string): Promise<void> {
+    await this.pool.query("begin");
+    try {
+      await this.pool.query(`delete from execution_audit_events where trading_account_id = $1`, [tradingAccountId]);
+      await this.pool.query(`delete from execution_intents where trading_account_id = $1`, [tradingAccountId]);
+      await this.pool.query("commit");
+    } catch (error) {
+      await this.pool.query("rollback");
+      throw error;
+    }
+  }
 }
 
 export async function createExecutionIntentRepository(databaseUrl?: string): Promise<ExecutionIntentRepository> {

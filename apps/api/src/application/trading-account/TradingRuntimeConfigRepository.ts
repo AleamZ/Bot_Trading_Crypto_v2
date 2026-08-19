@@ -7,4 +7,5 @@ export interface TradingRuntimeConfigRepository {
   saveSettings(tradingAccountId: string, settings: TradingSettings): Promise<void>;
   getWatchlist(tradingAccountId: string): Promise<string[]>;
   saveWatchlist(tradingAccountId: string, symbols: string[]): Promise<void>;
+  deleteAccountData?(tradingAccountId: string): Promise<void>;
 }

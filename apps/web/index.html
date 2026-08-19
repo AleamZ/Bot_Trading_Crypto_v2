@@ -20,6 +20,7 @@
         <button class="user-menu-trigger" id="account-selector-trigger" type="button">Select Account</button>
         <div class="user-menu-popover account-selector-popover" id="account-selector-popover" hidden>
           <div id="account-selector-list"></div>
+          <button id="manage-account-button" type="button">Manage Account</button>
           <button id="add-account-button" type="button">+ Add Account</button>
         </div>
       </div>
@@ -130,6 +131,39 @@
             <strong id="account-created-at">-</strong>
             <small>UTC session profile</small>
           </article>
+        </section>
+      </section>
+
+      <section class="view" id="account-manage-view">
+        <section class="settings-toolbar">
+          <div>
+            <h1>Manage Account</h1>
+            <p id="manage-account-status">Selected trading account</p>
+          </div>
+        </section>
+        <section class="status-grid account-grid">
+          <article class="status-card">
+            <span>Account Name</span>
+            <strong id="manage-account-name">-</strong>
+            <small id="manage-account-id">-</small>
+          </article>
+          <article class="status-card">
+            <span>Mode</span>
+            <strong id="manage-account-mode">-</strong>
+            <small id="manage-account-environment">-</small>
+          </article>
+          <article class="status-card">
+            <span>Binance Connection</span>
+            <strong id="manage-connection-status">-</strong>
+            <small id="manage-connection-detail">-</small>
+          </article>
+        </section>
+        <section class="danger-zone">
+          <div>
+            <h2>Danger Zone</h2>
+            <p id="delete-account-message">Permanent removal of this account's bot data.</p>
+          </div>
+          <button id="delete-account-button" type="button">Delete Account</button>
         </section>
       </section>
 
@@ -701,6 +735,20 @@
         </section>
       </section>
     </main>
+    <div class="modal-backdrop" id="delete-account-modal" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="delete-account-title">
+        <h2 id="delete-account-title">Permanently Delete Account</h2>
+        <p id="delete-account-warning">This action is permanent.</p>
+        <p id="delete-account-real-warning" hidden>REAL account configuration will be permanently removed from the bot. This does not close positions or cancel orders on Binance.</p>
+        <label for="delete-account-confirm-input" id="delete-account-confirm-label">Type the account name to confirm</label>
+        <input id="delete-account-confirm-input" autocomplete="off" />
+        <p class="auth-message" id="delete-account-confirm-message"></p>
+        <div class="modal-actions">
+          <button id="cancel-delete-account-button" type="button">Cancel</button>
+          <button id="confirm-delete-account-button" type="button" disabled>Permanently Delete Account</button>
+        </div>
+      </section>
+    </div>
     <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="./app-config.js"></script>
     <script type="module" src="./app.js"></script>

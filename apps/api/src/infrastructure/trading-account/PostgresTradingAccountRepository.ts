@@ -147,6 +147,34 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
     await this.pool.query(`delete from binance_connections where trading_account_id = $1`, [tradingAccountId]);
   }
 
+  async hardDeleteTradingAccount(id: string, userId: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const locked = await client.query(`select id from trading_accounts where id = $1 and user_id = $2 for update`, [id, userId]);
+      if (!locked.rows[0]) {
+        await client.query("rollback");
+        return false;
+      }
+
+      await client.query(`delete from execution_audit_events where trading_account_id = $1`, [id]);
+      await client.query(`delete from execution_intents where trading_account_id = $1`, [id]);
+      await client.query(`delete from real_execution_proposals where trading_account_id = $1`, [id]);
+      await client.query(`delete from trading_records where trading_account_id = $1`, [id]);
+      await client.query(`delete from trading_watchlist_symbols where trading_account_id = $1`, [id]);
+      await client.query(`delete from trading_settings where trading_account_id = $1`, [id]);
+      await client.query(`delete from binance_connections where trading_account_id = $1`, [id]);
+      await client.query(`delete from trading_accounts where id = $1 and user_id = $2`, [id, userId]);
+      await client.query("commit");
+      return true;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   private async ensureCompatibleTable(tableName: string, requiredColumns: string[]): Promise<void> {
     const result = await this.pool.query(
       `select column_name from information_schema.columns where table_schema = 'public' and table_name = $1`,

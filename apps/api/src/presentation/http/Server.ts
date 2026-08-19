@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import type { AuthService } from "../../application/auth/AuthService.js";
 import { InvalidAuthInputError, InvalidCredentialsError, isDuplicateEmailError } from "../../application/auth/AuthService.js";
 import type { TradingAccountService } from "../../application/trading-account/TradingAccountService.js";
-import { InvalidTradingAccountInputError, TradingAccountNotFoundError } from "../../application/trading-account/TradingAccountService.js";
+import { InvalidTradingAccountInputError, TradingAccountNotFoundError, UnsafeTradingAccountDeletionError } from "../../application/trading-account/TradingAccountService.js";
 import { BinanceVerificationError } from "../../application/trading-account/BinanceAccountVerifier.js";
 import type { TradingRuntimeManager } from "../../application/runtime/TradingRuntimeManager.js";
 import type { TradingEngine } from "../../application/engine/TradingEngine.js";
@@ -294,9 +294,11 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
               ? 401
               : error instanceof TradingAccountNotFoundError
                 ? 404
-                : error instanceof BinanceVerificationError
-                  ? binanceErrorStatus(error)
-                  : 400;
+                : error instanceof UnsafeTradingAccountDeletionError
+                  ? 409
+                  : error instanceof BinanceVerificationError
+                    ? binanceErrorStatus(error)
+                    : 400;
       const message =
         error instanceof InvalidAuthInputError ||
         error instanceof InvalidTradingAccountInputError ||
@@ -304,6 +306,7 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
         duplicateEmail ||
         error instanceof InvalidCredentialsError ||
         error instanceof TradingAccountNotFoundError ||
+        error instanceof UnsafeTradingAccountDeletionError ||
         error instanceof BinanceVerificationError
           ? error.message
           : error instanceof Error
@@ -457,6 +460,7 @@ function systemStatus(params: HttpServerParams): Record<string, unknown> {
 
 function errorCodeForStatus(status: number, error: unknown): string {
   if (error instanceof PayloadTooLargeError) return "PAYLOAD_TOO_LARGE";
+  if (error instanceof UnsafeTradingAccountDeletionError) return error.code;
   if (status === 401) return "UNAUTHORIZED";
   if (status === 404) return "NOT_FOUND";
   if (status === 409) return "CONFLICT";
@@ -552,6 +556,25 @@ async function handleTradingAccountRoute(params: {
 
   if (parts.length === 3 && request.method === "GET") {
     sendJson(response, 200, { account: await service.getAccount(userId, accountId) }, corsHeaders);
+    return;
+  }
+
+  if (parts.length === 3 && request.method === "DELETE") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    await runtimeManager.prepareAccountDeletion(accountId);
+    try {
+      await service.hardDeleteAccount(userId, accountId);
+      await runtimeManager.completeAccountDeletion(accountId);
+      response.writeHead(204, noCacheHeaders("application/json", corsHeaders));
+      response.end();
+    } catch (error) {
+      runtimeManager.cancelAccountDeletion(accountId);
+      throw error;
+    }
     return;
   }
 

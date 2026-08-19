@@ -11,7 +11,7 @@ import { MemoryTradingAccountRepository } from "../src/infrastructure/trading-ac
 import { MemoryTradingRuntimeConfigRepository } from "../src/infrastructure/trading-account/MemoryTradingRuntimeConfigRepository.js";
 import { MemoryExecutionIntentRepository } from "../src/infrastructure/execution/MemoryExecutionIntentRepository.js";
 import { MemoryRealExecutionProposalRepository } from "../src/infrastructure/execution/MemoryRealExecutionProposalRepository.js";
-import { BinanceFuturesAccountClient, type BinanceFuturesPositionStatus } from "../src/infrastructure/execution/BinanceFuturesAccountClient.js";
+import { BinanceFuturesAccountClient, type BinanceFuturesOpenOrderStatus, type BinanceFuturesPositionStatus } from "../src/infrastructure/execution/BinanceFuturesAccountClient.js";
 import { fingerprintProposal, type CreateRealExecutionProposalInput } from "../src/application/execution/RealExecutionProposal.js";
 import { CredentialCipher } from "../src/infrastructure/security/CredentialCipher.js";
 import { TradingRuntimeManager } from "../src/application/runtime/TradingRuntimeManager.js";
@@ -89,6 +89,7 @@ describe("trading account HTTP flow", () => {
     FakeAccountClient.nextLeverage = 20;
     FakeAccountClient.nextMarginType = "ISOLATED";
     FakeAccountClient.positionsByApiKey.clear();
+    FakeAccountClient.openOrdersByApiKey.clear();
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
     const cipher = new CredentialCipher(encryptionKey);
     const tradingAccounts = new TradingAccountService(accountRepository, cipher, verifier, configRepository, testConfig());
@@ -157,6 +158,91 @@ describe("trading account HTTP flow", () => {
 
     const response = await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}`, { headers: { cookie: cookieA } });
     expect(response.status).toBe(404);
+  });
+
+  it("permanently deletes an inactive DEMO account and account-scoped data", async () => {
+    const cookie = await register("delete-demo@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Demo Delete", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), marginPerTrade: 333, watchlist: ["ETHUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "DELETE_DEMO_KEY", apiSecret: "DELETE_SECRET" }, cookie);
+    await runtimeManager.ensureRuntime(account.id);
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}`, { method: "DELETE", headers: { cookie } });
+
+    expect(response.status).toBe(204);
+    expect(await accountRepository.findTradingAccountById(account.id)).toBeNull();
+    expect(await accountRepository.findBinanceConnection(account.id)).toBeNull();
+    expect(await configRepository.getSettings(account.id)).toBeNull();
+    expect(await configRepository.getWatchlist(account.id)).toEqual([]);
+    expect(await executionIntentRepository.listByAccount(account.id)).toEqual([]);
+    expect(runtimeManager.getEngineForTest(account.id, "ETHUSDT")).toBeNull();
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${account.id}/settings`, { headers: { cookie } })).status).toBe(404);
+    await expect(runtimeManager.ensureRuntime(account.id)).rejects.toThrow("ACCOUNT_NOT_FOUND");
+  });
+
+  it("permanently deletes an inactive REAL account without unlocking execution", async () => {
+    const cookie = await register("delete-real@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real Delete", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "DELETE_REAL_KEY", apiSecret: "DELETE_SECRET" }, cookie);
+    await seedProposal(account.id, "delete-real");
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}`, { method: "DELETE", headers: { cookie } });
+
+    expect(response.status).toBe(204);
+    expect(await accountRepository.findTradingAccountById(account.id)).toBeNull();
+    expect(await accountRepository.findBinanceConnection(account.id)).toBeNull();
+    expect(await realProposalRepository.listByAccount(account.id)).toEqual([]);
+  });
+
+  it("returns 404 when deleting another user's or nonexistent trading account", async () => {
+    const cookieA = await register("delete-a@example.com");
+    const cookieB = await register("delete-b@example.com");
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "B", mode: "DEMO" }, cookieB)).json()).account;
+
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}`, { method: "DELETE", headers: { cookie: cookieA } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/00000000-0000-4000-8000-000000000000`, { method: "DELETE", headers: { cookie: cookieA } })).status).toBe(404);
+    expect(await accountRepository.findTradingAccountById(accountB.id)).toBeTruthy();
+  });
+
+  it("blocks deletion when Binance has an active position", async () => {
+    const cookie = await register("delete-position@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Position", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "POSITION_DELETE_KEY", apiSecret: "DELETE_SECRET" }, cookie);
+    FakeAccountClient.positionsByApiKey.set("POSITION_DELETE_KEY", [fakePosition("BTCUSDT", "long")]);
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}`, { method: "DELETE", headers: { cookie } });
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body.code).toBe("ACCOUNT_HAS_ACTIVE_TRADING_STATE");
+    expect(await accountRepository.findTradingAccountById(account.id)).toBeTruthy();
+  });
+
+  it("blocks deletion when Binance has a bot-owned open order", async () => {
+    const cookie = await register("delete-order@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Order", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "ORDER_DELETE_KEY", apiSecret: "DELETE_SECRET" }, cookie);
+    FakeAccountClient.openOrdersByApiKey.set("ORDER_DELETE_KEY", [fakeOpenOrder("BTCUSDT", "smc_existing_E")]);
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}`, { method: "DELETE", headers: { cookie } });
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body.code).toBe("ACCOUNT_HAS_ACTIVE_TRADING_STATE");
+    expect(await accountRepository.findTradingAccountById(account.id)).toBeTruthy();
+  });
+
+  it("blocks deletion when an execution intent is unsafe", async () => {
+    const cookie = await register("delete-intent@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Intent", mode: "DEMO" }, cookie)).json()).account;
+    await seedExecutionIntent(account.id);
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}`, { method: "DELETE", headers: { cookie } });
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body.code).toBe("ACCOUNT_HAS_ACTIVE_TRADING_STATE");
+    expect((await executionIntentRepository.listByAccount(account.id)).length).toBe(1);
   });
 
   it("does not let user A connect Binance credentials to user B account", async () => {
@@ -570,6 +656,24 @@ describe("trading account HTTP flow", () => {
     return (await realProposalRepository.createOrGet({ ...base, proposalHash: fingerprintProposal(base) })).proposal;
   }
 
+  async function seedExecutionIntent(tradingAccountId: string) {
+    return executionIntentRepository.createOrGet({
+      id: "11111111-2222-4333-8444-555555555555",
+      tradingAccountId,
+      symbol: "BTCUSDT",
+      side: "long",
+      setupKey: "unsafe-delete-intent",
+      entryType: "market",
+      requestedEntry: 100,
+      requestedStopLoss: 95,
+      requestedTakeProfit: 110,
+      quantity: 1,
+      clientEntryOrderId: "smc_unsafe_E",
+      clientStopOrderId: "smc_unsafe_S",
+      clientTakeProfitOrderId: "smc_unsafe_T"
+    });
+  }
+
   function postJson(path: string, body: unknown, cookie?: string): Promise<Response> {
     return fetch(`${baseUrl}${path}`, {
       method: "POST",
@@ -636,6 +740,7 @@ class FakeAccountClient {
   static nextLeverage = 20;
   static nextMarginType: "CROSS" | "ISOLATED" = "ISOLATED";
   static positionsByApiKey = new Map<string, BinanceFuturesPositionStatus[]>();
+  static openOrdersByApiKey = new Map<string, BinanceFuturesOpenOrderStatus[]>();
 
   constructor(
     private readonly apiKey: string,
@@ -659,8 +764,9 @@ class FakeAccountClient {
     return positions.filter((position) => !symbol || position.symbol === symbol);
   }
 
-  async getOpenOrders() {
-    return [];
+  async getOpenOrders(symbol?: string) {
+    const openOrders = FakeAccountClient.openOrdersByApiKey.get(this.apiKey) ?? [];
+    return openOrders.filter((order) => !symbol || order.symbol === symbol);
   }
 
   async getOrderHistory() {
@@ -733,6 +839,25 @@ function fakePosition(symbol: string, side: "long" | "short"): BinanceFuturesPos
     unrealizedProfit: 0,
     stopLoss: null,
     takeProfit: null
+  };
+}
+
+function fakeOpenOrder(symbol: string, clientOrderId: string): BinanceFuturesOpenOrderStatus {
+  return {
+    id: `binance:${symbol}:${clientOrderId}`,
+    symbol,
+    orderId: "12345",
+    clientOrderId,
+    side: "BUY",
+    type: "LIMIT",
+    price: 100,
+    stopPrice: null,
+    quantity: 1,
+    executedQuantity: 0,
+    status: "NEW",
+    reduceOnly: false,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
   };
 }
 

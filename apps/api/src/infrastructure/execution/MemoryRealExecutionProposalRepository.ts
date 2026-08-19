@@ -67,6 +67,14 @@ export class MemoryRealExecutionProposalRepository implements RealExecutionPropo
     }
     return count;
   }
+
+  async deleteAccountData(tradingAccountId: string): Promise<void> {
+    for (const proposal of this.proposals.values()) {
+      if (proposal.tradingAccountId !== tradingAccountId) continue;
+      this.proposals.delete(proposal.id);
+      this.setupIndex.delete(indexKey(proposal.tradingAccountId, proposal.setupKey));
+    }
+  }
 }
 
 function indexKey(tradingAccountId: string, setupKey: string): string {

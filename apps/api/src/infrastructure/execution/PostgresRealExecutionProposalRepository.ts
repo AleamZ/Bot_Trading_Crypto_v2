@@ -159,6 +159,10 @@ export class PostgresRealExecutionProposalRepository implements RealExecutionPro
     const result = await this.pool.query(`update real_execution_proposals set status = 'EXPIRED' where status = 'PENDING' and expires_at <= $1`, [nowIso]);
     return result.rowCount ?? 0;
   }
+
+  async deleteAccountData(tradingAccountId: string): Promise<void> {
+    await this.pool.query(`delete from real_execution_proposals where trading_account_id = $1`, [tradingAccountId]);
+  }
 }
 
 export async function createRealExecutionProposalRepository(databaseUrl?: string): Promise<RealExecutionProposalRepository> {

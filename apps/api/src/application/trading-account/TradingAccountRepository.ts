@@ -19,4 +19,5 @@ export interface TradingAccountRepository {
   upsertBinanceConnection(connection: BinanceConnection): Promise<BinanceConnection>;
   findBinanceConnection(tradingAccountId: string): Promise<BinanceConnection | null>;
   deleteBinanceConnection(tradingAccountId: string): Promise<void>;
+  hardDeleteTradingAccount(id: string, userId: string): Promise<boolean>;
 }

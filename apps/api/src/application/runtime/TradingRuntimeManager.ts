@@ -37,6 +37,7 @@ import { RealExecutionProposalGateway } from "../execution/RealExecutionProposal
 import type { RealExecutionProposalRepository } from "../execution/RealExecutionProposalRepository.js";
 import { MemoryRealExecutionProposalRepository } from "../../infrastructure/execution/MemoryRealExecutionProposalRepository.js";
 import { fingerprintProposal, type RealExecutionProposal } from "../execution/RealExecutionProposal.js";
+import { UnsafeTradingAccountDeletionError } from "../trading-account/TradingAccountService.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -141,6 +142,7 @@ export class TradingRuntimeManager {
   private readonly runtimes = new Map<string, AccountRuntime>();
   private readonly runtimeLoads = new Map<string, Promise<AccountRuntime>>();
   private readonly realAuditThrottle = new Map<string, number>();
+  private readonly deletingAccounts = new Set<string>();
   private shuttingDown = false;
 
   constructor(
@@ -167,6 +169,7 @@ export class TradingRuntimeManager {
   }
 
   async ensureRuntime(accountId: string): Promise<AccountRuntime> {
+    if (this.deletingAccounts.has(accountId)) throw new Error("ACCOUNT_REMOVING");
     const existing = this.runtimes.get(accountId);
     if (existing) return existing;
     if (this.shuttingDown) throw new Error("SHUTTING_DOWN");
@@ -181,6 +184,7 @@ export class TradingRuntimeManager {
   }
 
   private async createRuntime(accountId: string): Promise<AccountRuntime> {
+    if (this.deletingAccounts.has(accountId)) throw new Error("ACCOUNT_REMOVING");
     const account = await this.accountRepository.findTradingAccountById(accountId);
     if (!account) throw new Error("ACCOUNT_NOT_FOUND");
     await this.configRepository.ensureDefaults(account.id, this.baseConfig);
@@ -269,6 +273,39 @@ export class TradingRuntimeManager {
     if (runtime?.reconciliationTimer) clearInterval(runtime.reconciliationTimer);
     this.runtimes.delete(accountId);
     this.runtimeLoads.delete(accountId);
+  }
+
+  async prepareAccountDeletion(accountId: string): Promise<void> {
+    if (this.deletingAccounts.has(accountId)) throw new UnsafeTradingAccountDeletionError("Trading account is already being removed");
+    this.deletingAccounts.add(accountId);
+    try {
+      const runtime = await this.getLoadedRuntime(accountId);
+      await this.assertAccountDeletionIsSafe(accountId, runtime);
+      if (runtime) {
+        runtime.health.state = "SHUTTING_DOWN";
+        runtime.health.execution = { enabled: false, reason: "SHUTTING_DOWN" };
+        runtime.health.executionEnabled = false;
+        if (runtime.reconciliationTimer) clearInterval(runtime.reconciliationTimer);
+        runtime.reconciliationTimer = null;
+        runtime.scanner.stop();
+      }
+      this.runtimeLoads.delete(accountId);
+    } catch (error) {
+      this.deletingAccounts.delete(accountId);
+      throw error;
+    }
+  }
+
+  async completeAccountDeletion(accountId: string): Promise<void> {
+    await this.executionIntentRepository.deleteAccountData?.(accountId);
+    await this.realProposalRepository.deleteAccountData?.(accountId);
+    this.runtimes.delete(accountId);
+    this.runtimeLoads.delete(accountId);
+    this.deletingAccounts.delete(accountId);
+  }
+
+  cancelAccountDeletion(accountId: string): void {
+    this.deletingAccounts.delete(accountId);
   }
 
   async shutdown(): Promise<void> {
@@ -554,6 +591,42 @@ export class TradingRuntimeManager {
     const apiKey = this.cipher.decrypt(connection.apiKeyEncrypted);
     const apiSecret = this.cipher.decrypt(connection.apiSecretEncrypted);
     return this.accountClientFactory(apiKey, apiSecret, account.mode === "DEMO");
+  }
+
+  private async getLoadedRuntime(accountId: string): Promise<AccountRuntime | null> {
+    const loading = this.runtimeLoads.get(accountId);
+    if (loading) return loading;
+    return this.runtimes.get(accountId) ?? null;
+  }
+
+  private async assertAccountDeletionIsSafe(accountId: string, runtime: AccountRuntime | null): Promise<void> {
+    if (runtime?.reconciliationInFlight || runtime?.health.reconciliationStatus === "PENDING" || runtime?.health.state === "RECOVERING") {
+      throw new UnsafeTradingAccountDeletionError("Trading account reconciliation is currently active");
+    }
+
+    const intents = await this.executionIntentRepository.listOpenByAccount(accountId);
+    if (intents.length > 0) {
+      throw new UnsafeTradingAccountDeletionError("Trading account has active execution intents");
+    }
+
+    const client = await this.createAccountClient(accountId);
+    if (!client) return;
+
+    let positions: BinanceFuturesPositionStatus[];
+    let openOrders: BinanceFuturesOpenOrderStatus[];
+    try {
+      [positions, openOrders] = await Promise.all([client.getOpenPositions(), client.getOpenOrders()]);
+    } catch {
+      throw new UnsafeTradingAccountDeletionError("Unable to verify Binance active trading state");
+    }
+    if (positions.some((position) => position.quantity !== 0)) {
+      throw new UnsafeTradingAccountDeletionError("Trading account has an active Binance Futures position");
+    }
+
+    const hasBotOwnedOpenOrder = openOrders.some((order) => (order.clientOrderId ?? "").startsWith("smc_"));
+    if (hasBotOwnedOpenOrder) {
+      throw new UnsafeTradingAccountDeletionError("Trading account has an active bot-owned Binance order");
+    }
   }
 
   private async loadAllAccountsBestEffort(): Promise<TradingAccount[]> {

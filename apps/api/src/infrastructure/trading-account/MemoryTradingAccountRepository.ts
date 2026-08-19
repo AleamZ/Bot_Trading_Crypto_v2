@@ -39,4 +39,12 @@ export class MemoryTradingAccountRepository implements TradingAccountRepository 
   async deleteBinanceConnection(tradingAccountId: string): Promise<void> {
     this.connections.delete(tradingAccountId);
   }
+
+  async hardDeleteTradingAccount(id: string, userId: string): Promise<boolean> {
+    const account = this.accounts.get(id);
+    if (!account || account.userId !== userId) return false;
+    this.connections.delete(id);
+    this.accounts.delete(id);
+    return true;
+  }
 }

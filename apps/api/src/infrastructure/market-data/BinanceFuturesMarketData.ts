@@ -33,7 +33,7 @@ export class BinanceFuturesMarketData {
   constructor(private readonly testnet: boolean) {}
 
   async getClosedCandles(symbol: string, timeframe: Timeframe, limit: number): Promise<Candle[]> {
-    const baseUrl = this.testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    const baseUrl = this.testnet ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
     const url = new URL("/fapi/v1/klines", baseUrl);
     url.searchParams.set("symbol", symbol);
     url.searchParams.set("interval", intervalByTimeframe[timeframe]);
@@ -52,7 +52,7 @@ export class BinanceFuturesMarketData {
   }
 
   async getKlines(symbol: string, interval: string, limit: number): Promise<BinanceKline[]> {
-    const baseUrl = this.testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    const baseUrl = this.testnet ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
     const url = new URL("/fapi/v1/klines", baseUrl);
     url.searchParams.set("symbol", symbol);
     url.searchParams.set("interval", interval);
@@ -73,7 +73,7 @@ export class BinanceFuturesMarketData {
       return this.symbolsCache.symbols;
     }
 
-    const baseUrl = this.testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    const baseUrl = this.testnet ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
     const url = new URL("/fapi/v1/exchangeInfo", baseUrl);
     const response = await fetch(url);
     if (!response.ok) {

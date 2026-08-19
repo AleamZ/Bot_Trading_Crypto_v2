@@ -24,7 +24,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     private readonly entryMode: EntryMode,
     private readonly leverage: number
   ) {
-    this.baseUrl = mode === "testnet" ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    this.baseUrl = mode === "testnet" ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
   }
 
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision, context?: ExecutionOrderContext): Promise<SubmittedOrder> {

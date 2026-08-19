@@ -39,6 +39,7 @@ const defaultSettings = {
   maxDrawdownPercent: "10",
   tradingEnabled: "false",
   killSwitch: "false",
+  realExecutionMode: "LOCKED",
   emaPeriod: "50",
   swingLeft: "2",
   swingRight: "2",
@@ -57,6 +58,11 @@ const defaultSettings = {
   fixedRr: "2",
 };
 const settingsState = { ...defaultSettings };
+const realSafetyState = {
+  mode: "LOCKED",
+  masterLiveExecutionEnabled: false,
+  proposals: [],
+};
 let marketSymbols = [];
 let symbolSearchTerm = "";
 let settingsRequestSequence = 0;
@@ -291,7 +297,9 @@ function renderAccountSelector() {
 
 async function setActiveTradingAccount(account) {
   accountState.activeAccount = account;
+  chartState.instance?.cancelPendingLoad();
   Object.assign(settingsState, defaultSettings);
+  Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
   renderAccountSelector();
   renderSettings();
   await Promise.all([loadActiveAccountStatus(), loadSettings(account.id)]);
@@ -493,7 +501,7 @@ async function load() {
   const executionReason = execution.reason ? ` · ${execution.reason}` : "";
   const realReadiness = snapshot.realReadiness ?? null;
   const readinessText = realReadiness
-    ? ` · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"} · Execution LOCKED · ${realReadiness.executionReason}`
+    ? ` · Mode ${realReadiness.realExecutionMode} · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"} · Master Live Execution ${realReadiness.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER"} · Execution LOCKED · ${realReadiness.executionReason}`
     : "";
   const reconciliationError = runtimeHealth.lastReconciliationError ? ` · Error ${runtimeHealth.lastReconciliationError}` : "";
   $("engine-detail").textContent =
@@ -613,6 +621,10 @@ function formatPrice(value) {
   return Number(value).toLocaleString("en-US", { maximumFractionDigits: 4 });
 }
 
+function formatDateTime(value) {
+  return value ? new Date(value).toLocaleString() : "-";
+}
+
 function formatQuantity(value) {
   return Number(value).toLocaleString("en-US", { maximumFractionDigits: 6 });
 }
@@ -680,6 +692,10 @@ $("analysis-form").addEventListener("submit", (event) => {
 });
 $("settings-save").addEventListener("click", saveSettings);
 $("settings-reset").addEventListener("click", resetSettings);
+$("real-proposal-status-filter").addEventListener("change", () => loadRealProposals());
+document.querySelectorAll("[data-real-execution-mode]").forEach((button) => {
+  button.addEventListener("click", () => changeRealExecutionMode(button.dataset.realExecutionMode));
+});
 $("setting-margin-per-order").addEventListener("input", updateSettingFromInput);
 $("setting-symbol-search").addEventListener("input", (event) => {
   symbolSearchTerm = event.target.value.trim().toUpperCase();
@@ -890,11 +906,12 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
   const sequence = ++settingsRequestSequence;
   const settingsPath = `/api/trading-accounts/${accountId}/settings`;
   const watchlistPath = `/api/trading-accounts/${accountId}/watchlist`;
+  const symbolsPath = `/api/market/symbols?accountId=${encodeURIComponent(accountId)}`;
   $("settings-status").textContent = "Loading";
   try {
     const [response, symbolsResponse, watchlistResponse] = await Promise.all([
       apiFetch(settingsPath),
-      apiFetch("/api/market/symbols"),
+      apiFetch(symbolsPath),
       apiFetch(watchlistPath),
     ]);
     if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
@@ -908,6 +925,11 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
     if (Array.isArray(watchlist.watchlist)) {
       settingsState.watchlist = watchlist.watchlist.join(",");
     }
+    if (accountState.activeAccount?.mode === "REAL") {
+      await Promise.all([loadRealExecutionMode(accountId, sequence), loadRealProposals(accountId, sequence)]);
+    } else {
+      Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
+    }
     $("settings-status").textContent = "Loaded";
   } catch {
     if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
@@ -920,6 +942,7 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
 
 function renderSettings() {
   renderWatchlistSettings();
+  renderRealSafety();
   $("setting-margin-per-order").value = settingsState.marginPerTrade;
   $("setting-leverage").value = settingsState.leverage;
   $("setting-max-leverage").value = settingsState.maxLeverage;
@@ -951,6 +974,165 @@ function renderSettings() {
       button.classList.toggle("active", button.dataset.settingValue === value);
     });
   });
+}
+
+function renderRealSafety() {
+  const isReal = accountState.activeAccount?.mode === "REAL";
+  $("real-execution-safety").hidden = !isReal;
+  $("real-proposals-section").hidden = !isReal;
+  if (!isReal) return;
+
+  const mode = realSafetyState.mode ?? settingsState.realExecutionMode ?? "LOCKED";
+  settingsState.realExecutionMode = mode;
+  $("real-master-lock").textContent = realSafetyState.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER";
+  $("real-execution-mode-detail").textContent = realExecutionModeDescription(mode);
+  document.querySelectorAll("[data-real-execution-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.realExecutionMode === mode);
+  });
+  renderRealProposals();
+}
+
+function realExecutionModeDescription(mode) {
+  if (mode === "DRY_RUN") return "Bot may create simulated proposals. No Binance order is sent.";
+  if (mode === "APPROVAL_REQUIRED") return "Bot may create PENDING proposals. Approval still does not send a Binance order.";
+  return "Bot cannot create REAL execution proposals or send orders.";
+}
+
+async function loadRealExecutionMode(accountId = accountState.activeAccount?.id ?? null, sequence = settingsRequestSequence) {
+  if (!accountId || accountState.activeAccount?.mode !== "REAL") return;
+  const response = await apiFetch(`/api/trading-accounts/${accountId}/real-execution-mode`);
+  if (sequence !== settingsRequestSequence || accountId !== accountState.activeAccount?.id) return;
+  if (handleUnauthorized(response)) return;
+  if (!response.ok) throw new Error(`REAL execution mode request failed: ${response.status}`);
+  const body = await response.json();
+  realSafetyState.mode = body.mode ?? "LOCKED";
+  realSafetyState.masterLiveExecutionEnabled = Boolean(body.masterLiveExecutionEnabled);
+  settingsState.realExecutionMode = realSafetyState.mode;
+}
+
+async function changeRealExecutionMode(mode) {
+  const account = accountState.activeAccount;
+  if (!account || account.mode !== "REAL") return;
+  if (mode !== "LOCKED") {
+    const confirmed = window.confirm(
+      `You are enabling REAL proposal generation for ${account.name}.\n\nEnvironment: Mainnet\nSelected mode: ${mode}\nLive execution remains server-locked.\n\nNo Binance Mainnet orders will be submitted.`
+    );
+    if (!confirmed) return;
+  }
+  $("settings-status").textContent = "Saving REAL execution mode";
+  const response = await apiFetch(`/api/trading-accounts/${account.id}/real-execution-mode`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (handleUnauthorized(response)) return;
+  if (!response.ok) {
+    $("settings-status").textContent = `Mode save failed: ${response.status}`;
+    return;
+  }
+  const body = await response.json();
+  realSafetyState.mode = body.mode ?? "LOCKED";
+  realSafetyState.masterLiveExecutionEnabled = Boolean(body.masterLiveExecutionEnabled);
+  settingsState.realExecutionMode = realSafetyState.mode;
+  renderRealSafety();
+  await loadRealProposals(account.id);
+  $("settings-status").textContent = "REAL execution mode saved";
+}
+
+async function loadRealProposals(accountId = accountState.activeAccount?.id ?? null, sequence = settingsRequestSequence) {
+  if (!accountId || accountState.activeAccount?.mode !== "REAL") return;
+  const status = $("real-proposal-status-filter").value;
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  const response = await apiFetch(`/api/trading-accounts/${accountId}/real-execution-proposals${suffix}`);
+  if (sequence !== settingsRequestSequence || accountId !== accountState.activeAccount?.id) return;
+  if (handleUnauthorized(response)) return;
+  if (!response.ok) throw new Error(`REAL proposals request failed: ${response.status}`);
+  realSafetyState.proposals = (await response.json()).proposals ?? [];
+  renderRealProposals();
+}
+
+function renderRealProposals() {
+  if (accountState.activeAccount?.mode !== "REAL") return;
+  const proposals = realSafetyState.proposals ?? [];
+  if (proposals.length === 0) {
+    $("real-proposals-body").innerHTML = `<tr><td colspan="11" class="empty-position">No proposals</td></tr>`;
+    $("real-proposal-detail").hidden = true;
+    return;
+  }
+  $("real-proposals-body").replaceChildren(
+    ...proposals.map((proposal) => {
+      const row = document.createElement("tr");
+      const rr = proposal.normalizedEntryPrice && proposal.normalizedStopLoss
+        ? Math.abs((proposal.normalizedTakeProfit - proposal.normalizedEntryPrice) / (proposal.normalizedEntryPrice - proposal.normalizedStopLoss))
+        : null;
+      row.innerHTML = `
+        <td>${escapeHtml(formatDateTime(proposal.createdAt))}</td>
+        <td>${escapeHtml(proposal.symbol)}</td>
+        <td>${escapeHtml(proposal.direction)}</td>
+        <td>${proposal.normalizedEntryPrice === null ? "MARKET" : escapeHtml(formatPrice(proposal.normalizedEntryPrice))}</td>
+        <td>${escapeHtml(formatQuantity(proposal.normalizedQuantity))}</td>
+        <td>${escapeHtml(formatPrice(proposal.normalizedStopLoss))}</td>
+        <td>${escapeHtml(formatPrice(proposal.normalizedTakeProfit))}</td>
+        <td>${rr === null || !Number.isFinite(rr) ? "-" : escapeHtml(rr.toFixed(2))}</td>
+        <td><span class="status-badge">${escapeHtml(proposal.status)}</span></td>
+        <td>${escapeHtml(String(proposal.setupKey).slice(0, 24))}</td>
+      `;
+      const actions = document.createElement("td");
+      const inspect = document.createElement("button");
+      inspect.type = "button";
+      inspect.textContent = "Inspect";
+      inspect.addEventListener("click", () => showProposalDetail(proposal));
+      actions.appendChild(inspect);
+      if (proposal.status === "PENDING") {
+        const approve = document.createElement("button");
+        approve.type = "button";
+        approve.textContent = "Approve";
+        approve.addEventListener("click", () => transitionProposal(proposal.id, "approve"));
+        const reject = document.createElement("button");
+        reject.type = "button";
+        reject.textContent = "Reject";
+        reject.addEventListener("click", () => transitionProposal(proposal.id, "reject"));
+        actions.append(approve, reject);
+      }
+      row.appendChild(actions);
+      return row;
+    })
+  );
+}
+
+function showProposalDetail(proposal) {
+  $("real-proposal-detail").hidden = false;
+  $("real-proposal-detail").textContent = JSON.stringify({
+    id: proposal.id,
+    symbol: proposal.symbol,
+    side: proposal.direction,
+    orderType: proposal.requestedEntryType,
+    entry: proposal.normalizedEntryPrice ?? "MARKET",
+    quantity: proposal.normalizedQuantity,
+    stopLoss: proposal.normalizedStopLoss,
+    takeProfit: proposal.normalizedTakeProfit,
+    notional: proposal.estimatedNotional,
+    margin: proposal.estimatedMargin,
+    leverage: proposal.configuredLeverage,
+    status: proposal.status,
+    setupKey: proposal.setupKey,
+    createdAt: proposal.createdAt,
+    expiresAt: proposal.expiresAt,
+    note: "Approval records operator approval only. Live order submission remains disabled."
+  }, null, 2);
+}
+
+async function transitionProposal(proposalId, action) {
+  const account = accountState.activeAccount;
+  if (!account || account.mode !== "REAL") return;
+  const message = action === "approve"
+    ? "Approval records operator approval only. Live order submission remains disabled."
+    : "Reject this proposal?";
+  if (!window.confirm(message)) return;
+  const response = await apiFetch(`/api/trading-accounts/${account.id}/real-execution-proposals/${proposalId}/${action}`, { method: "POST" });
+  if (handleUnauthorized(response)) return;
+  $("settings-status").textContent = response.ok ? "Proposal updated" : `Proposal update failed: ${response.status}`;
+  await loadRealProposals(account.id);
 }
 
 function updateSettingFromInput(event) {
@@ -1039,6 +1221,7 @@ function settingsFromApi(settings) {
     maxDrawdownPercent: String(settings.maxDrawdownPercent ?? defaultSettings.maxDrawdownPercent),
     tradingEnabled: String(settings.tradingEnabled ?? "false"),
     killSwitch: String(settings.killSwitch ?? "false"),
+    realExecutionMode: String(settings.realExecutionMode ?? defaultSettings.realExecutionMode),
     emaPeriod: String(settings.emaPeriod ?? defaultSettings.emaPeriod),
     swingLeft: String(settings.swingLeft ?? defaultSettings.swingLeft),
     swingRight: String(settings.swingRight ?? defaultSettings.swingRight),
@@ -1080,6 +1263,7 @@ function settingsPayload() {
     maxDrawdownPercent: Number(settingsState.maxDrawdownPercent),
     tradingEnabled: settingsState.tradingEnabled === "true",
     killSwitch: settingsState.killSwitch === "true",
+    realExecutionMode: settingsState.realExecutionMode,
     emaPeriod: Number(settingsState.emaPeriod),
     swingLeft: Number(settingsState.swingLeft),
     swingRight: Number(settingsState.swingRight),

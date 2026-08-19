@@ -36,6 +36,7 @@ const schema = z.object({
   maxDrawdownPercent: z.coerce.number().positive().default(10),
   tradingEnabled: z.coerce.boolean().default(false),
   killSwitch: z.coerce.boolean().default(false),
+  realExecutionMode: z.enum(["LOCKED", "DRY_RUN", "APPROVAL_REQUIRED"]).default("LOCKED"),
   emaPeriod: z.coerce.number().int().positive().default(50),
   swingLeft: z.coerce.number().int().positive().default(2),
   swingRight: z.coerce.number().int().positive().default(2),
@@ -61,7 +62,8 @@ const schema = z.object({
   reconciliationIntervalMs: z.coerce.number().int().positive().default(30_000),
   binanceRetryMaxAttempts: z.coerce.number().int().positive().default(3),
   binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500),
-  postgresPoolMax: z.coerce.number().int().positive().max(10).default(2)
+  postgresPoolMax: z.coerce.number().int().positive().max(10).default(2),
+  realLiveExecutionEnabled: z.coerce.boolean().default(false)
 });
 
 export type AppConfig = z.infer<typeof schema>;
@@ -82,6 +84,7 @@ export type TradingSettings = Omit<
   | "binanceRetryMaxAttempts"
   | "binanceRetryBaseDelayMs"
   | "postgresPoolMax"
+  | "realLiveExecutionEnabled"
 >;
 
 export const defaultTradingSettings: TradingSettings = {
@@ -105,6 +108,7 @@ export const defaultTradingSettings: TradingSettings = {
   maxDrawdownPercent: 10,
   tradingEnabled: false,
   killSwitch: false,
+  realExecutionMode: "LOCKED",
   emaPeriod: 50,
   swingLeft: 2,
   swingRight: 2,
@@ -138,7 +142,8 @@ const tradingSettingsSchema = schema.omit({
   reconciliationIntervalMs: true,
   binanceRetryMaxAttempts: true,
   binanceRetryBaseDelayMs: true,
-  postgresPoolMax: true
+  postgresPoolMax: true,
+  realLiveExecutionEnabled: true
 });
 
 export function validateTradingSettings(input: unknown): TradingSettings {
@@ -180,7 +185,8 @@ export function loadConfig(): AppConfig {
     reconciliationIntervalMs: process.env.RECONCILIATION_INTERVAL_MS,
     binanceRetryMaxAttempts: process.env.BINANCE_RETRY_MAX_ATTEMPTS,
     binanceRetryBaseDelayMs: process.env.BINANCE_RETRY_BASE_DELAY_MS,
-    postgresPoolMax: process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX
+    postgresPoolMax: process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX,
+    realLiveExecutionEnabled: process.env.REAL_LIVE_EXECUTION_ENABLED
   });
   validateProductionConfig(parsed);
   return parsed;
@@ -198,6 +204,7 @@ export function validateProductionConfig(config: AppConfig): void {
   if (!process.env.BINANCE_RETRY_MAX_ATTEMPTS) missing.push("BINANCE_RETRY_MAX_ATTEMPTS");
   if (!process.env.BINANCE_RETRY_BASE_DELAY_MS) missing.push("BINANCE_RETRY_BASE_DELAY_MS");
   if (!process.env.POSTGRES_POOL_MAX && !process.env.PG_POOL_MAX) missing.push("POSTGRES_POOL_MAX");
+  if (config.realLiveExecutionEnabled && process.env.REAL_LIVE_EXECUTION_ENABLED !== "true") missing.push("REAL_LIVE_EXECUTION_ENABLED=true");
   if (missing.length > 0) throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
 
   if ((config.sessionSecret ?? "").length < 32) throw new Error("SESSION_SECRET must be at least 32 characters in production");

@@ -143,6 +143,7 @@ export class TradingChart {
     const resetRange = this.lastKey !== key;
     if (resetRange && this.lastKey !== null) {
       this.resetChart();
+      this.clearAccountTables();
     }
     const visibleRange = resetRange ? null : this.chart.timeScale().getVisibleLogicalRange();
     const [candlePayload, overlayPayload, accountActivity] = await Promise.all([
@@ -179,7 +180,7 @@ export class TradingChart {
     this.choch.render(overlayPayload.choch ?? []);
     this.liquidity.render(overlayPayload.externalLiquidity ?? []);
     this.position.render(overlayPayload.positions ?? []);
-    this.setAccountTables(overlayPayload.positions ?? [], accountActivity);
+    this.setAccountTables(accountActivity);
     this.swing.render(this.trade.render(overlayPayload.trades ?? []));
 
     if (visibleRange) {
@@ -201,6 +202,7 @@ export class TradingChart {
 
   cancelPendingLoad() {
     this.loadSequence += 1;
+    this.clearAccountTables();
   }
 
   resetChart() {
@@ -231,9 +233,23 @@ export class TradingChart {
     }
   }
 
-  setAccountTables(positions, accountActivity) {
+  clearAccountTables() {
     this.accountTables = {
-      positions,
+      positions: [],
+      openOrders: [],
+      orderHistory: [],
+      tradeHistory: [],
+    };
+    if (this.positionsCount) this.positionsCount.textContent = "0";
+    if (this.openOrdersCount) this.openOrdersCount.textContent = "0";
+    if (this.orderHistoryCount) this.orderHistoryCount.textContent = "0";
+    if (this.tradeHistoryCount) this.tradeHistoryCount.textContent = "0";
+    this.renderAccountTable();
+  }
+
+  setAccountTables(accountActivity) {
+    this.accountTables = {
+      positions: (accountActivity?.positions ?? []).map(toAccountPositionRow),
       openOrders: accountActivity?.openOrders ?? [],
       orderHistory: accountActivity?.orderHistory ?? [],
       tradeHistory: accountActivity?.tradeHistory ?? [],
@@ -274,7 +290,7 @@ export class TradingChart {
     this.renderHeader(["Symbol", "Size", "Entry Price", "Stop Loss", "Take Profit", "Margin", "PNL", "Risk/Reward", "Source"]);
 
     const rows = positions
-      .filter((position) => position.state === "active" || position.state === "pending")
+      .filter((position) => position.state === "active")
       .sort((a, b) => sourceRank(a.source) - sourceRank(b.source));
 
     if (rows.length === 0) {
@@ -420,9 +436,22 @@ function formatUtc7Time(time) {
 }
 
 function sourceRank(source) {
+  if (source === "binance") return 0;
   if (source === "manual") return 0;
   if (source === "bot") return 1;
   return 2;
+}
+
+function toAccountPositionRow(position) {
+  return {
+    ...position,
+    state: "active",
+    source: position.source ?? "binance",
+    entry: position.entryPrice,
+    positionSize: position.notional,
+    pnl: position.unrealizedProfit,
+    riskReward: null,
+  };
 }
 
 function positionSymbolCell(position) {
@@ -497,7 +526,7 @@ function sourceCell(position) {
   const cell = document.createElement("td");
   const badge = document.createElement("span");
   badge.className = `source-badge ${position.source ?? "unknown"}`;
-  badge.textContent = position.source === "manual" ? "Binance" : "Bot";
+  badge.textContent = position.source === "binance" || position.source === "manual" ? "Binance" : "Bot";
   cell.append(badge);
   return cell;
 }

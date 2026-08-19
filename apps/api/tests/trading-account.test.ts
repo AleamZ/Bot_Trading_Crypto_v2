@@ -10,6 +10,9 @@ import { MemoryTradingRepository } from "../src/infrastructure/persistence/Memor
 import { MemoryTradingAccountRepository } from "../src/infrastructure/trading-account/MemoryTradingAccountRepository.js";
 import { MemoryTradingRuntimeConfigRepository } from "../src/infrastructure/trading-account/MemoryTradingRuntimeConfigRepository.js";
 import { MemoryExecutionIntentRepository } from "../src/infrastructure/execution/MemoryExecutionIntentRepository.js";
+import { MemoryRealExecutionProposalRepository } from "../src/infrastructure/execution/MemoryRealExecutionProposalRepository.js";
+import { BinanceFuturesAccountClient, type BinanceFuturesPositionStatus } from "../src/infrastructure/execution/BinanceFuturesAccountClient.js";
+import { fingerprintProposal, type CreateRealExecutionProposalInput } from "../src/application/execution/RealExecutionProposal.js";
 import { CredentialCipher } from "../src/infrastructure/security/CredentialCipher.js";
 import { TradingRuntimeManager } from "../src/application/runtime/TradingRuntimeManager.js";
 import { LockedRealExecutionGateway } from "../src/infrastructure/execution/LockedRealExecutionGateway.js";
@@ -43,12 +46,35 @@ describe("Phase 3 execution policy", () => {
   });
 });
 
+describe("Binance signed account source routing", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("routes DEMO signed account reads to demo-fapi and REAL reads to fapi", async () => {
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    await new BinanceFuturesAccountClient("DEMO_KEY", "DEMO_SECRET", true).getOpenOrders("BTCUSDT");
+    await new BinanceFuturesAccountClient("REAL_KEY", "REAL_SECRET", false).getOpenOrders("BTCUSDT");
+
+    expect(urls[0]).toContain("https://demo-fapi.binance.com/fapi/v1/openOrders");
+    expect(urls[1]).toContain("https://fapi.binance.com/fapi/v1/openOrders");
+  });
+});
+
 describe("trading account HTTP flow", () => {
   let server: Server;
   let baseUrl: string;
   let accountRepository: MemoryTradingAccountRepository;
   let configRepository: MemoryTradingRuntimeConfigRepository;
   let executionIntentRepository: MemoryExecutionIntentRepository;
+  let realProposalRepository: MemoryRealExecutionProposalRepository;
   let verifier: MockVerifier;
   let runtimeManager: TradingRuntimeManager;
   let accountClientFactoryCalls: Array<{ apiKey: string; apiSecret: string; testnet: boolean }>;
@@ -57,10 +83,12 @@ describe("trading account HTTP flow", () => {
     accountRepository = new MemoryTradingAccountRepository();
     configRepository = new MemoryTradingRuntimeConfigRepository();
     executionIntentRepository = new MemoryExecutionIntentRepository();
+    realProposalRepository = new MemoryRealExecutionProposalRepository();
     verifier = new MockVerifier();
     accountClientFactoryCalls = [];
     FakeAccountClient.nextLeverage = 20;
     FakeAccountClient.nextMarginType = "ISOLATED";
+    FakeAccountClient.positionsByApiKey.clear();
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
     const cipher = new CredentialCipher(encryptionKey);
     const tradingAccounts = new TradingAccountService(accountRepository, cipher, verifier, configRepository, testConfig());
@@ -75,9 +103,11 @@ describe("trading account HTTP flow", () => {
       fakeLogger(),
       (apiKey, apiSecret, testnet) => {
         accountClientFactoryCalls.push({ apiKey, apiSecret, testnet });
-        return new FakeAccountClient();
+        return new FakeAccountClient(apiKey, testnet);
       },
-      new FakeSymbolMetadataService()
+      new FakeSymbolMetadataService(),
+      realProposalRepository,
+      () => new FakeMarketData() as never
     );
     server = createServer(
       createHttpHandler({
@@ -225,6 +255,83 @@ describe("trading account HTTP flow", () => {
     expect(accountClientFactoryCalls).toContainEqual({ apiKey: "ACCOUNT_B_KEY", apiSecret: "ACCOUNT_B_SECRET", testnet: false });
   });
 
+  it("keeps REAL execution proposals account-scoped and approval auditable", async () => {
+    const cookieA = await register("proposal-a@example.com");
+    const cookieB = await register("proposal-b@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "Real A", mode: "REAL" }, cookieA)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "Real B", mode: "REAL" }, cookieB)).json()).account;
+    const proposalA = await seedProposal(accountA.id, "setup-a");
+    const proposalB = await seedProposal(accountB.id, "setup-b");
+
+    const readBFromA = await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/execution-proposals/${proposalB.id}`, { headers: { cookie: cookieA } });
+    expect(readBFromA.status).toBe(404);
+
+    const approveA = await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/execution-proposals/${proposalA.id}/approve`, { method: "POST", headers: { cookie: cookieA } });
+    expect(approveA.status).toBe(200);
+    const approved = (await approveA.json()).proposal;
+    expect(approved.status).toBe("APPROVED");
+    expect(approved.approvedByUserId).toBeTruthy();
+
+    const accountBProposals = await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/execution-proposals`, { headers: { cookie: cookieB } })).json();
+    expect(accountBProposals.proposals).toHaveLength(1);
+    expect(accountBProposals.proposals[0].id).toBe(proposalB.id);
+  });
+
+  it("manages REAL execution mode through account-scoped API only", async () => {
+    const cookieA = await register("mode-a@example.com");
+    const cookieB = await register("mode-b@example.com");
+    const realA = (await (await postJson("/api/trading-accounts", { name: "Real A", mode: "REAL" }, cookieA)).json()).account;
+    const realB = (await (await postJson("/api/trading-accounts", { name: "Real B", mode: "REAL" }, cookieA)).json()).account;
+    const demo = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookieA)).json()).account;
+    const otherReal = (await (await postJson("/api/trading-accounts", { name: "Other", mode: "REAL" }, cookieB)).json()).account;
+
+    expect((await (await fetch(`${baseUrl}/api/trading-accounts/${realA.id}/real-execution-mode`, { headers: { cookie: cookieA } })).json()).mode).toBe("LOCKED");
+    expect((await putJson(`/api/trading-accounts/${realA.id}/real-execution-mode`, { mode: "DRY_RUN" }, cookieA)).status).toBe(200);
+    expect((await (await fetch(`${baseUrl}/api/trading-accounts/${realA.id}/real-execution-mode`, { headers: { cookie: cookieA } })).json()).mode).toBe("DRY_RUN");
+    expect((await (await fetch(`${baseUrl}/api/trading-accounts/${realB.id}/real-execution-mode`, { headers: { cookie: cookieA } })).json()).mode).toBe("LOCKED");
+
+    expect((await putJson(`/api/trading-accounts/${realA.id}/real-execution-mode`, { mode: "AUTO_LIVE" }, cookieA)).status).toBe(400);
+    expect((await putJson(`/api/trading-accounts/${demo.id}/real-execution-mode`, { mode: "DRY_RUN" }, cookieA)).status).toBe(400);
+    expect((await putJson(`/api/trading-accounts/${otherReal.id}/real-execution-mode`, { mode: "DRY_RUN" }, cookieA)).status).toBe(404);
+
+    const modeBody = await (await fetch(`${baseUrl}/api/trading-accounts/${realA.id}/real-execution-mode`, { headers: { cookie: cookieA } })).json();
+    expect(modeBody).toMatchObject({ masterLiveExecutionEnabled: false, liveExecutionLocked: true });
+    expect(JSON.stringify(modeBody)).not.toContain("secret-value");
+  });
+
+  it("supports REAL proposal aliases with filtering, reject, and cross-user approval denial", async () => {
+    const cookieA = await register("proposal-alias-a@example.com");
+    const cookieB = await register("proposal-alias-b@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "Real A", mode: "REAL" }, cookieA)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "Real B", mode: "REAL" }, cookieB)).json()).account;
+    const pending = await seedProposal(accountA.id, "setup-pending");
+    const rejected = await seedProposal(accountA.id, "setup-reject");
+    const other = await seedProposal(accountB.id, "setup-other");
+
+    const pendingList = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/real-execution-proposals?status=PENDING`, { headers: { cookie: cookieA } })).json();
+    expect(pendingList.proposals.map((proposal: { id: string }) => proposal.id).sort()).toEqual([pending.id, rejected.id].sort());
+
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/real-execution-proposals/${other.id}/approve`, { method: "POST", headers: { cookie: cookieA } })).status).toBe(404);
+    const rejectResponse = await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/real-execution-proposals/${rejected.id}/reject`, { method: "POST", headers: { cookie: cookieA } });
+    expect(rejectResponse.status).toBe(200);
+    expect((await rejectResponse.json()).proposal.status).toBe("REJECTED");
+
+    const detail = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/real-execution-proposals/${pending.id}`, { headers: { cookie: cookieA } })).text();
+    expect(detail).not.toContain("secret-value");
+    expect(detail).not.toContain("apiSecret");
+  });
+
+  it("does not approve already approved or expired REAL proposals", async () => {
+    const cookie = await register("proposal-status@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    const pending = await seedProposal(account.id, "setup-approve-once");
+    const expired = await seedProposal(account.id, "setup-expired", true);
+
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${account.id}/real-execution-proposals/${pending.id}/approve`, { method: "POST", headers: { cookie } })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${account.id}/real-execution-proposals/${pending.id}/approve`, { method: "POST", headers: { cookie } })).status).toBe(400);
+    expect((await fetch(`${baseUrl}/api/trading-accounts/${account.id}/real-execution-proposals/${expired.id}/approve`, { method: "POST", headers: { cookie } })).status).toBe(400);
+  });
+
   it("normalizes invalid credentials, missing futures permission, and unavailable Binance", async () => {
     const cookie = await register("a@example.com");
     const account = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookie)).json()).account;
@@ -340,6 +447,75 @@ describe("trading account HTTP flow", () => {
     expect(accountA.id).not.toBe(accountB.id);
   });
 
+  it("returns only signed Binance account activity for REAL accounts, not DEMO positions", async () => {
+    const cookie = await register("real-source@example.com");
+    const demo = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookie)).json()).account;
+    const real = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${demo.id}/binance-connection`, { apiKey: "DEMO_POSITION_KEY", apiSecret: "DEMO_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${real.id}/binance-connection`, { apiKey: "REAL_EMPTY_KEY", apiSecret: "REAL_SECRET" }, cookie);
+    FakeAccountClient.positionsByApiKey.set("DEMO_POSITION_KEY", [fakePosition("BTCUSDT", "long")]);
+    FakeAccountClient.positionsByApiKey.set("REAL_EMPTY_KEY", []);
+
+    const body = await (await fetch(`${baseUrl}/api/trading-accounts/${real.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(body).toMatchObject({
+      connected: true,
+      source: "BINANCE_SIGNED_ACCOUNT",
+      sourceEnvironment: "MAINNET",
+      tradingAccountId: real.id,
+      positions: []
+    });
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "REAL_EMPTY_KEY", apiSecret: "REAL_SECRET", testnet: false });
+  });
+
+  it("does not expose REAL execution proposals or execution intents as chart positions", async () => {
+    const cookie = await register("real-proposal-source@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "REAL_NO_POSITION_KEY", apiSecret: "REAL_SECRET" }, cookie);
+    FakeAccountClient.positionsByApiKey.set("REAL_NO_POSITION_KEY", []);
+    await seedProposal(account.id, "btc-real-pending-source");
+    await executionIntentRepository.createOrGet({
+      id: "11111111-2222-4333-8444-555555555555",
+      tradingAccountId: account.id,
+      symbol: "BTCUSDT",
+      side: "short",
+      setupKey: "real-intent-source-key",
+      entryType: "limit",
+      requestedEntry: 603.74,
+      requestedStopLoss: 610,
+      requestedTakeProfit: 590,
+      quantity: 0.01,
+      clientEntryOrderId: "entry-real-intent-source-key",
+      clientStopOrderId: "stop-real-intent-source-key",
+      clientTakeProfitOrderId: "take-real-intent-source-key"
+    });
+
+    const body = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(body.positions).toEqual([]);
+    expect(JSON.stringify(body)).not.toContain("603.74");
+    expect(JSON.stringify(body)).not.toContain("btc-real-pending-source");
+    expect(JSON.stringify(body)).not.toContain("real-intent-source-key");
+  });
+
+  it("keeps signed account activity isolated for two REAL accounts on the same symbol", async () => {
+    const cookie = await register("two-real-source@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "Real A", mode: "REAL" }, cookie)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "Real B", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${accountA.id}/binance-connection`, { apiKey: "REAL_A_KEY", apiSecret: "A_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/binance-connection`, { apiKey: "REAL_B_KEY", apiSecret: "B_SECRET" }, cookie);
+    FakeAccountClient.positionsByApiKey.set("REAL_A_KEY", [fakePosition("BTCUSDT", "short")]);
+    FakeAccountClient.positionsByApiKey.set("REAL_B_KEY", []);
+
+    const accountAActivity = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie } })).json();
+    const accountBActivity = await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/chart/account-activity?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(accountAActivity.positions).toHaveLength(1);
+    expect(accountAActivity.positions[0]).toMatchObject({ source: "binance", sourceEnvironment: "MAINNET", tradingAccountId: accountA.id });
+    expect(accountBActivity.positions).toEqual([]);
+    expect(accountBActivity.tradingAccountId).toBe(accountB.id);
+  });
+
   it("does not share engine instances for the same symbol across accounts", async () => {
     const cookieA = await register("a@example.com");
     const cookieB = await register("b@example.com");
@@ -360,6 +536,38 @@ describe("trading account HTTP flow", () => {
     const cookie = response.headers.get("set-cookie");
     if (!cookie) throw new Error("Expected cookie");
     return cookie;
+  }
+
+  async function seedProposal(tradingAccountId: string, setupKey: string, expired = false) {
+    const base = {
+      id: `${tradingAccountId.slice(0, 8)}-${setupKey.includes("reject") ? "2222" : setupKey.includes("other") ? "3333" : setupKey.includes("expired") ? "4444" : "1111"}-4111-8111-111111111111`,
+      tradingAccountId,
+      setupKey,
+      symbol: "BTCUSDT",
+      direction: "bullish" as const,
+      status: "PENDING" as const,
+      requestedEntryType: "market" as const,
+      requestedEntryPrice: 100,
+      normalizedEntryPrice: null,
+      requestedQuantity: 10,
+      normalizedQuantity: 10,
+      requestedStopLoss: 95,
+      normalizedStopLoss: 95,
+      requestedTakeProfit: 110,
+      normalizedTakeProfit: 110,
+      estimatedNotional: 1000,
+      estimatedMargin: 200,
+      configuredLeverage: 20,
+      configuredMarginMode: "ISOLATED" as const,
+      symbolTickSize: 0.1,
+      symbolStepSize: 0.001,
+      symbolMinQty: 0.001,
+      symbolMinNotional: 5,
+      strategySnapshot: {},
+      riskSnapshot: {},
+      expiresAt: new Date(Date.now() + (expired ? -60_000 : 30 * 60_000)).toISOString()
+    } satisfies Omit<CreateRealExecutionProposalInput, "proposalHash">;
+    return (await realProposalRepository.createOrGet({ ...base, proposalHash: fingerprintProposal(base) })).proposal;
   }
 
   function postJson(path: string, body: unknown, cookie?: string): Promise<Response> {
@@ -427,11 +635,17 @@ class FakeMarketData {
 class FakeAccountClient {
   static nextLeverage = 20;
   static nextMarginType: "CROSS" | "ISOLATED" = "ISOLATED";
+  static positionsByApiKey = new Map<string, BinanceFuturesPositionStatus[]>();
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly testnet: boolean
+  ) {}
 
   async getWalletStatus() {
     return {
       connected: true,
-      environment: "live" as const,
+      environment: this.testnet ? "testnet" as const : "live" as const,
       label: "Binance Futures account verified",
       walletBalance: 10_000,
       availableBalance: 10_000,
@@ -440,8 +654,9 @@ class FakeAccountClient {
     };
   }
 
-  async getOpenPositions() {
-    return [];
+  async getOpenPositions(symbol?: string) {
+    const positions = FakeAccountClient.positionsByApiKey.get(this.apiKey) ?? [];
+    return positions.filter((position) => !symbol || position.symbol === symbol);
   }
 
   async getOpenOrders() {
@@ -502,6 +717,23 @@ function readSnapshotSettings(store: unknown): AppConfig {
 
 function credentials(): { apiKey: string; apiSecret: string } {
   return { apiKey: "ABCD1234WXYZ", apiSecret: "secret-value" };
+}
+
+function fakePosition(symbol: string, side: "long" | "short"): BinanceFuturesPositionStatus {
+  return {
+    id: `binance:${symbol}:${side}`,
+    symbol,
+    side,
+    entryPrice: 603.74,
+    entryTime: null,
+    quantity: 0.01,
+    notional: 6.0374,
+    leverage: 5,
+    margin: 1.20748,
+    unrealizedProfit: 0,
+    stopLoss: null,
+    takeProfit: null
+  };
 }
 
 function testConfig(): AppConfig {

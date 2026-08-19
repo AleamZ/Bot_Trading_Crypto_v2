@@ -71,6 +71,7 @@ const metrics = {
 };
 
 export function createHttpHandler(params: HttpServerParams): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
+  authLimiters.clear();
   let runtimeConfig = params.config;
   const marketData = params.marketData ?? new BinanceFuturesMarketData(runtimeConfig.binanceTestnet);
   const accountClient =
@@ -222,7 +223,9 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
       }
 
       if (requestUrl.pathname === "/api/market/symbols") {
-        const symbols = await marketData.getFuturesSymbols();
+        const accountId = requestUrl.searchParams.get("accountId");
+        const account = accountId && params.tradingAccounts ? await params.tradingAccounts.getOwnedAccount(authenticatedUser.id, accountId) : null;
+        const symbols = await marketDataForAccount(account, marketData).getFuturesSymbols();
         response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify(symbols));
         return;
@@ -564,6 +567,45 @@ async function handleTradingAccountRoute(params: {
     return;
   }
 
+  if (child === "real-execution-mode" && parts.length === 4 && request.method === "GET") {
+    const account = await service.getOwnedAccount(userId, accountId);
+    if (account.mode !== "REAL") throw new InvalidTradingAccountInputError("REAL execution mode is only available for REAL accounts");
+    const settings = await service.getSettings(userId, accountId);
+    sendJson(
+      response,
+      200,
+      {
+        mode: settings.realExecutionMode ?? "LOCKED",
+        masterLiveExecutionEnabled: Boolean(config.realLiveExecutionEnabled),
+        liveExecutionLocked: !config.realLiveExecutionEnabled
+      },
+      corsHeaders
+    );
+    return;
+  }
+
+  if (child === "real-execution-mode" && parts.length === 4 && request.method === "PUT") {
+    const account = await service.getOwnedAccount(userId, accountId);
+    if (account.mode !== "REAL") throw new InvalidTradingAccountInputError("REAL execution mode is only available for REAL accounts");
+    const body = await readJsonBody(request);
+    const mode = isRecord(body) ? body.mode : null;
+    if (mode !== "LOCKED" && mode !== "DRY_RUN" && mode !== "APPROVAL_REQUIRED") throw new InvalidTradingAccountInputError("Invalid REAL execution mode");
+    const current = await service.getSettings(userId, accountId);
+    await service.saveSettings(userId, accountId, { ...current, realExecutionMode: mode });
+    await runtimeManager?.refreshRuntime(accountId);
+    sendJson(
+      response,
+      200,
+      {
+        mode,
+        masterLiveExecutionEnabled: Boolean(config.realLiveExecutionEnabled),
+        liveExecutionLocked: !config.realLiveExecutionEnabled
+      },
+      corsHeaders
+    );
+    return;
+  }
+
   if (child === "watchlist" && parts.length === 4 && request.method === "GET") {
     sendJson(response, 200, { watchlist: await service.getWatchlist(userId, accountId) }, corsHeaders);
     return;
@@ -649,10 +691,10 @@ async function handleTradingAccountRoute(params: {
   }
 
   if (child === "analysis" && parts.length === 4 && request.method === "GET") {
-    await service.getOwnedAccount(userId, accountId);
+    const account = await service.getOwnedAccount(userId, accountId);
     const query = parseAccountActivityQuery(requestUrl, config.symbol);
     const settings = await service.getSettings(userId, accountId);
-    sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketData), corsHeaders);
+    sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketDataForAccount(account, marketData)), corsHeaders);
     return;
   }
 
@@ -661,12 +703,13 @@ async function handleTradingAccountRoute(params: {
       sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
       return;
     }
-    await service.getOwnedAccount(userId, accountId);
+    const account = await service.getOwnedAccount(userId, accountId);
     const query = parseKlineQuery(requestUrl, config.symbol);
+    const accountMarketData = marketDataForAccount(account, marketData);
     const [settings, snapshot, candles, manualPositions] = await Promise.all([
       service.getSettings(userId, accountId),
       runtimeManager.getSnapshot(accountId),
-      marketData.getKlines(query.symbol, query.interval, query.limit),
+      accountMarketData.getKlines(query.symbol, query.interval, query.limit),
       runtimeManager.getManualPositions(accountId, query.symbol)
     ]);
     sendJson(
@@ -681,7 +724,8 @@ async function handleTradingAccountRoute(params: {
         emaPeriod: settings.emaPeriod,
         marginPerTrade: settings.marginPerTrade,
         leverage: settings.leverage,
-        manualPositions
+        manualPositions,
+        includeBotPositionOverlays: account.mode === "DEMO"
       }),
       corsHeaders
     );
@@ -720,6 +764,56 @@ async function handleTradingAccountRoute(params: {
     return;
   }
 
+  if ((child === "execution-proposals" || child === "real-execution-proposals") && parts.length === 4 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    const account = await service.getOwnedAccount(userId, accountId);
+    if (account.mode !== "REAL") throw new InvalidTradingAccountInputError("REAL execution proposals are only available for REAL accounts");
+    const limit = clampLimit(requestUrl.searchParams.get("limit"), 100, 500);
+    const status = requestUrl.searchParams.get("status");
+    const proposals = await runtimeManager.listRealExecutionProposals(accountId, limit);
+    sendJson(response, 200, { proposals: status ? proposals.filter((proposal) => proposal.status === status) : proposals }, corsHeaders);
+    return;
+  }
+
+  if ((child === "execution-proposals" || child === "real-execution-proposals") && parts[4] && parts.length === 5 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    const account = await service.getOwnedAccount(userId, accountId);
+    if (account.mode !== "REAL") throw new InvalidTradingAccountInputError("REAL execution proposals are only available for REAL accounts");
+    const proposal = await runtimeManager.getRealExecutionProposal(accountId, parts[4]);
+    sendJson(response, proposal ? 200 : 404, proposal ? { proposal } : { error: "PROPOSAL_NOT_FOUND" }, corsHeaders);
+    return;
+  }
+
+  if ((child === "execution-proposals" || child === "real-execution-proposals") && parts[4] && parts[5] && parts.length === 6 && request.method === "POST") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    const account = await service.getOwnedAccount(userId, accountId);
+    if (account.mode !== "REAL") throw new InvalidTradingAccountInputError("REAL execution proposals are only available for REAL accounts");
+    const action = parts[5];
+    const proposal =
+      action === "approve"
+        ? await runtimeManager.approveRealExecutionProposal(accountId, parts[4], userId)
+        : action === "reject"
+          ? await runtimeManager.rejectRealExecutionProposal(accountId, parts[4])
+          : action === "cancel"
+            ? await runtimeManager.cancelRealExecutionProposal(accountId, parts[4])
+            : null;
+    if (!proposal) {
+      sendJson(response, 404, { error: "Proposal action not found" }, corsHeaders);
+      return;
+    }
+    sendJson(response, 200, { proposal }, corsHeaders);
+    return;
+  }
+
   if (child === "binance-connection" && parts.length === 4 && request.method === "GET") {
     sendJson(response, 200, { connection: await service.getConnection(userId, accountId) }, corsHeaders);
     return;
@@ -755,6 +849,11 @@ function binanceErrorStatus(error: BinanceVerificationError): number {
   if (error.code === "BINANCE_UNAVAILABLE") return 503;
   if (error.code === "INVALID_ACCOUNT_MODE") return 400;
   return 422;
+}
+
+function marketDataForAccount(account: { mode: "DEMO" | "REAL" } | null, fallback: BinanceFuturesMarketData): BinanceFuturesMarketData {
+  if (!account) return fallback;
+  return new BinanceFuturesMarketData(account.mode === "DEMO");
 }
 
 function assertAuthRateLimit(request: IncomingMessage, action: string): void {
@@ -874,6 +973,7 @@ async function buildChartOverlays(params: {
   marginPerTrade: number;
   leverage: number;
   manualPositions: BinanceFuturesPositionStatus[];
+  includeBotPositionOverlays?: boolean;
 }): Promise<unknown> {
   const events = selectBotEvents(params.store, params.symbol, 500).filter(isRecord);
   const fvg = new Map<string, Record<string, unknown>>();
@@ -940,7 +1040,8 @@ async function buildChartOverlays(params: {
     timeframe: params.timeframe,
     candles: params.candles,
     marginPerTrade: params.marginPerTrade,
-    leverage: params.leverage
+    leverage: params.leverage,
+    includeBotPositionOverlays: params.includeBotPositionOverlays ?? true
   })) {
     positions.set(String(position.id), position);
   }
@@ -1551,11 +1652,12 @@ function buildPositionOverlays(params: {
   candles: Array<{ time: number }>;
   marginPerTrade: number;
   leverage: number;
+  includeBotPositionOverlays?: boolean;
 }): Record<string, unknown>[] {
   const overlays: Record<string, unknown>[] = [];
   const latestTime = params.candles.at(-1)?.time ?? Math.floor(Date.now() / 1000);
 
-  if (isRecord(params.engineState) && isRecord(params.engineState.pendingSetup) && isRecord(params.engineState.pendingSetup.plan) && isRecord(params.engineState.pendingSetup.fvg)) {
+  if (params.includeBotPositionOverlays !== false && isRecord(params.engineState) && isRecord(params.engineState.pendingSetup) && isRecord(params.engineState.pendingSetup.plan) && isRecord(params.engineState.pendingSetup.fvg)) {
     const plan = params.engineState.pendingSetup.plan;
     const fvg = params.engineState.pendingSetup.fvg;
     overlays.push(
@@ -1579,7 +1681,7 @@ function buildPositionOverlays(params: {
     );
   }
 
-  if (isRecord(params.engineState) && isRecord(params.engineState.activeRisk)) {
+  if (params.includeBotPositionOverlays !== false && isRecord(params.engineState) && isRecord(params.engineState.activeRisk)) {
     const risk = params.engineState.activeRisk;
     overlays.push(
       createPositionOverlay({

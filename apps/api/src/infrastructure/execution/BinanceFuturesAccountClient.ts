@@ -23,6 +23,9 @@ export interface BinanceFuturesPositionStatus {
   unrealizedProfit: number;
   stopLoss: number | null;
   takeProfit: number | null;
+  source?: "binance";
+  sourceEnvironment?: "TESTNET" | "MAINNET";
+  tradingAccountId?: string;
 }
 
 export interface BinanceFuturesOpenOrderStatus {
@@ -40,6 +43,9 @@ export interface BinanceFuturesOpenOrderStatus {
   reduceOnly: boolean;
   createdAt: number | null;
   updatedAt: number | null;
+  source?: "binance";
+  sourceEnvironment?: "TESTNET" | "MAINNET";
+  tradingAccountId?: string;
 }
 
 export interface BinanceFuturesOrderHistoryStatus extends BinanceFuturesOpenOrderStatus {
@@ -59,6 +65,9 @@ export interface BinanceFuturesTradeHistoryStatus {
   commission: number;
   commissionAsset: string | null;
   createdAt: number | null;
+  source?: "binance";
+  sourceEnvironment?: "TESTNET" | "MAINNET";
+  tradingAccountId?: string;
 }
 
 export interface BinanceFuturesSymbolAccountState {
@@ -83,7 +92,7 @@ export class BinanceFuturesAccountClient {
     private readonly apiSecret: string,
     private readonly testnet: boolean
   ) {
-    this.baseUrl = testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    this.baseUrl = testnet ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
   }
 
   async getWalletStatus(): Promise<BinanceFuturesWalletStatus> {

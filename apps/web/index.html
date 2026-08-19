@@ -611,6 +611,73 @@
           </div>
         </section>
 
+        <section class="settings-group" id="real-execution-safety" hidden>
+          <h2>REAL Execution Safety</h2>
+          <div class="settings-grid">
+            <article class="setting-card">
+              <label>Environment</label>
+              <strong>REAL · BINANCE FUTURES MAINNET</strong>
+              <small>Phase 7.1 safety mode: REAL Mainnet order submission is disabled.</small>
+            </article>
+
+            <article class="setting-card">
+              <label>Execution Mode</label>
+              <div class="segmented-control three-options" id="real-execution-mode-control">
+                <button class="segmented-option" data-real-execution-mode="LOCKED" type="button">LOCKED</button>
+                <button class="segmented-option" data-real-execution-mode="DRY_RUN" type="button">DRY RUN</button>
+                <button class="segmented-option" data-real-execution-mode="APPROVAL_REQUIRED" type="button">APPROVAL REQUIRED</button>
+              </div>
+              <small id="real-execution-mode-detail">LOCKED prevents proposals and orders.</small>
+            </article>
+
+            <article class="setting-card">
+              <label>Master Live Execution</label>
+              <strong id="real-master-lock">LOCKED BY SERVER</strong>
+              <small>Approval records operator approval only. Live order submission remains disabled.</small>
+            </article>
+          </div>
+        </section>
+
+        <section class="settings-group" id="real-proposals-section" hidden>
+          <div class="panel-head">
+            <h2>REAL Execution Proposals</h2>
+            <select id="real-proposal-status-filter" aria-label="Proposal status filter">
+              <option value="">All</option>
+              <option value="PENDING">PENDING</option>
+              <option value="DRY_RUN">DRY_RUN</option>
+              <option value="APPROVED">APPROVED</option>
+              <option value="REJECTED">REJECTED</option>
+              <option value="EXPIRED">EXPIRED</option>
+              <option value="CANCELLED">CANCELLED</option>
+              <option value="EXECUTION_BLOCKED">EXECUTION_BLOCKED</option>
+              <option value="EXECUTED">EXECUTED</option>
+            </select>
+          </div>
+          <div class="positions-table-wrap">
+            <table class="positions-table">
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Entry</th>
+                  <th>Qty</th>
+                  <th>SL</th>
+                  <th>TP</th>
+                  <th>R/R</th>
+                  <th>Status</th>
+                  <th>Setup Key</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="real-proposals-body">
+                <tr><td colspan="11" class="empty-position">No proposals</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <pre class="proposal-detail" id="real-proposal-detail" hidden></pre>
+        </section>
+
         <section class="settings-group">
           <h2>Bot Control</h2>
           <div class="settings-grid">

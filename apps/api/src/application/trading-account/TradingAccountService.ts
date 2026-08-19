@@ -93,6 +93,7 @@ export class TradingAccountService {
   async saveSettings(userId: string, accountId: string, input: unknown): Promise<TradingSettings> {
     const account = await this.getOwnedAccount(userId, accountId);
     const settings = validateTradingSettings(input);
+    if (account.mode === "DEMO") settings.realExecutionMode = "LOCKED";
     await this.runtimeConfigRepository?.saveSettings(account.id, settings);
     await this.runtimeConfigRepository?.saveWatchlist(account.id, settings.watchlist);
     return settings;

@@ -14,6 +14,7 @@ import { BinanceFuturesAccountVerifier } from "./infrastructure/trading-account/
 import { createTradingAccountRepository } from "./infrastructure/trading-account/PostgresTradingAccountRepository.js";
 import { createTradingRuntimeConfigRepository } from "./infrastructure/trading-account/PostgresTradingRuntimeConfigRepository.js";
 import { createExecutionIntentRepository } from "./infrastructure/execution/PostgresExecutionIntentRepository.js";
+import { createRealExecutionProposalRepository } from "./infrastructure/execution/PostgresRealExecutionProposalRepository.js";
 import { closeAllPostgresPools } from "./infrastructure/persistence/PgPoolFactory.js";
 import { startHttpServer } from "./presentation/http/Server.js";
 
@@ -33,6 +34,7 @@ const auth = new AuthService(authRepository, config.sessionSecret ?? "developmen
 const tradingAccountRepository = await createTradingAccountRepository(config.databaseUrl);
 const tradingRuntimeConfigRepository = await createTradingRuntimeConfigRepository(config.databaseUrl);
 const executionIntentRepository = await createExecutionIntentRepository(config.databaseUrl);
+const realExecutionProposalRepository = await createRealExecutionProposalRepository(config.databaseUrl);
 const credentialCipher = new CredentialCipher(config.binanceCredentialEncryptionKey ?? "0000000000000000000000000000000000000000000000000000000000000000");
 const tradingAccounts = new TradingAccountService(
   tradingAccountRepository,
@@ -57,7 +59,19 @@ const availableBalanceProvider = async () => {
   return status?.connected ? status.availableBalance : null;
 };
 const marketData = new BinanceFuturesMarketData(config.binanceTestnet);
-const runtimeManager = new TradingRuntimeManager(config, config.databaseUrl, tradingAccountRepository, tradingRuntimeConfigRepository, executionIntentRepository, credentialCipher, marketData, logger);
+const runtimeManager = new TradingRuntimeManager(
+  config,
+  config.databaseUrl,
+  tradingAccountRepository,
+  tradingRuntimeConfigRepository,
+  executionIntentRepository,
+  credentialCipher,
+  marketData,
+  logger,
+  undefined,
+  undefined,
+  realExecutionProposalRepository
+);
 const scanner = new MarketScanner(config, repository, execution, logger, marketData, availableBalanceProvider);
 const engine = scanner.getPrimaryEngine();
 const appState = { shuttingDown: false, bootstrapComplete: false, startedAt: Date.now() };

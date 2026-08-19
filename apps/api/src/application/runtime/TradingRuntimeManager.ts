@@ -7,7 +7,7 @@ import type { TradingRepository } from "../ports/Repositories.js";
 import { MarketScanner, type WatchlistStatus } from "../scanner/MarketScanner.js";
 import { PostgresTradingRepository } from "../../infrastructure/persistence/PostgresTradingRepository.js";
 import { MemoryTradingRepository } from "../../infrastructure/persistence/MemoryTradingRepository.js";
-import type { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
+import { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
 import type { CredentialCipher } from "../../infrastructure/security/CredentialCipher.js";
 import { BinanceFuturesExecutionGateway } from "../../infrastructure/execution/BinanceFuturesExecutionGateway.js";
 import {
@@ -33,6 +33,10 @@ import { ExecutionCoordinator, type ExecutionGateReason, type ExecutionGateState
 import { TradingReconciliationService, type ReconciliationResult } from "../execution/TradingReconciliationService.js";
 import { BinanceFuturesSymbolMetadataService } from "../../infrastructure/market-data/BinanceFuturesSymbolMetadataService.js";
 import { validateAgainstSymbolRules, type FuturesSymbolRules } from "../../domain/symbol/SymbolRules.js";
+import { RealExecutionProposalGateway } from "../execution/RealExecutionProposalGateway.js";
+import type { RealExecutionProposalRepository } from "../execution/RealExecutionProposalRepository.js";
+import { MemoryRealExecutionProposalRepository } from "../../infrastructure/execution/MemoryRealExecutionProposalRepository.js";
+import { fingerprintProposal, type RealExecutionProposal } from "../execution/RealExecutionProposal.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -61,6 +65,9 @@ export interface RuntimeHealth {
 
 export interface AccountActivitySnapshot {
   connected: boolean;
+  source: "BINANCE_SIGNED_ACCOUNT";
+  sourceEnvironment: "TESTNET" | "MAINNET";
+  tradingAccountId: string;
   positions: BinanceFuturesPositionStatus[];
   openOrders: BinanceFuturesOpenOrderStatus[];
   orderHistory: BinanceFuturesOrderHistoryStatus[];
@@ -77,6 +84,8 @@ export interface RealTradingReadinessResult {
   mode: "DEMO" | "REAL";
   executionLocked: boolean;
   executionReason: "READY" | "REAL_EXECUTION_LOCKED";
+  realExecutionMode: "LOCKED" | "DRY_RUN" | "APPROVAL_REQUIRED";
+  masterLiveExecutionEnabled: boolean;
   symbol: string;
   configuredLeverage: number;
   binanceLeverage: number | null;
@@ -112,6 +121,7 @@ interface AccountRuntimeClient {
 }
 
 type AccountRuntimeClientFactory = (apiKey: string, apiSecret: string, testnet: boolean) => AccountRuntimeClient;
+type RuntimeMarketDataFactory = (testnet: boolean) => BinanceFuturesMarketData;
 
 export interface ExecutionGateInput {
   shuttingDown: boolean;
@@ -143,7 +153,9 @@ export class TradingRuntimeManager {
     private readonly marketData: BinanceFuturesMarketData,
     private readonly logger: DecisionLogger,
     private readonly accountClientFactory: AccountRuntimeClientFactory = (apiKey, apiSecret, testnet) => new BinanceFuturesAccountClient(apiKey, apiSecret, testnet),
-    private readonly symbolMetadata: BinanceFuturesSymbolMetadataService = new BinanceFuturesSymbolMetadataService()
+    private readonly symbolMetadata: BinanceFuturesSymbolMetadataService = new BinanceFuturesSymbolMetadataService(),
+    private readonly realProposalRepository: RealExecutionProposalRepository = new MemoryRealExecutionProposalRepository(),
+    private readonly runtimeMarketDataFactory: RuntimeMarketDataFactory = (testnet) => new BinanceFuturesMarketData(testnet)
   ) {}
 
   async start(): Promise<void> {
@@ -195,9 +207,24 @@ export class TradingRuntimeManager {
             executionGate,
             preTradeValidation: (plan, risk) => this.validatePreTrade(account, configRef.current, plan, risk)
           })
-        : rawExecution;
+        : new RealExecutionProposalGateway({
+            tradingAccountId: account.id,
+            config: () => configRef.current,
+            runtimeReady: () => !this.shuttingDown && health.state === "READY",
+            reconciliationHealthy: () => health.reconciliationStatus === "OK",
+            binanceConnected: () => !(rawExecution instanceof DisabledExecutionGateway),
+            loadSymbolRules: (symbol) => this.getSymbolRules(account.id, symbol),
+            loadAvailableBalance: async () => {
+              const client = await this.createAccountClient(account.id);
+              const status = client?.getWalletStatus ? await client.getWalletStatus() : null;
+              return status?.connected ? status.availableBalance : null;
+            },
+            proposalRepository: this.realProposalRepository,
+            auditRepository: this.executionIntentRepository,
+            logger: this.logger
+          });
     const reconciliationGateway = account.mode === "DEMO" && isRecoverableExecutionGateway(rawExecution) ? new GatedRecoverableExecutionGateway(rawExecution, executionGate) : undefined;
-    const scanner = new MarketScanner(config, repository, execution, this.logger, this.marketData, null);
+    const scanner = new MarketScanner(config, repository, execution, this.logger, this.runtimeMarketDataFactory(account.mode === "DEMO"), null);
     const reconciliation = new TradingReconciliationService(this.executionIntentRepository, this.logger);
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
     this.runtimes.set(account.id, runtime);
@@ -339,6 +366,8 @@ export class TradingRuntimeManager {
       mode: account.mode,
       executionLocked: account.mode === "REAL",
       executionReason: account.mode === "REAL" ? "REAL_EXECUTION_LOCKED" : "READY",
+      realExecutionMode: settings.realExecutionMode,
+      masterLiveExecutionEnabled: this.baseConfig.realLiveExecutionEnabled,
       symbol,
       configuredLeverage: settings.leverage,
       binanceLeverage,
@@ -360,6 +389,63 @@ export class TradingRuntimeManager {
       if (marginModeMatch === false) await this.auditRealEvent(account.id, symbol, "REAL_MARGIN_MODE_MISMATCH", { configured: settings.marginMode, binance: binanceMarginMode });
     }
     return readiness;
+  }
+
+  async listRealExecutionProposals(accountId: string, limit = 100): Promise<RealExecutionProposal[]> {
+    await this.realProposalRepository.expireOpen(new Date().toISOString());
+    return this.realProposalRepository.listByAccount(accountId, limit);
+  }
+
+  async getRealExecutionProposal(accountId: string, proposalId: string): Promise<RealExecutionProposal | null> {
+    await this.realProposalRepository.expireOpen(new Date().toISOString());
+    return this.realProposalRepository.findById(accountId, proposalId);
+  }
+
+  async approveRealExecutionProposal(accountId: string, proposalId: string, userId: string): Promise<RealExecutionProposal> {
+    const proposal = await this.getRealExecutionProposal(accountId, proposalId);
+    if (!proposal) throw new Error("PROPOSAL_NOT_FOUND");
+    if (proposal.expiresAt <= new Date().toISOString()) throw new Error("PROPOSAL_EXPIRED");
+    await this.assertProposalFingerprintCurrent(proposal);
+    const approved = await this.realProposalRepository.transitionStatus(accountId, proposalId, ["PENDING"], "APPROVED", {
+      approvedAt: new Date().toISOString(),
+      approvedByUserId: userId
+    });
+    if (!approved) throw new Error("APPROVAL_STATUS");
+    await this.auditRealEvent(accountId, proposal.symbol, "REAL_PROPOSAL_APPROVED", { proposalId, setupKey: proposal.setupKey });
+    if (!this.baseConfig.realLiveExecutionEnabled) {
+      await this.auditRealEvent(accountId, proposal.symbol, "REAL_EXECUTION_MASTER_LOCKED", { proposalId, setupKey: proposal.setupKey });
+    }
+    return approved;
+  }
+
+  async rejectRealExecutionProposal(accountId: string, proposalId: string): Promise<RealExecutionProposal> {
+    const rejected = await this.realProposalRepository.transitionStatus(accountId, proposalId, ["PENDING", "APPROVED"], "REJECTED", { rejectedAt: new Date().toISOString() });
+    if (!rejected) throw new Error("APPROVAL_STATUS");
+    await this.auditRealEvent(accountId, rejected.symbol, "REAL_PROPOSAL_REJECTED", { proposalId, setupKey: rejected.setupKey });
+    return rejected;
+  }
+
+  async cancelRealExecutionProposal(accountId: string, proposalId: string): Promise<RealExecutionProposal> {
+    const cancelled = await this.realProposalRepository.transitionStatus(accountId, proposalId, ["PENDING", "APPROVED"], "CANCELLED", { cancelledAt: new Date().toISOString() });
+    if (!cancelled) throw new Error("APPROVAL_STATUS");
+    await this.auditRealEvent(accountId, cancelled.symbol, "REAL_PROPOSAL_CANCELLED", { proposalId, setupKey: cancelled.setupKey });
+    return cancelled;
+  }
+
+  private async assertProposalFingerprintCurrent(proposal: RealExecutionProposal): Promise<void> {
+    const rules = await this.getSymbolRules(proposal.tradingAccountId, proposal.symbol);
+    const currentHash = fingerprintProposal({
+      ...proposal,
+      symbolTickSize: rules.tickSize,
+      symbolStepSize: rules.stepSize,
+      symbolMinQty: rules.minQty,
+      symbolMinNotional: rules.minNotional
+    });
+    if (currentHash !== proposal.proposalHash) {
+      await this.realProposalRepository.transitionStatus(proposal.tradingAccountId, proposal.id, ["PENDING"], "EXECUTION_BLOCKED");
+      await this.auditRealEvent(proposal.tradingAccountId, proposal.symbol, "REAL_EXECUTION_PARAMETER_CHANGED", { proposalId: proposal.id, setupKey: proposal.setupKey });
+      throw new Error("REAL_EXECUTION_PARAMETER_CHANGED");
+    }
   }
 
   private async validatePreTrade(account: TradingAccount, config: AppConfig, plan: EntryPlan, risk: RiskDecision): Promise<void> {
@@ -413,15 +499,21 @@ export class TradingRuntimeManager {
   }
 
   async getManualPositions(accountId: string, symbol: string): Promise<BinanceFuturesPositionStatus[]> {
+    const account = await this.accountRepository.findTradingAccountById(accountId);
+    if (!account) throw new Error("ACCOUNT_NOT_FOUND");
     const client = await this.createAccountClient(accountId);
     if (!client) return [];
-    return readAccountRuntimeData("positions", () => client.getOpenPositions(symbol), this.logger);
+    const positions = await readAccountRuntimeData("positions", () => client.getOpenPositions(symbol), this.logger);
+    return withActivitySource(positions, account);
   }
 
   async getAccountActivity(accountId: string, symbol: string | undefined, limit: number): Promise<AccountActivitySnapshot> {
+    const account = await this.accountRepository.findTradingAccountById(accountId);
+    if (!account) throw new Error("ACCOUNT_NOT_FOUND");
+    const metadata = accountActivityMetadata(account);
     const client = await this.createAccountClient(accountId);
     if (!client) {
-      return { connected: false, positions: [], openOrders: [], orderHistory: [], tradeHistory: [] };
+      return { connected: false, ...metadata, positions: [], openOrders: [], orderHistory: [], tradeHistory: [] };
     }
 
     const [positions, openOrders, orderHistory, tradeHistory] = await Promise.all([
@@ -431,7 +523,14 @@ export class TradingRuntimeManager {
       symbol ? readAccountRuntimeData("trade history", () => client.getTradeHistory(symbol, limit), this.logger) : Promise.resolve([])
     ]);
 
-    return { connected: true, positions, openOrders, orderHistory, tradeHistory };
+    return {
+      connected: true,
+      ...metadata,
+      positions: withActivitySource(positions, account),
+      openOrders: withActivitySource(openOrders, account),
+      orderHistory: withActivitySource(orderHistory, account),
+      tradeHistory: withActivitySource(tradeHistory, account)
+    };
   }
 
   getEngineForTest(accountId: string, symbol: string): TradingEngine | null {
@@ -578,6 +677,27 @@ function ok(): ReadinessCheck {
 
 function fail(reason: string): ReadinessCheck {
   return { ok: false, reason };
+}
+
+function accountActivityMetadata(account: TradingAccount): Pick<AccountActivitySnapshot, "source" | "sourceEnvironment" | "tradingAccountId"> {
+  return {
+    source: "BINANCE_SIGNED_ACCOUNT",
+    sourceEnvironment: account.mode === "DEMO" ? "TESTNET" : "MAINNET",
+    tradingAccountId: account.id
+  };
+}
+
+function withActivitySource<T extends object>(
+  items: T[],
+  account: TradingAccount
+): Array<T & { source: "binance"; sourceEnvironment: "TESTNET" | "MAINNET"; tradingAccountId: string }> {
+  const metadata = accountActivityMetadata(account);
+  return items.map((item) => ({
+    ...item,
+    source: "binance",
+    sourceEnvironment: metadata.sourceEnvironment,
+    tradingAccountId: metadata.tradingAccountId
+  }));
 }
 
 async function readAccountRuntimeData<T>(label: string, read: () => Promise<T[]>, logger: DecisionLogger): Promise<T[]> {

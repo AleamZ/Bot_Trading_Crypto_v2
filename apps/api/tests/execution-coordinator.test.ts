@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ExecutionCoordinator, type ExecutionGateState } from "../src/application/execution/ExecutionCoordinator.js";
 import { resolveExecutionGate } from "../src/application/runtime/TradingRuntimeManager.js";
 import { TradingReconciliationService } from "../src/application/execution/TradingReconciliationService.js";
+import { RealExecutionProposalGateway } from "../src/application/execution/RealExecutionProposalGateway.js";
 import type {
   ExecutionGateway,
   ExecutionOrderContext,
@@ -20,6 +21,8 @@ import { defaultTradingSettings } from "../src/application/config/AppConfig.js";
 import { MarketScanner } from "../src/application/scanner/MarketScanner.js";
 import type { BinanceFuturesMarketData } from "../src/infrastructure/market-data/BinanceFuturesMarketData.js";
 import { MemoryExecutionIntentRepository } from "../src/infrastructure/execution/MemoryExecutionIntentRepository.js";
+import { MemoryRealExecutionProposalRepository } from "../src/infrastructure/execution/MemoryRealExecutionProposalRepository.js";
+import { createExecutionGateway } from "../src/infrastructure/execution/createExecutionGateway.js";
 import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
 import { LockedRealExecutionGateway } from "../src/infrastructure/execution/LockedRealExecutionGateway.js";
 import { isRecoverableExecutionGateway } from "../src/application/ports/ExecutionGateway.js";
@@ -364,6 +367,55 @@ describe("Execution gate", () => {
   });
 });
 
+describe("RealExecutionProposalGateway", () => {
+  it("keeps REAL default LOCKED mode from creating a proposal", async () => {
+    const proposals = new MemoryRealExecutionProposalRepository();
+    const gateway = realProposalGateway(proposals, { realExecutionMode: "LOCKED", tradingEnabled: true });
+
+    await expect(gateway.submitBracketOrder(plan(), risk())).rejects.toThrow("REAL_EXECUTION_MODE_LOCKED");
+    expect(await proposals.listByAccount("account-real")).toHaveLength(0);
+  });
+
+  it("creates a DRY_RUN proposal only and never returns a submitted order", async () => {
+    const proposals = new MemoryRealExecutionProposalRepository();
+    const gateway = realProposalGateway(proposals, { realExecutionMode: "DRY_RUN", tradingEnabled: true });
+
+    await expect(gateway.submitBracketOrder(plan(), risk())).rejects.toThrow("REAL_DRY_RUN_CREATED");
+
+    const saved = await proposals.listByAccount("account-real");
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ status: "DRY_RUN", normalizedQuantity: 10, normalizedStopLoss: 95, normalizedTakeProfit: 110 });
+  });
+
+  it("creates one PENDING proposal in APPROVAL_REQUIRED mode for duplicate setup", async () => {
+    const proposals = new MemoryRealExecutionProposalRepository();
+    const gateway = realProposalGateway(proposals, { realExecutionMode: "APPROVAL_REQUIRED", tradingEnabled: true });
+
+    await expect(gateway.submitBracketOrder(plan(), risk())).rejects.toThrow("APPROVAL_REQUIRED");
+    await expect(gateway.submitBracketOrder(plan(), risk())).rejects.toThrow("APPROVAL_REQUIRED");
+
+    const saved = await proposals.listByAccount("account-real");
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.status).toBe("PENDING");
+  });
+
+  it("blocks proposals when Trading Enabled is off or Kill Switch is on", async () => {
+    const disabled = new MemoryRealExecutionProposalRepository();
+    await expect(realProposalGateway(disabled, { realExecutionMode: "DRY_RUN", tradingEnabled: false }).submitBracketOrder(plan(), risk())).rejects.toThrow("TRADING_DISABLED");
+    expect(await disabled.listByAccount("account-real")).toHaveLength(0);
+
+    const killed = new MemoryRealExecutionProposalRepository();
+    await expect(realProposalGateway(killed, { realExecutionMode: "DRY_RUN", tradingEnabled: true, killSwitch: true }).submitBracketOrder(plan(), risk())).rejects.toThrow("KILL_SWITCH");
+    expect(await killed.listByAccount("account-real")).toHaveLength(0);
+  });
+
+  it("legacy live gateway is locked unless server master lock is enabled", async () => {
+    const gateway = createExecutionGateway(appConfig({ executionMode: "live", binanceApiKey: "KEY", binanceApiSecret: "SECRET", realLiveExecutionEnabled: false }));
+
+    await expect(gateway.submitBracketOrder(plan(), risk())).rejects.toThrow("REAL_EXECUTION_LOCKED");
+  });
+});
+
 describe("TradingReconciliationService", () => {
   it("detects external/manual positions without attaching them to bot intents", async () => {
     const repository = new MemoryExecutionIntentRepository();
@@ -681,6 +733,39 @@ function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     postgresPoolMax: 2,
     ...overrides
   };
+}
+
+function realProposalGateway(proposals: MemoryRealExecutionProposalRepository, overrides: Partial<AppConfig> = {}): RealExecutionProposalGateway {
+  const config = appConfig({ executionMode: "live", marginMode: "ISOLATED", ...overrides });
+  return new RealExecutionProposalGateway({
+    tradingAccountId: "account-real",
+    config: () => config,
+    runtimeReady: () => true,
+    reconciliationHealthy: () => true,
+    binanceConnected: () => true,
+    loadSymbolRules: async () => ({
+      symbol: "BTCUSDT",
+      status: "TRADING",
+      contractType: "PERPETUAL",
+      quoteAsset: "USDT",
+      marginAsset: "USDT",
+      pricePrecision: 1,
+      quantityPrecision: 3,
+      tickSize: 0.1,
+      minPrice: 0.1,
+      maxPrice: null,
+      stepSize: 0.001,
+      minQty: 0.001,
+      maxQty: 100,
+      minNotional: 5,
+      maxLeverage: 125,
+      supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    }),
+    loadAvailableBalance: async () => 10_000,
+    proposalRepository: proposals,
+    auditRepository: new MemoryExecutionIntentRepository(),
+    logger: fakeLogger()
+  });
 }
 
 function plan(): EntryPlan {

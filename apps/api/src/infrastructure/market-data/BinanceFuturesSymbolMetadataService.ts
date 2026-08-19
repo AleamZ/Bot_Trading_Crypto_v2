@@ -22,7 +22,7 @@ export class BinanceFuturesSymbolMetadataService {
       return withMaxLeverage(cached.rules, await readMaxLeverage(symbol, loadLeverageBrackets));
     }
 
-    const baseUrl = environment === "testnet" ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
+    const baseUrl = environment === "testnet" ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
     const url = new URL("/fapi/v1/exchangeInfo", baseUrl);
     url.searchParams.set("symbol", symbol);
     const response = await this.fetchFn(url);

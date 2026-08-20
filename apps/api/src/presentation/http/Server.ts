@@ -7,6 +7,7 @@ import { InvalidTradingAccountInputError, TradingAccountNotFoundError, UnsafeTra
 import { BinanceVerificationError } from "../../application/trading-account/BinanceAccountVerifier.js";
 import type { TradingRuntimeManager } from "../../application/runtime/TradingRuntimeManager.js";
 import type { TradingEngine } from "../../application/engine/TradingEngine.js";
+import type { SetupDiagnostic } from "../../application/engine/TradingEngine.js";
 import type { MarketScanner } from "../../application/scanner/MarketScanner.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
 import type { DecisionLogger } from "../../application/ports/Logger.js";
@@ -717,7 +718,8 @@ async function handleTradingAccountRoute(params: {
     const account = await service.getOwnedAccount(userId, accountId);
     const query = parseAccountActivityQuery(requestUrl, config.symbol);
     const settings = await service.getSettings(userId, accountId);
-    sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketDataForAccount(account, marketData)), corsHeaders);
+    const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, query.symbol) : null;
+    sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketDataForAccount(account, marketData), diagnostic), corsHeaders);
     return;
   }
 
@@ -1127,7 +1129,7 @@ interface AnalysisSetupContext {
   invalidatedReason: string | null;
 }
 
-async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData: BinanceFuturesMarketData): Promise<{
+export async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData: BinanceFuturesMarketData, canonicalSetup: SetupDiagnostic | null = null): Promise<{
   symbol: string;
   checkedAt: string;
   setupState: AnalysisSetupState;
@@ -1153,7 +1155,7 @@ async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData
     marketData.getClosedCandles(symbol, "M5", 360)
   ]);
   const trend = detectH1Trend(h1Candles, config.emaPeriod);
-  const setup = buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config);
+  const setup = canonicalSetup?.symbol === symbol && canonicalSetup.setupKey ? setupFromDiagnostic(symbol, canonicalSetup) : buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config);
   const conditions = buildLifecycleConditions(setup, config);
   const riskManagement = buildAnalysisRiskManagement(setup, config);
 
@@ -1173,6 +1175,46 @@ async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData
     riskManagement,
     plan: setup.plan
   };
+}
+
+function setupFromDiagnostic(symbol: string, diagnostic: SetupDiagnostic): AnalysisSetupContext {
+  const htfFvg = diagnostic.htfFvg;
+  const ltfFvg = diagnostic.ltfFvg;
+  const htfMitigatedAt = htfFvg?.mitigatedAt ?? null;
+  const ltfMitigatedAt = ltfFvg?.mitigatedAt ?? null;
+  const state = analysisStateFromDiagnostic(diagnostic);
+  return {
+    id: diagnostic.setupKey ?? `${symbol}:runtime`,
+    state,
+    direction: diagnostic.trend === "neutral" ? htfFvg?.direction ?? null : diagnostic.trend,
+    trendReason: diagnostic.trend === "neutral" ? "Runtime has no active EMA trend" : `Runtime scanner trend is ${diagnostic.trend}`,
+    htfFvg,
+    htfMitigatedAt,
+    signal: diagnostic.ltfSignal,
+    ltfFvg,
+    ltfMitigatedAt,
+    plan: diagnostic.invariantOk ? diagnostic.entryPlan : null,
+    entryDetail: diagnostic.invariantOk ? null : "Runtime setup is missing required ReadyToEnter evidence",
+    invalidatedConditionId: diagnostic.state === "Archived" ? invalidatedConditionFromDiagnostic(diagnostic) : null,
+    invalidatedReason: diagnostic.state === "Archived" ? "Runtime scanner archived the previous setup" : null
+  };
+}
+
+function analysisStateFromDiagnostic(diagnostic: SetupDiagnostic): AnalysisSetupState {
+  if (diagnostic.state === "Archived") return "INVALIDATED";
+  if (!diagnostic.htfFvg) return diagnostic.trend === "neutral" ? "WAITING_HTF_CONTEXT" : "WAITING_HTF_FVG";
+  if (!diagnostic.htfFvg.mitigatedAt) return "WAITING_HTF_MITIGATION";
+  if (!diagnostic.ltfSignal) return "WAITING_M5_BOS";
+  if (!diagnostic.ltfFvg) return "WAITING_M5_FVG";
+  if (!diagnostic.ltfFvg.mitigatedAt) return "WAITING_M5_PULLBACK";
+  if (diagnostic.entryPlan && diagnostic.invariantOk) return "READY_TO_ENTRY";
+  return "WAITING_M5_PULLBACK";
+}
+
+function invalidatedConditionFromDiagnostic(diagnostic: SetupDiagnostic): string {
+  if (diagnostic.ltfFvg?.status === "invalidated") return "m5-fvg-pullback";
+  if (diagnostic.htfFvg?.status === "invalidated") return "htf-fvg-mitigated";
+  return "entry-plan";
 }
 
 function buildAnalysisLifecycle(
@@ -1220,6 +1262,8 @@ function processAnalysisH1Candle(
   config: AppConfig
 ): { setup: AnalysisSetupContext; invalidated: AnalysisSetupContext | null } {
   const trend = detectH1Trend(h1Candles, config.emaPeriod);
+  let invalidatedSetup: AnalysisSetupContext | null = null;
+  let invalidatedHtfFvgId: string | null = null;
   if (trend.direction !== "neutral" && setup.direction && setup.direction !== trend.direction) {
     setup = {
       ...createEmptyAnalysisSetup(candle.symbol),
@@ -1231,8 +1275,9 @@ function processAnalysisH1Candle(
 
   if (setup.htfFvg && ["WAITING_HTF_MITIGATION", "WAITING_M5_BOS", "WAITING_M5_FVG", "WAITING_M5_PULLBACK"].includes(setup.state)) {
     if (isFvgInvalidated(setup.htfFvg, candle)) {
-      const invalidated = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated bởi H1 close phá boundary đối diện");
-      return { setup: createEmptyAnalysisSetup(candle.symbol), invalidated };
+      invalidatedHtfFvgId = setup.htfFvg.id;
+      invalidatedSetup = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated bởi H1 close phá boundary đối diện");
+      setup = createEmptyAnalysisSetup(candle.symbol);
     }
   }
 
@@ -1252,7 +1297,7 @@ function processAnalysisH1Candle(
 
   if (setup.state === "WAITING_HTF_FVG" && setup.direction) {
     const htfFvg = detectLatestHtfFvg(h1Candles, setup.direction);
-    if (htfFvg) {
+    if (htfFvg && htfFvg.id !== invalidatedHtfFvgId) {
       setup = {
         ...setup,
         id: htfFvg.id,
@@ -1264,8 +1309,27 @@ function processAnalysisH1Candle(
 
   if (setup.state === "WAITING_HTF_MITIGATION" && setup.htfFvg) {
     if (isFvgInvalidated(setup.htfFvg, candle)) {
-      const invalidated = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated trước khi mitigation");
-      return { setup: createEmptyAnalysisSetup(candle.symbol), invalidated };
+      invalidatedHtfFvgId = setup.htfFvg.id;
+      invalidatedSetup = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated trước khi mitigation");
+      setup = createEmptyAnalysisSetup(candle.symbol);
+      if (trend.direction !== "neutral") {
+        setup = {
+          ...setup,
+          state: "WAITING_HTF_FVG",
+          direction: trend.direction,
+          trendReason: trend.reason
+        };
+        const htfFvg = detectLatestHtfFvg(h1Candles, trend.direction);
+        if (htfFvg && htfFvg.id !== invalidatedHtfFvgId) {
+          setup = {
+            ...setup,
+            id: htfFvg.id,
+            state: "WAITING_HTF_MITIGATION",
+            htfFvg
+          };
+        }
+      }
+      return { setup, invalidated: invalidatedSetup };
     }
 
     if (isFvgMitigated(setup.htfFvg, candle, config.fvgMitigation)) {
@@ -1277,7 +1341,7 @@ function processAnalysisH1Candle(
     }
   }
 
-  return { setup, invalidated: null };
+  return { setup, invalidated: invalidatedSetup };
 }
 
 function processAnalysisM5Candle(

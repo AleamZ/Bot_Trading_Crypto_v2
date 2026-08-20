@@ -25,6 +25,7 @@ import { DisabledExecutionGateway } from "../../infrastructure/execution/Disable
 import type { ExecutionGateway, ExecutionOrderContext, ExecutionOrderLookupResult, ProtectionOrderRequest, RecoverableExecutionGateway, SubmittedOrder } from "../ports/ExecutionGateway.js";
 import { isRecoverableExecutionGateway } from "../ports/ExecutionGateway.js";
 import type { TradingEngine } from "../engine/TradingEngine.js";
+import type { SetupDiagnostic } from "../engine/TradingEngine.js";
 import type { TradingAccount } from "../../domain/trading-account/TradingAccount.js";
 import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
@@ -572,6 +573,11 @@ export class TradingRuntimeManager {
 
   getEngineForTest(accountId: string, symbol: string): TradingEngine | null {
     return this.runtimes.get(accountId)?.scanner.getEngine(symbol) ?? null;
+  }
+
+  async getSetupDiagnostic(accountId: string, symbol: string): Promise<SetupDiagnostic | null> {
+    const runtime = await this.ensureRuntime(accountId);
+    return runtime.scanner.getSetupDiagnostic(symbol);
   }
 
   private async createExecutionGateway(account: TradingAccount, entryMode: "limit" | "market", leverage: number): Promise<ExecutionGateway> {

@@ -1,5 +1,5 @@
 import type { AppConfig } from "../config/AppConfig.js";
-import { TradingEngine, type AvailableBalanceProvider } from "../engine/TradingEngine.js";
+import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type SetupDiagnostic } from "../engine/TradingEngine.js";
 import type { ExecutionGateway } from "../ports/ExecutionGateway.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { TradingRepository } from "../ports/Repositories.js";
@@ -19,6 +19,7 @@ export interface WatchlistStatus {
 export class MarketScanner {
   private readonly engines = new Map<string, TradingEngine>();
   private readonly lastCloseTime = new Map<string, number>();
+  private readonly lastScanTime = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   private scanning = false;
 
@@ -44,19 +45,24 @@ export class MarketScanner {
     return this.engines.get(symbol) ?? null;
   }
 
+  getSetupDiagnostic(symbol: string): SetupDiagnostic | null {
+    return this.engines.get(symbol)?.getSetupDiagnostic() ?? null;
+  }
+
   getWatchlistStatus(): WatchlistStatus[] {
     return [...this.engines.entries()].map(([symbol, engine]) => {
       const state = engine.getState();
       const pending = state.pendingEntryPlan;
-      const passed = conditionsPassed(state.setupState);
+      const diagnostic = engine.getSetupDiagnostic();
+      const passed = state.setupState === "Archived" ? 0 : countSetupEvidence(state.setupEvidence);
       return {
         symbol,
         state: state.setupState,
         conditions: `${passed}/7`,
         rr: pending?.riskReward ?? state.activeRisk?.riskReward ?? null,
         position: positionFromState(state.openPositions, this.config.executionMode),
-        status: statusFromState(state.setupState, this.config.executionMode),
-        lastScanAt: this.lastCloseTime.has(symbol) ? new Date(this.lastCloseTime.get(symbol) ?? 0).toISOString() : null
+        status: statusFromState(state.setupState, this.config.executionMode, diagnostic.invariantOk),
+        lastScanAt: this.lastScanTime.has(symbol) ? new Date(this.lastScanTime.get(symbol) ?? 0).toISOString() : null
       };
     });
   }
@@ -71,7 +77,9 @@ export class MarketScanner {
       const engine = this.engines.get(symbol);
       if (!config.watchlist.includes(symbol) && engine?.getState().openPositions === 0) {
         this.engines.delete(symbol);
-        this.lastCloseTime.delete(symbol);
+        this.lastCloseTime.delete(closeTimeKey(symbol, "H1"));
+        this.lastCloseTime.delete(closeTimeKey(symbol, "M5"));
+        this.lastScanTime.delete(symbol);
       }
     }
   }
@@ -110,16 +118,22 @@ export class MarketScanner {
 
   private async scanSymbol(symbol: string, bootstrap: boolean): Promise<void> {
     const engine = this.engines.get(symbol) ?? this.createEngine(symbol);
+    this.lastScanTime.set(symbol, Date.now());
     const [h1, m5] = await Promise.all([
       this.marketData.getClosedCandles(symbol, "H1", Math.max(this.config.emaPeriod + 10, 80)),
       this.marketData.getClosedCandles(symbol, "M5", bootstrap ? 300 : 20)
     ]);
-    const minCloseTime = bootstrap ? 0 : this.lastCloseTime.get(symbol) ?? 0;
-    const candles = [...h1, ...m5].filter((candle) => candle.closeTime > minCloseTime).sort((a, b) => a.closeTime - b.closeTime);
+    const h1MinCloseTime = bootstrap ? 0 : this.lastCloseTime.get(closeTimeKey(symbol, "H1")) ?? 0;
+    const m5MinCloseTime = bootstrap ? 0 : this.lastCloseTime.get(closeTimeKey(symbol, "M5")) ?? 0;
+    const candles = [
+      ...h1.filter((candle) => candle.closeTime > h1MinCloseTime),
+      ...m5.filter((candle) => candle.closeTime > m5MinCloseTime)
+    ].sort((a, b) => a.closeTime - b.closeTime);
 
     for (const candle of candles) {
       await engine.onClosedCandle(candle);
-      this.lastCloseTime.set(symbol, Math.max(this.lastCloseTime.get(symbol) ?? 0, candle.closeTime));
+      const key = closeTimeKey(symbol, candle.timeframe);
+      this.lastCloseTime.set(key, Math.max(this.lastCloseTime.get(key) ?? 0, candle.closeTime));
     }
 
     this.logger.info(`[SCANNER] ${symbol} -> ${engine.getState().setupState}`);
@@ -133,23 +147,8 @@ export class MarketScanner {
   }
 }
 
-function conditionsPassed(state: string): number {
-  const rank: Record<string, number> = {
-    WaitingTrend: 0,
-    TrendConfirmed: 1,
-    FVGDetected: 2,
-    WaitingMitigation: 2,
-    MonitoringLTF: 3,
-    WaitingCHOCH: 3,
-    WaitingLtfFvg: 4,
-    WaitingLtfMitigation: 5,
-    ReadyToEnter: 7,
-    PositionOpened: 7,
-    ManagingTrade: 7,
-    Closed: 7,
-    Archived: 0
-  };
-  return rank[state] ?? 0;
+function closeTimeKey(symbol: string, timeframe: Candle["timeframe"]): string {
+  return `${symbol}:${timeframe}`;
 }
 
 function positionFromState(openPositions: number, executionMode: string): "None" | "Open" | "Paper" {
@@ -157,8 +156,8 @@ function positionFromState(openPositions: number, executionMode: string): "None"
   return executionMode === "paper" ? "Paper" : "Open";
 }
 
-function statusFromState(state: string, executionMode: string): string {
-  if (state === "ReadyToEnter") return "Ready";
+function statusFromState(state: string, executionMode: string, invariantOk: boolean): string {
+  if (state === "ReadyToEnter") return invariantOk ? "Ready" : "Monitoring";
   if (state === "PositionOpened" || state === "ManagingTrade") return executionMode === "paper" ? "Simulated" : "Active";
   if (state === "Archived") return "Invalidated";
   return "Monitoring";

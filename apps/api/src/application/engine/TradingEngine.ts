@@ -33,9 +33,32 @@ export interface EngineState {
   pendingLtfFvg: Fvg | null;
   pendingEntryPlan: EntryPlan | null;
   activeRisk: RiskDecision | null;
+  setupEvidence: SetupEvidence;
 }
 
 export type AvailableBalanceProvider = () => Promise<number | null>;
+
+export interface SetupEvidence {
+  htfFvg: Fvg | null;
+  htfMitigatedAt: number | null;
+  ltfSignal: MarketStructureSignal | null;
+  ltfFvg: Fvg | null;
+  ltfMitigatedAt: number | null;
+  entryPlan: EntryPlan | null;
+}
+
+export interface SetupDiagnostic {
+  symbol: string;
+  state: SetupState;
+  setupKey: string | null;
+  trend: Direction | "neutral";
+  htfFvg: (Fvg & { mitigatedAt: number | null }) | null;
+  ltfSignal: MarketStructureSignal | null;
+  ltfFvg: (Fvg & { mitigatedAt: number | null }) | null;
+  entryPlan: EntryPlan | null;
+  evidenceCount: number;
+  invariantOk: boolean;
+}
 
 export class TradingEngine {
   readonly events: EventBus;
@@ -65,7 +88,8 @@ export class TradingEngine {
       pendingSignal: null,
       pendingLtfFvg: null,
       pendingEntryPlan: null,
-      activeRisk: null
+      activeRisk: null,
+      setupEvidence: emptySetupEvidence()
     };
   }
 
@@ -98,6 +122,31 @@ export class TradingEngine {
     };
   }
 
+  getSetupDiagnostic(): SetupDiagnostic {
+    const evidence = this.state.setupEvidence;
+    const setupKey = [
+      this.config.symbol,
+      this.state.trend,
+      evidence.htfFvg?.id ?? "-",
+      evidence.ltfSignal?.id ?? "-",
+      evidence.ltfFvg?.id ?? "-",
+      evidence.entryPlan ? numberKey(evidence.entryPlan.entry) : "-"
+    ].join(":");
+    const evidenceCount = countSetupEvidence(evidence);
+    return {
+      symbol: this.config.symbol,
+      state: this.state.setupState,
+      setupKey: evidence.htfFvg || evidence.ltfSignal || evidence.ltfFvg || evidence.entryPlan ? setupKey : null,
+      trend: this.state.trend,
+      htfFvg: evidence.htfFvg ? { ...evidence.htfFvg, mitigatedAt: evidence.htfMitigatedAt } : null,
+      ltfSignal: evidence.ltfSignal,
+      ltfFvg: evidence.ltfFvg ? { ...evidence.ltfFvg, mitigatedAt: evidence.ltfMitigatedAt } : null,
+      entryPlan: evidence.entryPlan,
+      evidenceCount,
+      invariantOk: this.state.setupState !== "ReadyToEnter" || evidenceCount === 7
+    };
+  }
+
   async onClosedCandle(candle: Candle): Promise<void> {
     if (!candle.isClosed) return;
     if (candle.symbol !== this.config.symbol) return;
@@ -114,27 +163,43 @@ export class TradingEngine {
 
   private async processH1(candle: Candle): Promise<void> {
     const trend = detectH1Trend(this.state.h1Candles, this.config.emaPeriod);
-    if (trend.direction !== "neutral" && trend.direction !== this.state.trend) {
+
+    if (trend.direction !== "neutral") {
+      const trendChanged = trend.direction !== this.state.trend;
       this.state.trend = trend.direction;
-      this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "TrendConfirmed");
-      await this.events.publish({
-        type: "TrendChanged",
-        at: candle.closeTime,
-        symbol: candle.symbol,
-        direction: trend.direction,
-        reason: trend.reason
-      });
+      if (this.state.setupState === "WaitingTrend") {
+        this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "TrendConfirmed");
+      }
+      if (trendChanged) {
+        await this.events.publish({
+          type: "TrendChanged",
+          at: candle.closeTime,
+          symbol: candle.symbol,
+          direction: trend.direction,
+          reason: trend.reason
+        });
+      }
+    } else {
+      this.state.trend = "neutral";
     }
 
     if (this.state.trend === "neutral") return;
 
+    let invalidatedFvgId: string | null = null;
+
     const existingFvg = await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1");
     if (existingFvg) {
+      if (this.state.setupState === "Archived") {
+        this.resetArchivedSetup(trend.direction);
+      }
+      this.state.setupEvidence.htfFvg = existingFvg;
       this.syncSetupStateWithHtfFvg(existingFvg);
 
       if (isFvgInvalidated(existingFvg, candle)) {
         const invalidated = { ...existingFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
+        invalidatedFvgId = invalidated.id;
         await this.repository.updateFvg(invalidated);
+        this.state.setupEvidence.htfFvg = invalidated;
         this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
         await this.events.publish({
           type: "FVGInvalidated",
@@ -142,12 +207,11 @@ export class TradingEngine {
           fvg: invalidated,
           reason: "Closed candle fully crossed the opposite FVG boundary"
         });
-        return;
-      }
-
-      if (existingFvg.status === "waiting-mitigation" && isFvgMitigated(existingFvg, candle, this.config.fvgMitigation)) {
+      } else if (existingFvg.status === "waiting-mitigation" && isFvgMitigated(existingFvg, candle, this.config.fvgMitigation)) {
         const active = { ...existingFvg, status: "active" as const, activatedAt: candle.closeTime };
         await this.repository.updateFvg(active);
+        this.state.setupEvidence.htfFvg = active;
+        this.state.setupEvidence.htfMitigatedAt = candle.closeTime;
         this.syncSetupStateWithHtfFvg(active);
         await this.events.publish({
           type: "FVGActivated",
@@ -155,14 +219,20 @@ export class TradingEngine {
           fvg: active,
           reason: `FVG mitigation mode ${this.config.fvgMitigation} was met`
         });
+        return;
+      } else {
+        return;
       }
-      return;
     }
 
     const fvg = detectLatestHtfFvg(this.state.h1Candles, this.state.trend);
-    if (!fvg) return;
+    if (!fvg || fvg.id === invalidatedFvgId) return;
 
+    if (this.state.setupState === "Archived") {
+      this.resetArchivedSetup(trend.direction);
+    }
     await this.repository.saveFvg(fvg);
+    this.state.setupEvidence = { ...emptySetupEvidence(), htfFvg: fvg };
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "FVGDetected");
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingMitigation");
     await this.events.publish({
@@ -174,6 +244,10 @@ export class TradingEngine {
   }
 
   private async processM5(candle: Candle): Promise<void> {
+    if (this.state.setupState === "ReadyToEnter") {
+      await this.processReadyToEnterM5Invalidation(candle);
+      return;
+    }
     if (!["MonitoringLTF", "WaitingCHOCH", "WaitingLtfFvg", "WaitingLtfMitigation"].includes(this.state.setupState)) return;
 
     const htfFvg = await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1");
@@ -192,6 +266,7 @@ export class TradingEngine {
       }
 
       this.state.pendingSignal = signal;
+      this.state.setupEvidence.ltfSignal = signal;
       await this.repository.saveSignal(signal);
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingCHOCH");
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingLtfFvg");
@@ -210,6 +285,7 @@ export class TradingEngine {
 
       await this.repository.saveFvg(ltfFvg);
       this.state.pendingLtfFvg = ltfFvg;
+      this.state.setupEvidence.ltfFvg = ltfFvg;
       this.state.pendingEntryPlan = this.calculatePlanForLtfFvg(ltfFvg);
       if (!this.state.pendingEntryPlan) {
         this.logger.warn("Pending M5 FVG ignored", { reason: "Could not build entry plan from M5 FVG" });
@@ -228,6 +304,7 @@ export class TradingEngine {
     if (isFvgInvalidated(this.state.pendingLtfFvg, candle)) {
       const invalidated = { ...this.state.pendingLtfFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
       await this.repository.updateFvg(invalidated);
+      this.state.setupEvidence.ltfFvg = invalidated;
       this.state.pendingSignal = null;
       this.state.pendingLtfFvg = null;
       this.state.pendingEntryPlan = null;
@@ -246,6 +323,8 @@ export class TradingEngine {
     const activeLtfFvg = { ...this.state.pendingLtfFvg, status: "active" as const, activatedAt: candle.closeTime };
     await this.repository.updateFvg(activeLtfFvg);
     this.state.pendingLtfFvg = activeLtfFvg;
+    this.state.setupEvidence.ltfFvg = activeLtfFvg;
+    this.state.setupEvidence.ltfMitigatedAt = candle.closeTime;
     await this.events.publish({
       type: "FVGActivated",
       at: candle.closeTime,
@@ -262,6 +341,7 @@ export class TradingEngine {
       return;
     }
 
+    this.state.setupEvidence.entryPlan = plan;
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "ReadyToEnter");
     const availableBalance = await this.getAvailableBalance();
     const risk = evaluateRisk({
@@ -402,6 +482,41 @@ export class TradingEngine {
       this.state.setupState = advanceSetupState(this.state.setupState, "MonitoringLTF");
     }
   }
+
+  private async processReadyToEnterM5Invalidation(candle: Candle): Promise<void> {
+    const ltfFvg = this.state.setupEvidence.ltfFvg;
+    if (this.state.openPositions > 0 || !ltfFvg || ltfFvg.status === "invalidated") return;
+    if (!isFvgInvalidated(ltfFvg, candle)) return;
+
+    const invalidated = { ...ltfFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
+    await this.repository.updateFvg(invalidated);
+    this.state.setupEvidence.ltfFvg = invalidated;
+    this.state.pendingSignal = null;
+    this.state.pendingLtfFvg = null;
+    this.state.pendingEntryPlan = null;
+    this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
+    await this.events.publish({
+      type: "FVGInvalidated",
+      at: candle.closeTime,
+      fvg: invalidated,
+      reason: "M5 entry FVG was invalidated after ready state before position opened"
+    });
+  }
+
+  private resetArchivedSetup(direction: Direction | "neutral"): void {
+    this.state.setupState = "WaitingTrend";
+    this.state.trend = direction;
+    this.state.pendingSignal = null;
+    this.state.pendingLtfFvg = null;
+    this.state.pendingEntryPlan = null;
+    this.state.setupEvidence = emptySetupEvidence();
+    if (this.state.openPositions === 0) {
+      this.state.activeRisk = null;
+    }
+    if (direction !== "neutral") {
+      this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "TrendConfirmed");
+    }
+  }
 }
 
 function isDisplacementSignal(
@@ -422,6 +537,30 @@ function isDisplacementSignal(
   const body = Math.abs(signalCandle.close - signalCandle.open);
   const strongClose = signal.direction === "bullish" ? signalCandle.close > signalCandle.open : signalCandle.close < signalCandle.open;
   return strongClose && body >= averageBody * bodyMultiplier;
+}
+
+function emptySetupEvidence(): SetupEvidence {
+  return {
+    htfFvg: null,
+    htfMitigatedAt: null,
+    ltfSignal: null,
+    ltfFvg: null,
+    ltfMitigatedAt: null,
+    entryPlan: null
+  };
+}
+
+export function countSetupEvidence(evidence: SetupEvidence): number {
+  if (!evidence.htfFvg) return 0;
+  if (!evidence.htfMitigatedAt) return 2;
+  if (!evidence.ltfSignal) return 3;
+  if (!evidence.ltfFvg) return 4;
+  if (!evidence.ltfMitigatedAt) return 5;
+  return evidence.entryPlan ? 7 : 6;
+}
+
+function numberKey(value: number): string {
+  return Number(value).toFixed(8).replace(/\.?0+$/, "");
 }
 
 function transitionSetupStateIfPossible(current: SetupState, next: SetupState): SetupState {

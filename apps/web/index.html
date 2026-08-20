@@ -276,8 +276,11 @@
 
         <section class="panel">
           <div class="panel-head">
-            <h2>Decision Log</h2>
-            <span id="event-count">0 events</span>
+            <h2>Recent Activities</h2>
+            <div class="panel-actions">
+              <span id="event-count">0 events</span>
+              <button id="view-all-events" type="button">View all</button>
+            </div>
           </div>
           <ol id="events"></ol>
         </section>
@@ -747,6 +750,24 @@
           <button id="cancel-delete-account-button" type="button">Cancel</button>
           <button id="confirm-delete-account-button" type="button" disabled>Permanently Delete Account</button>
         </div>
+      </section>
+    </div>
+    <div class="modal-backdrop" id="decision-log-modal" hidden>
+      <section class="modal-panel decision-log-panel" role="dialog" aria-modal="true" aria-labelledby="decision-log-title">
+        <div class="decision-log-header">
+          <div>
+            <h2 id="decision-log-title">Decision Log</h2>
+            <p id="decision-log-summary">All available bot events</p>
+          </div>
+          <button id="close-decision-log" type="button">Close</button>
+        </div>
+        <div class="decision-log-filters">
+          <label for="event-symbol-filter">Symbol</label>
+          <select id="event-symbol-filter"></select>
+          <label for="event-type-filter">Event type</label>
+          <select id="event-type-filter"></select>
+        </div>
+        <ol class="decision-log-list" id="all-events"></ol>
       </section>
     </div>
     <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>

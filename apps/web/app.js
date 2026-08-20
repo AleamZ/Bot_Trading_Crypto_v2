@@ -20,6 +20,11 @@ const accountState = {
   lastConnection: null,
   lastBinanceAccount: null,
 };
+const activityState = {
+  events: [],
+  symbolFilter: "all",
+  typeFilter: "all",
+};
 const defaultSettings = {
   watchlist: "",
   positionSizingMode: "fixed-margin",
@@ -103,6 +108,16 @@ $("delete-account-button").addEventListener("click", openDeleteAccountModal);
 $("cancel-delete-account-button").addEventListener("click", closeDeleteAccountModal);
 $("delete-account-confirm-input").addEventListener("input", updateDeleteAccountConfirmState);
 $("confirm-delete-account-button").addEventListener("click", deleteActiveAccount);
+$("view-all-events").addEventListener("click", openDecisionLogModal);
+$("close-decision-log").addEventListener("click", closeDecisionLogModal);
+$("event-symbol-filter").addEventListener("change", (event) => {
+  activityState.symbolFilter = event.target.value;
+  renderDecisionLogModal();
+});
+$("event-type-filter").addEventListener("change", (event) => {
+  activityState.typeFilter = event.target.value;
+  renderDecisionLogModal();
+});
 $("show-register").addEventListener("click", () => showAuthForm("register"));
 $("show-login").addEventListener("click", () => showAuthForm("login"));
 $("login-form").addEventListener("submit", (event) => {
@@ -632,21 +647,121 @@ async function load() {
       ].join(" · ")
     : "Risk manager has not run";
 
-  $("event-count").textContent = `${store.events?.length ?? 0} events`;
-  const events = $("events");
-  events.replaceChildren(
-    ...(store.events ?? []).toReversed().map((event) => {
-      const item = document.createElement("li");
-      const title = document.createElement("strong");
-      const detail = document.createElement("code");
-      title.textContent = event.type;
-      detail.textContent = event.reason ?? JSON.stringify(event);
-      item.append(title, detail);
-      return item;
-    }),
-  );
+  activityState.events = Array.isArray(store.events) ? store.events : [];
+  renderRecentActivities();
+  if (!$("decision-log-modal").hidden) {
+    renderDecisionLogFilters();
+    renderDecisionLogModal();
+  }
 
   renderWatchlist(snapshot.watchlistRows ?? []);
+}
+
+function renderRecentActivities() {
+  const recent = [...activityState.events].toReversed().slice(0, 8);
+  $("event-count").textContent = `${recent.length} recent · ${activityState.events.length} total`;
+  $("view-all-events").disabled = activityState.events.length === 0;
+  $("events").replaceChildren(
+    ...(recent.length > 0 ? recent.map((event) => eventListItem(event, { compact: true })) : [emptyEventItem("No recent activities")]),
+  );
+}
+
+function openDecisionLogModal() {
+  activityState.symbolFilter = "all";
+  activityState.typeFilter = "all";
+  renderDecisionLogFilters();
+  renderDecisionLogModal();
+  $("decision-log-modal").hidden = false;
+}
+
+function closeDecisionLogModal() {
+  $("decision-log-modal").hidden = true;
+}
+
+function renderDecisionLogFilters() {
+  fillSelect("event-symbol-filter", ["all", ...uniqueEventValues((event) => eventSymbol(event))], activityState.symbolFilter);
+  fillSelect("event-type-filter", ["all", ...uniqueEventValues((event) => eventType(event))], activityState.typeFilter);
+}
+
+function renderDecisionLogModal() {
+  const filtered = [...activityState.events]
+    .toReversed()
+    .filter((event) => activityState.symbolFilter === "all" || eventSymbol(event) === activityState.symbolFilter)
+    .filter((event) => activityState.typeFilter === "all" || eventType(event) === activityState.typeFilter);
+  $("decision-log-summary").textContent = `${filtered.length} shown · ${activityState.events.length} total`;
+  $("all-events").replaceChildren(
+    ...(filtered.length > 0
+      ? filtered.map((event) => eventListItem(event, { compact: false }))
+      : [emptyEventItem("No events match the selected filters")]),
+  );
+}
+
+function fillSelect(id, values, selected) {
+  const select = $(id);
+  const selectedValue = values.includes(selected) ? selected : "all";
+  select.replaceChildren(
+    ...values.map((value) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value === "all" ? "All" : value;
+      option.selected = value === selectedValue;
+      return option;
+    }),
+  );
+  if (selectedValue !== selected) {
+    if (id === "event-symbol-filter") activityState.symbolFilter = selectedValue;
+    if (id === "event-type-filter") activityState.typeFilter = selectedValue;
+  }
+}
+
+function uniqueEventValues(selector) {
+  return [...new Set(activityState.events.map(selector).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+function eventListItem(event, options) {
+  const item = document.createElement("li");
+  item.className = options.compact ? "activity-item compact" : "activity-item";
+  const titleRow = document.createElement("div");
+  titleRow.className = "activity-title-row";
+  const title = document.createElement("strong");
+  const meta = document.createElement("span");
+  const detail = document.createElement("code");
+  title.textContent = eventType(event);
+  meta.textContent = [eventSymbol(event), eventTimestamp(event)].filter(Boolean).join(" · ");
+  detail.textContent = eventDescription(event);
+  titleRow.append(title, meta);
+  item.append(titleRow, detail);
+  return item;
+}
+
+function emptyEventItem(message) {
+  const item = document.createElement("li");
+  item.className = "activity-item";
+  const detail = document.createElement("span");
+  detail.textContent = message;
+  item.append(detail);
+  return item;
+}
+
+function eventType(event) {
+  return String(event?.type ?? "UnknownEvent");
+}
+
+function eventSymbol(event) {
+  return String(event?.symbol ?? event?.fvg?.symbol ?? event?.signal?.symbol ?? event?.decision?.symbol ?? "");
+}
+
+function eventTimestamp(event) {
+  const timestamp = event?.at ?? event?.timestamp ?? event?.createdAt ?? null;
+  return timestamp ? new Date(timestamp).toLocaleString() : "";
+}
+
+function eventDescription(event) {
+  if (event?.reason) return String(event.reason);
+  if (event?.decision?.reason) return String(event.decision.reason);
+  if (event?.fvg) return `${event.fvg.direction ?? "-"} ${event.fvg.timeframe ?? "-"} FVG ${formatPrice(event.fvg.lower)} - ${formatPrice(event.fvg.upper)}`;
+  if (event?.signal) return `${event.signal.type ?? "-"} ${event.signal.direction ?? "-"} at ${formatPrice(event.signal.close)}`;
+  return JSON.stringify(event);
 }
 
 function startHomePolling() {

@@ -1003,6 +1003,7 @@ async function ensureChart() {
     orderHistoryCount: $("order-history-count"),
     tradeHistoryCount: $("trade-history-count"),
     tabButtons: [...document.querySelectorAll("[data-account-tab]")],
+    hideOtherSymbolsInput: $("hide-other-symbols"),
   });
 }
 

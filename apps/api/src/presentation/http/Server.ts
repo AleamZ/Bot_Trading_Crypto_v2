@@ -182,7 +182,7 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
 
       if (requestUrl.pathname === "/api/binance/account-activity") {
         const query = parseAccountActivityQuery(requestUrl, runtimeConfig.symbol);
-        const activity = await getAccountActivity(accountClient, query.symbol, query.limit, params.logger);
+        const activity = await getAccountActivity(accountClient, query.symbol ?? runtimeConfig.symbol, query.limit, params.logger);
         response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify({ symbol: query.symbol, limit: query.limit, ...activity }));
         return;
@@ -253,7 +253,8 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
 
       if (requestUrl.pathname === "/api/analysis") {
         const query = parseAccountActivityQuery(requestUrl, runtimeConfig.symbol);
-        const analysis = await buildSymbolAnalysis(query.symbol, runtimeConfig, marketData);
+        const symbol = query.symbol ?? runtimeConfig.symbol;
+        const analysis = await buildSymbolAnalysis(symbol, runtimeConfig, marketData);
         response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
         response.end(JSON.stringify(analysis));
         return;
@@ -717,9 +718,10 @@ async function handleTradingAccountRoute(params: {
   if (child === "analysis" && parts.length === 4 && request.method === "GET") {
     const account = await service.getOwnedAccount(userId, accountId);
     const query = parseAccountActivityQuery(requestUrl, config.symbol);
+    const symbol = query.symbol ?? config.symbol;
     const settings = await service.getSettings(userId, accountId);
-    const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, query.symbol) : null;
-    sendJson(response, 200, await buildSymbolAnalysis(query.symbol, { ...config, ...settings, symbol: query.symbol }, marketDataForAccount(account, marketData), diagnostic), corsHeaders);
+    const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol) : null;
+    sendJson(response, 200, await buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, marketDataForAccount(account, marketData), diagnostic), corsHeaders);
     return;
   }
 
@@ -763,7 +765,7 @@ async function handleTradingAccountRoute(params: {
       return;
     }
     await service.getOwnedAccount(userId, accountId);
-    const query = parseAccountActivityQuery(requestUrl, config.symbol);
+    const query = parseAccountActivityQuery(requestUrl);
     sendJson(response, 200, { symbol: query.symbol, limit: query.limit, ...(await runtimeManager.getAccountActivity(accountId, query.symbol, query.limit)) }, corsHeaders);
     return;
   }
@@ -952,11 +954,12 @@ async function assertValidWatchlistSymbols(watchlist: string[], marketData: Bina
   }
 }
 
-function parseAccountActivityQuery(url: URL, defaultSymbol: string): { symbol: string; limit: number } {
-  const symbol = (url.searchParams.get("symbol") ?? defaultSymbol).toUpperCase();
+function parseAccountActivityQuery(url: URL, defaultSymbol?: string): { symbol: string | undefined; limit: number } {
+  const rawSymbol = url.searchParams.get("symbol") ?? defaultSymbol;
+  const symbol = rawSymbol ? rawSymbol.toUpperCase() : undefined;
   const limit = clampLimit(url.searchParams.get("limit"), 100, 500);
 
-  if (!/^[A-Z0-9]{5,20}$/.test(symbol)) {
+  if (symbol && !/^[A-Z0-9]{5,20}$/.test(symbol)) {
     throw new Error(`Invalid symbol: ${symbol}`);
   }
 

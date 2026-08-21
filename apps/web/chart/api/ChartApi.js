@@ -19,8 +19,10 @@ export async function fetchOverlays({ accountId, symbol, interval, limit }) {
 
 export async function fetchAccountActivity({ accountId, symbol, limit }) {
   if (!accountId) throw new Error("Trading account is required for account activity");
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (symbol) query.set("symbol", symbol);
   const response = await apiFetch(
-    `/api/trading-accounts/${accountId}/chart/account-activity?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+    `/api/trading-accounts/${accountId}/chart/account-activity?${query.toString()}`,
   );
   if (!response.ok) throw new Error(`Account activity request failed: ${response.status}`);
   return response.json();

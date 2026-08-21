@@ -21,6 +21,7 @@ export class TradingChart {
     orderHistoryCount = null,
     tradeHistoryCount = null,
     tabButtons = [],
+    hideOtherSymbolsInput = null,
   }) {
     this.container = container;
     this.overlayRoot = overlayRoot;
@@ -32,6 +33,7 @@ export class TradingChart {
     this.orderHistoryCount = orderHistoryCount;
     this.tradeHistoryCount = tradeHistoryCount;
     this.tabButtons = tabButtons;
+    this.hideOtherSymbolsInput = hideOtherSymbolsInput;
     this.activeAccountTab = "positions";
     this.accountTables = {
       positions: [],
@@ -40,9 +42,11 @@ export class TradingChart {
       tradeHistory: [],
     };
     this.lastKey = null;
+    this.lastLoadParams = null;
     this.loadSequence = 0;
     this.createChart();
     this.bindAccountTabs();
+    this.bindActivityFilter();
 
     window.addEventListener("resize", () => this.resize());
     container.addEventListener(
@@ -138,6 +142,7 @@ export class TradingChart {
   }
 
   async load({ accountId = null, symbol, interval, limit }) {
+    this.lastLoadParams = { accountId, symbol, interval, limit };
     const sequence = ++this.loadSequence;
     const key = `${accountId ?? "legacy"}:${symbol}:${interval}`;
     const resetRange = this.lastKey !== key;
@@ -149,7 +154,11 @@ export class TradingChart {
     const [candlePayload, overlayPayload, accountActivity] = await Promise.all([
       fetchCandles({ symbol, interval, limit }),
       fetchOverlays({ accountId, symbol, interval, limit: 200 }),
-      fetchAccountActivity({ accountId, symbol, limit: 100 }),
+      fetchAccountActivity({
+        accountId,
+        symbol: this.hideOtherSymbolsInput?.checked === false ? null : symbol,
+        limit: 100,
+      }),
     ]);
     if (sequence !== this.loadSequence) return;
 
@@ -231,6 +240,12 @@ export class TradingChart {
         this.renderAccountTable();
       });
     }
+  }
+
+  bindActivityFilter() {
+    this.hideOtherSymbolsInput?.addEventListener("change", () => {
+      if (this.lastLoadParams) this.load(this.lastLoadParams);
+    });
   }
 
   clearAccountTables() {

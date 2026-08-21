@@ -3,6 +3,9 @@ import { apiFetch } from "./apiClient.js";
 const $ = (id) => document.getElementById(id);
 const HOME_POLL_INTERVAL_MS = 10_000;
 const CHART_POLL_INTERVAL_MS = 10_000;
+const LAST_MAIN_VIEW_STORAGE_KEY = "smc-futures-bot:last-main-view";
+const MAIN_VIEWS = new Set(["home", "chart", "analysis", "settings"]);
+const DEFAULT_SYMBOL = "BTCUSDT";
 const chartState = {
   instance: null,
   timer: null,
@@ -137,7 +140,6 @@ window.addEventListener("auth:unauthorized", () => {
 boot();
 
 async function boot() {
-  showLoggedOut();
   try {
     const response = await apiFetch("/api/auth/me");
     if (response.ok) {
@@ -215,8 +217,9 @@ async function logout() {
 function showLoggedIn(user) {
   authState.user = user;
   $("auth-view").hidden = true;
-  document.querySelector(".nav-tabs").hidden = false;
-  $("user-menu").hidden = false;
+  document.querySelector(".nav-tabs").hidden = true;
+  $("account-selector").hidden = true;
+  $("user-menu").hidden = true;
   $("user-menu-trigger").textContent = `${user?.email ?? "Account"} ▼`;
   renderAccount(user);
   initializeTradingAccounts();
@@ -280,13 +283,17 @@ async function initializeTradingAccounts() {
     await refreshTradingAccounts();
     if (accountState.accounts.length === 0) {
       $("account-selector").hidden = true;
+      $("user-menu").hidden = false;
       showView("onboarding");
       return;
     }
 
-    $("account-selector").hidden = false;
     await setActiveTradingAccount(accountState.accounts[0]);
-    showView("home");
+    restoreWorkspaceInputs(accountState.accounts[0].id);
+    showView(getStoredMainView());
+    document.querySelector(".nav-tabs").hidden = false;
+    $("account-selector").hidden = false;
+    $("user-menu").hidden = false;
   } catch (error) {
     $("login-message").textContent = error instanceof Error ? error.message : String(error);
     showLoggedOut();
@@ -325,6 +332,7 @@ async function setActiveTradingAccount(account) {
   Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
   renderAccountSelector();
   renderSettings();
+  restoreWorkspaceInputs(account.id);
   await Promise.all([loadActiveAccountStatus(), loadSettings(account.id)]);
   dashboardRequestSequence += 1;
   if ($("chart-view").classList.contains("active")) loadChart();
@@ -560,7 +568,6 @@ async function load() {
   const engine = snapshot.engine ?? {};
   const runtime = snapshot.runtime ?? {};
   const store = snapshot.store ?? {};
-  const db = store.databaseStatus ?? {};
   const account = snapshot.binanceAccount ?? runtime.account ?? {};
   const connection = snapshot.connection ?? {};
   const runtimeHealth = snapshot.runtimeHealth ?? {};
@@ -568,8 +575,6 @@ async function load() {
   accountState.lastBinanceAccount = account;
   const marketData = runtime.marketData ?? {};
 
-  $("connection").textContent =
-    `${runtime.symbol ?? "-"} · H1 ${engine.candleCounts?.H1 ?? 0} / M5 ${engine.candleCounts?.M5 ?? 0}`;
   setHeroBadge(
     "account-pill",
     connection.status === "CONNECTED" || account.connected ? "CONNECTED" : "DISCONNECTED",
@@ -580,14 +585,6 @@ async function load() {
     accountState.activeAccount ? `${accountState.activeAccount.mode} · ${account.environment ?? "-"}` : String(account.environment ?? "-").toUpperCase(),
     connection.status === "CONNECTED" || account.connected,
   );
-  $("mode-detail").textContent = accountState.activeAccount
-    ? `${accountState.activeAccount.name} · ${accountEnvironmentLabel(accountState.activeAccount.mode)}`
-    : getModeDetail(runtime.executionMode);
-  setPill(
-    "db-pill",
-    `DB: ${db.database ?? "unknown"}`,
-    db.database === "postgres",
-  );
 
   $("account").textContent = account.connected ? "Connected" : "Not connected";
   $("account-detail").textContent =
@@ -595,10 +592,6 @@ async function load() {
   $("wallet-balance").textContent = formatUsdt(account.walletBalance);
   $("available-balance").textContent = formatUsdt(account.availableBalance);
   $("connect-binance-button").hidden = connection.status === "CONNECTED";
-
-  $("database").textContent =
-    db.database === "postgres" ? "Postgres" : "Memory";
-  $("database-detail").textContent = db.reason ?? "-";
 
   $("market-data").textContent = marketData.connected ? "Connected" : "Offline";
   $("market-data-detail").textContent = marketData.label ?? "-";
@@ -627,25 +620,6 @@ async function load() {
   $("fvg-detail").textContent = htfFvg
     ? `${formatPrice(htfFvg.lower)} - ${formatPrice(htfFvg.upper)} · CE ${formatPrice(htfFvg.midpoint)}`
     : "No active HTF FVG";
-  $("signal").textContent = store.currentSignal
-    ? `${store.currentSignal.type} ${store.currentSignal.direction}`
-    : "-";
-  $("signal-detail").textContent = store.currentSignal
-    ? `Close ${formatPrice(store.currentSignal.close)}`
-    : "Waiting for M5 BOS/CHOCH";
-  $("risk").textContent = store.riskStatus
-    ? `${store.riskStatus.accepted ? "Passed" : "Rejected"}`
-    : "-";
-  $("risk-detail").textContent = store.riskStatus
-    ? [
-        `Margin ${formatUsdt(store.riskStatus.margin)}`,
-        `Size ${formatUsdt(store.riskStatus.positionSize)}`,
-        `Qty ${formatQuantity(store.riskStatus.quantity)}`,
-        `Loss ${formatUsdt(store.riskStatus.estimatedLoss)}`,
-        `Profit ${formatUsdt(store.riskStatus.estimatedProfit)}`,
-        `RR ${formatRatio(store.riskStatus.riskReward)}`
-      ].join(" · ")
-    : "Risk manager has not run";
 
   activityState.events = Array.isArray(store.events) ? store.events : [];
   renderRecentActivities();
@@ -793,7 +767,7 @@ function stopChartPolling() {
 
 function pollHomeOnce() {
   load().catch((error) => {
-    if (activeView === "home") $("connection").textContent = userFacingApiError(error);
+    if (activeView === "home") console.error(userFacingApiError(error));
   });
 }
 
@@ -808,12 +782,6 @@ function userFacingApiError(error) {
   if (message.includes("503")) return "Bot runtime is recovering. Please wait.";
   if (message.includes("Failed to fetch")) return "API is offline. Reconnecting...";
   return message;
-}
-
-function setPill(id, text, ok) {
-  const element = $(id);
-  element.textContent = text;
-  element.dataset.status = ok ? "ok" : "warn";
 }
 
 function setHeroBadge(id, text, ok) {
@@ -844,16 +812,6 @@ function formatRatio(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value)))
     return "-";
   return Number(value).toLocaleString("en-US", { maximumFractionDigits: 2 });
-}
-
-function getModeDetail(mode) {
-  if (mode === "paper")
-    return "Paper trading: signals are simulated, no Binance orders are sent.";
-  if (mode === "testnet")
-    return "Testnet trading: orders are sent to Binance Futures Testnet.";
-  if (mode === "live")
-    return "Live trading: real orders are sent to Binance Futures.";
-  return "-";
 }
 
 function renderWatchlist(rows) {
@@ -892,7 +850,6 @@ function tableCell(value) {
   return cell;
 }
 
-$("refresh").addEventListener("click", load);
 $("connect-binance-button").addEventListener("click", openConnectView);
 $("chart-refresh").addEventListener("click", loadChart);
 $("chart-symbol").addEventListener("change", loadChart);
@@ -956,6 +913,7 @@ document.querySelectorAll("[data-setting-group]").forEach((group) => {
 });
 function showView(view) {
   activeView = view;
+  if (MAIN_VIEWS.has(view)) localStorage.setItem(LAST_MAIN_VIEW_STORAGE_KEY, view);
   $("home-view").classList.toggle("active", view === "home");
   $("chart-view").classList.toggle("active", view === "chart");
   $("analysis-view").classList.toggle("active", view === "analysis");
@@ -984,14 +942,49 @@ function showView(view) {
   }
 
   if (view === "analysis") {
-    const chartSymbol = $("chart-symbol").value.trim().toUpperCase();
-    if (chartSymbol) $("analysis-symbol").value = chartSymbol;
     loadAnalysis();
   }
 
   if (view === "settings") {
     loadSettings();
   }
+}
+
+function getStoredMainView() {
+  const stored = localStorage.getItem(LAST_MAIN_VIEW_STORAGE_KEY);
+  return MAIN_VIEWS.has(stored) ? stored : "home";
+}
+
+function accountStorageKey(name, accountId = accountState.activeAccount?.id) {
+  return accountId ? `smc-futures-bot:${accountId}:${name}` : `smc-futures-bot:${name}`;
+}
+
+function restoreWorkspaceInputs(accountId) {
+  const symbol =
+    localStorage.getItem(accountStorageKey("workspace-symbol", accountId)) ??
+    localStorage.getItem(accountStorageKey("chart-symbol", accountId)) ??
+    localStorage.getItem(accountStorageKey("analysis-symbol", accountId)) ??
+    DEFAULT_SYMBOL;
+  $("chart-symbol").value = symbol;
+  $("chart-interval").value = localStorage.getItem(accountStorageKey("chart-interval", accountId)) ?? "5m";
+  $("analysis-symbol").value = symbol;
+}
+
+function rememberWorkspaceSymbol(symbol) {
+  localStorage.setItem(accountStorageKey("workspace-symbol"), symbol);
+  localStorage.setItem(accountStorageKey("chart-symbol"), symbol);
+  localStorage.setItem(accountStorageKey("analysis-symbol"), symbol);
+  $("chart-symbol").value = symbol;
+  $("analysis-symbol").value = symbol;
+}
+
+function rememberChartInputs(symbol, interval) {
+  rememberWorkspaceSymbol(symbol);
+  localStorage.setItem(accountStorageKey("chart-interval"), interval);
+}
+
+function rememberAnalysisSymbol(symbol) {
+  rememberWorkspaceSymbol(symbol);
 }
 
 async function ensureChart() {
@@ -1022,9 +1015,10 @@ async function loadChart() {
       $("chart-status").textContent = "Select a trading account";
       return;
     }
-    const symbol = $("chart-symbol").value.trim().toUpperCase() || "BTCUSDT";
+    const symbol = $("chart-symbol").value.trim().toUpperCase() || DEFAULT_SYMBOL;
     const interval = $("chart-interval").value;
     $("chart-symbol").value = symbol;
+    rememberChartInputs(symbol, interval);
     await chartState.instance.load({ accountId, symbol, interval, limit: 300 });
   } catch (error) {
     if (activeView !== "chart") return;
@@ -1039,8 +1033,9 @@ function resizeChart() {
 async function loadAnalysis() {
   const accountId = accountState.activeAccount?.id;
   const sequence = ++analysisRequestSequence;
-  const symbol = $("analysis-symbol").value.trim().toUpperCase() || "BTCUSDT";
+  const symbol = $("analysis-symbol").value.trim().toUpperCase() || DEFAULT_SYMBOL;
   $("analysis-symbol").value = symbol;
+  rememberAnalysisSymbol(symbol);
   if (!accountId) {
     $("analysis-status").textContent = "Select a trading account";
     return;

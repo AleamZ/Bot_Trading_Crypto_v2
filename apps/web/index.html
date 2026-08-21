@@ -11,7 +11,7 @@
     <header class="app-header">
       <div class="brand">SMC Futures Bot</div>
       <nav class="nav-tabs" aria-label="Main navigation" hidden>
-        <button class="nav-tab active" id="home-nav" type="button">Home</button>
+        <button class="nav-tab" id="home-nav" type="button">Home</button>
         <button class="nav-tab" id="chart-nav" type="button">Chart</button>
         <button class="nav-tab" id="analysis-nav" type="button">Analysis</button>
         <button class="nav-tab" id="settings-nav" type="button">Setting</button>
@@ -34,7 +34,7 @@
     </header>
 
     <main class="shell">
-      <section class="auth-view" id="auth-view">
+      <section class="auth-view" id="auth-view" hidden>
         <form class="auth-panel" id="login-form">
           <h1>Login</h1>
           <label for="login-email">Email</label>
@@ -167,7 +167,7 @@
         </section>
       </section>
 
-      <section class="view active" id="home-view">
+      <section class="view" id="home-view">
         <section class="wallet-hero">
           <div>
             <h1>Futures Wallet <span>(Binance)</span></h1>
@@ -178,7 +178,6 @@
             <div class="hero-line mode-line">
               <span>Mode:</span>
               <strong class="hero-badge muted" id="network-pill">-</strong>
-              <small id="mode-detail">-</small>
             </div>
             <p class="balance-line">
               Wallet balance:
@@ -188,29 +187,21 @@
             </p>
           </div>
           <div class="hero-actions">
-            <span class="pill" id="db-pill">DB: -</span>
             <button id="connect-binance-button" type="button">Connect Binance</button>
-            <button id="refresh" title="Refresh snapshot" aria-label="Refresh snapshot">Refresh</button>
           </div>
         </section>
 
         <section class="topbar">
           <div>
             <h2>SMC Strategy Console</h2>
-            <p id="connection">Waiting for snapshot</p>
           </div>
         </section>
 
-        <section class="status-grid">
+        <section class="status-grid home-system-grid">
           <article class="status-card">
             <span>Binance Account</span>
             <strong id="account">-</strong>
             <small id="account-detail">-</small>
-          </article>
-          <article class="status-card">
-            <span>Database</span>
-            <strong id="database">-</strong>
-            <small id="database-detail">-</small>
           </article>
           <article class="status-card">
             <span>Market Data</span>
@@ -224,7 +215,7 @@
           </article>
         </section>
 
-        <section class="grid">
+        <section class="grid home-strategy-grid">
           <article class="metric-card">
             <span>Trend</span>
             <strong id="trend">-</strong>
@@ -234,16 +225,6 @@
             <span>HTF FVG</span>
             <strong id="fvg">-</strong>
             <small id="fvg-detail">-</small>
-          </article>
-          <article class="metric-card">
-            <span>LTF Signal</span>
-            <strong id="signal">-</strong>
-            <small id="signal-detail">-</small>
-          </article>
-          <article class="metric-card">
-            <span>Risk</span>
-            <strong id="risk">-</strong>
-            <small id="risk-detail">-</small>
           </article>
         </section>
 

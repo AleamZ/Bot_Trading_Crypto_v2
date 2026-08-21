@@ -720,6 +720,11 @@ async function handleTradingAccountRoute(params: {
     const query = parseAccountActivityQuery(requestUrl, config.symbol);
     const symbol = query.symbol ?? config.symbol;
     const settings = await service.getSettings(userId, accountId);
+    const activePosition = runtimeManager ? (await runtimeManager.getAccountActivity(accountId, symbol, 20)).positions.find((position) => position.symbol === symbol && position.quantity > 0) : null;
+    if (activePosition) {
+      sendJson(response, 200, buildActivePositionAnalysis(symbol, activePosition), corsHeaders);
+      return;
+    }
     const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol) : null;
     sendJson(response, 200, await buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, marketDataForAccount(account, marketData), diagnostic), corsHeaders);
     return;
@@ -1087,6 +1092,28 @@ async function buildChartOverlays(params: {
     internalLiquidity: [],
     trades: [],
     positions: [...positions.values()]
+  };
+}
+
+function buildActivePositionAnalysis(symbol: string, position: BinanceFuturesPositionStatus) {
+  return {
+    symbol,
+    checkedAt: new Date().toISOString(),
+    setupState: "ORDER_PLACED",
+    setupStatus: "MANAGING_TRADE",
+    trend: { direction: position.side === "long" ? "bullish" : "bearish", ema: null, close: null, reason: "Active Binance Futures position" },
+    summary: "Position Open",
+    conditions: [],
+    riskManagement: { final: "BLOCKED", reason: "Active position; entry scanning paused", checks: [], decision: null },
+    plan: null,
+    position: {
+      side: position.side === "long" ? "LONG" : "SHORT",
+      quantity: position.quantity,
+      entryPrice: position.entryPrice,
+      unrealizedProfit: position.unrealizedProfit,
+      stopLoss: position.stopLoss,
+      takeProfit: position.takeProfit
+    }
   };
 }
 
@@ -2360,7 +2387,16 @@ function reconcileWatchlistRows(
 
     const hasRealPosition = openSymbols.has(row.symbol);
     if (hasRealPosition) {
-      return { ...row, position: "Open", status: "Active", positionSource: "binance" };
+      const position = positions.find((item) => item.symbol === row.symbol);
+      return {
+        ...row,
+        state: "ManagingTrade",
+        conditions: "—",
+        rr: null,
+        position: position?.side === "short" ? "SHORT" : "LONG",
+        status: "Position Open",
+        positionSource: "binance"
+      };
     }
 
     const enginePosition = row.position === "Open" || row.position === "Paper";

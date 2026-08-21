@@ -97,6 +97,46 @@ export class TradingEngine {
     return this.state;
   }
 
+  syncActivePosition(position: { side: "long" | "short"; quantity: number; entryPrice: number; unrealizedProfit: number; stopLoss: number | null; takeProfit: number | null } | null): void {
+    if (!position || position.quantity <= 0) {
+      if (this.state.openPositions > 0) {
+        this.state.openPositions = 0;
+        this.state.setupState = "WaitingTrend";
+        this.state.pendingSignal = null;
+        this.state.pendingLtfFvg = null;
+        this.state.pendingEntryPlan = null;
+        this.state.activeRisk = null;
+        this.state.setupEvidence = emptySetupEvidence();
+      }
+      return;
+    }
+
+    this.state.openPositions = 1;
+    this.state.setupState = this.state.setupState === "PositionOpened" ? "ManagingTrade" : "PositionOpened";
+    this.state.pendingSignal = null;
+    this.state.pendingLtfFvg = null;
+    this.state.pendingEntryPlan = null;
+    this.state.setupEvidence = emptySetupEvidence();
+    this.state.trend = position.side === "long" ? "bullish" : "bearish";
+    this.state.activeRisk = {
+      accepted: true,
+      reason: "Active Binance position",
+      symbol: this.config.symbol,
+      margin: 0,
+      leverage: 0,
+      positionSize: position.entryPrice * position.quantity,
+      quantity: position.quantity,
+      notional: position.entryPrice * position.quantity,
+      entry: position.entryPrice,
+      stopLoss: position.stopLoss ?? position.entryPrice,
+      takeProfit: position.takeProfit ?? position.entryPrice,
+      estimatedLoss: 0,
+      estimatedProfit: position.unrealizedProfit,
+      riskReward: 0,
+      createdAt: Date.now()
+    };
+  }
+
   updateConfig(config: AppConfig): void {
     this.config = config;
   }

@@ -5,6 +5,7 @@ import type { DecisionLogger } from "../ports/Logger.js";
 import type { TradingRepository } from "../ports/Repositories.js";
 import type { Candle } from "../../domain/market-data/Candle.js";
 import type { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
+import type { BinanceFuturesPositionStatus } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
 
 export interface WatchlistStatus {
   symbol: string;
@@ -22,6 +23,7 @@ export class MarketScanner {
   private readonly lastScanTime = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   private scanning = false;
+  private activePositions = new Map<string, BinanceFuturesPositionStatus>();
 
   constructor(
     private config: AppConfig,
@@ -65,6 +67,16 @@ export class MarketScanner {
         lastScanAt: this.lastScanTime.has(symbol) ? new Date(this.lastScanTime.get(symbol) ?? 0).toISOString() : null
       };
     });
+  }
+
+  syncPositions(positions: readonly BinanceFuturesPositionStatus[]): void {
+    this.activePositions.clear();
+    for (const position of positions) {
+      if (position.quantity > 0) this.activePositions.set(position.symbol, position);
+    }
+    for (const [symbol, engine] of this.engines) {
+      engine.syncActivePosition(this.activePositions.get(symbol) ?? null);
+    }
   }
 
   updateConfig(config: AppConfig): void {
@@ -118,6 +130,13 @@ export class MarketScanner {
 
   private async scanSymbol(symbol: string, bootstrap: boolean): Promise<void> {
     const engine = this.engines.get(symbol) ?? this.createEngine(symbol);
+    const activePosition = this.activePositions.get(symbol);
+    if (activePosition) {
+      engine.syncActivePosition(activePosition);
+      this.lastScanTime.set(symbol, Date.now());
+      this.logger.info(`[SCANNER] ${symbol} -> ${engine.getState().setupState} (active position)`);
+      return;
+    }
     this.lastScanTime.set(symbol, Date.now());
     const [h1, m5] = await Promise.all([
       this.marketData.getClosedCandles(symbol, "H1", Math.max(this.config.emaPeriod + 10, 80)),

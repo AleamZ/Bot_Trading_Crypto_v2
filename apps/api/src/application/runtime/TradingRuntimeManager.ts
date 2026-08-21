@@ -661,6 +661,8 @@ export class TradingRuntimeManager {
       () => this.getAccountActivity(runtime.account.id, undefined, 100),
       runtime.reconciliationGateway
     );
+    const activity = await this.getAccountActivity(runtime.account.id, undefined, 100);
+    runtime.scanner.syncPositions(activity.positions);
     runtime.health.lastReconciliationAt = result.checkedAt;
     runtime.health.lastReconciliationError = result.error;
     runtime.health.reconciliationStatus = result.status;

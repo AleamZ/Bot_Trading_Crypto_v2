@@ -833,7 +833,7 @@ function renderWatchlist(rows) {
       row.append(
         tableCell(item.symbol),
         tableCell(item.state),
-        tableCell(item.conditions),
+        tableCell(item.conditions === undefined || item.conditions === null ? "—" : item.conditions),
         tableCell(item.rr === null || item.rr === undefined ? "-" : formatRatio(item.rr)),
         tableCell(item.position),
         tableCell(item.status),

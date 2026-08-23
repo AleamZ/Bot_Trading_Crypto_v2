@@ -39,6 +39,8 @@ import type { RealExecutionProposalRepository } from "../execution/RealExecution
 import { MemoryRealExecutionProposalRepository } from "../../infrastructure/execution/MemoryRealExecutionProposalRepository.js";
 import { fingerprintProposal, type RealExecutionProposal } from "../execution/RealExecutionProposal.js";
 import { UnsafeTradingAccountDeletionError } from "../trading-account/TradingAccountService.js";
+import { calculateDailyRiskStatus, type DailyRiskStatus } from "../risk/DailyRiskService.js";
+import { updateAccountProtectionState, type AccountProtectionStatus } from "../risk/AccountProtectionService.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -47,6 +49,8 @@ export interface AccountSnapshot {
   runtimeHealth: RuntimeHealth;
   execution: ExecutionGateState;
   realReadiness: RealTradingReadinessResult | null;
+  dailyRisk: DailyRiskStatus;
+  accountProtection: AccountProtectionStatus | null;
 }
 
 export interface RuntimeHealth {
@@ -197,7 +201,7 @@ export class TradingRuntimeManager {
     if (this.databaseUrl && "migrate" in repository) await (repository as PostgresTradingRepository).migrate();
     await repository.saveTradingSettings(config);
     const health = createRecoveringHealth();
-    const rawExecution = await this.createExecutionGateway(account, config.entryMode, config.leverage);
+    const rawExecution = await this.createExecutionGateway(account, config.entryMode, config.maxLeverage);
     const executionGate = () => this.resolveRuntimeExecutionGate(account, health, configRef.current, rawExecution);
     const execution =
       account.mode === "DEMO"
@@ -224,12 +228,29 @@ export class TradingRuntimeManager {
               const status = client?.getWalletStatus ? await client.getWalletStatus() : null;
               return status?.connected ? status.availableBalance : null;
             },
+            assertAccountProtection: async () => {
+              const accountProtection = await this.getAccountProtectionStatus(account.id, true);
+              if (!accountProtection) throw new Error("ACCOUNT_PROTECTION_UNAVAILABLE");
+              if (!accountProtection.newEntriesAllowed) throw new Error(accountProtection.blockReason ?? "ACCOUNT_PROTECTION_UNAVAILABLE");
+            },
             proposalRepository: this.realProposalRepository,
             auditRepository: this.executionIntentRepository,
             logger: this.logger
           });
     const reconciliationGateway = account.mode === "DEMO" && isRecoverableExecutionGateway(rawExecution) ? new GatedRecoverableExecutionGateway(rawExecution, executionGate) : undefined;
-    const scanner = new MarketScanner(config, repository, execution, this.logger, this.runtimeMarketDataFactory(account.mode === "DEMO"), null);
+    const scanner = new MarketScanner(
+      config,
+      repository,
+      execution,
+      this.logger,
+      this.runtimeMarketDataFactory(account.mode === "DEMO"),
+      async () => {
+        const client = await this.createAccountClient(account.id);
+        const status = client?.getWalletStatus ? await client.getWalletStatus() : null;
+        return status?.connected ? status.availableBalance : null;
+      },
+      (symbol) => this.getSymbolRules(account.id, symbol)
+    );
     const reconciliation = new TradingReconciliationService(this.executionIntentRepository, this.logger);
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
     this.runtimes.set(account.id, runtime);
@@ -328,14 +349,69 @@ export class TradingRuntimeManager {
     const runtime = await this.ensureRuntime(accountId);
     const execution = this.updateExecutionHealth(runtime);
     const realReadiness = runtime.account.mode === "REAL" ? await this.getRealReadiness(accountId) : null;
+    const dailyRisk = await this.getDailyRiskStatus(accountId);
+    const accountProtection = await this.getAccountProtectionStatus(accountId);
     return {
       engine: runtime.scanner.getPrimaryEngine().getDashboardState(),
       store: await runtime.repository.getDashboardSnapshot(),
       watchlistStatus: runtime.scanner.getWatchlistStatus(),
       runtimeHealth: { ...runtime.health },
       execution,
-      realReadiness
+      realReadiness,
+      dailyRisk,
+      accountProtection
     };
+  }
+
+  async getDailyRiskStatus(accountId: string, now = new Date(), strict = false): Promise<DailyRiskStatus> {
+    const runtime = await this.ensureRuntime(accountId);
+    const settings = runtime.configRef.current;
+    const intents = await this.executionIntentRepository.listByAccount(accountId, 1000);
+    const symbols = [...new Set([...settings.watchlist, ...intents.map((intent) => intent.symbol)])];
+    const client = await this.createAccountClient(accountId);
+    if (!client) {
+      if (strict) throw new Error("DAILY_RISK_UNAVAILABLE");
+      return calculateDailyRiskStatus({ tradingAccountId: accountId, settings, intents, trades: [], now });
+    }
+    let tradeResults: BinanceFuturesTradeHistoryStatus[][];
+    try {
+      tradeResults = await Promise.all(symbols.map((symbol) => client.getTradeHistory(symbol, 1000)));
+    } catch (error) {
+      if (strict) throw error;
+      tradeResults = [];
+    }
+    return calculateDailyRiskStatus({
+      tradingAccountId: accountId,
+      settings,
+      intents,
+      trades: tradeResults.flat(),
+      now
+    });
+  }
+
+  async getAccountProtectionStatus(accountId: string, strict = false, now = new Date()): Promise<AccountProtectionStatus | null> {
+    const runtime = await this.ensureRuntime(accountId);
+    const client = await this.createAccountClient(accountId);
+    try {
+      if (!client?.getWalletStatus) throw new Error("ACCOUNT_PROTECTION_UNAVAILABLE");
+      const [wallet, positions] = await Promise.all([client.getWalletStatus(), client.getOpenPositions()]);
+      if (!wallet.connected || wallet.walletBalance === null) throw new Error("ACCOUNT_PROTECTION_UNAVAILABLE");
+      const currentEquityUsdt = wallet.walletBalance + positions.reduce((sum, position) => sum + position.unrealizedProfit, 0);
+      const currentState = this.configRepository.getAccountProtectionState ? await this.configRepository.getAccountProtectionState(accountId) : null;
+      const update = updateAccountProtectionState({
+        tradingAccountId: accountId,
+        currentEquityUsdt,
+        maxDrawdownPercent: runtime.configRef.current.maxDrawdownPercent,
+        state: currentState,
+        now
+      });
+      if (update.changed) await this.configRepository.saveAccountProtectionState?.(update.state);
+      return update.status;
+    } catch (error) {
+      if (strict) throw error;
+      this.logger.warn("[ACCOUNT PROTECTION] status unavailable", { tradingAccountId: accountId, error: error instanceof Error ? error.message : String(error) });
+      return null;
+    }
   }
 
   async getSymbolRules(accountId: string, symbol: string): Promise<FuturesSymbolRules> {
@@ -372,7 +448,7 @@ export class TradingRuntimeManager {
       rules = await this.getSymbolRules(account.id, symbol);
       checks.symbolRulesLoaded = ok();
       checks.marginAssetSupported = rules.marginAsset === "USDT" || rules.marginAsset === null ? ok() : fail("MARGIN_ASSET_UNSUPPORTED");
-      checks.leverageValid = rules.maxLeverage === null || settings.leverage <= rules.maxLeverage ? ok() : fail("LEVERAGE_EXCEEDS_BINANCE_MAX");
+      checks.leverageValid = rules.maxLeverage === null || settings.maxLeverage <= rules.maxLeverage ? ok() : fail("LEVERAGE_EXCEEDS_BINANCE_MAX");
     } catch {
       checks.symbolRulesLoaded = fail("SYMBOL_RULES_UNAVAILABLE");
       checks.marginAssetSupported = fail("SYMBOL_RULES_UNAVAILABLE");
@@ -382,13 +458,13 @@ export class TradingRuntimeManager {
     const symbolState = client?.getSymbolAccountState ? await client.getSymbolAccountState(symbol).catch(() => null) : null;
     const binanceLeverage = symbolState?.leverage ?? null;
     const binanceMarginMode = symbolState?.marginType ?? null;
-    const leverageMatch = binanceLeverage === null ? null : binanceLeverage === settings.leverage;
+    const leverageMatch = binanceLeverage === null ? null : binanceLeverage === settings.maxLeverage;
     const marginModeMatch = binanceMarginMode === null || binanceMarginMode === "UNKNOWN" ? null : binanceMarginMode === settings.marginMode;
     if (leverageMatch === false) checks.leverageValid = fail("LEVERAGE_MISMATCH");
     checks.marginModeKnown = marginModeMatch === null ? fail("MARGIN_MODE_UNKNOWN") : marginModeMatch ? ok() : fail("MARGIN_MODE_MISMATCH");
 
     checks.balanceAvailable =
-      wallet?.availableBalance !== null && wallet?.availableBalance !== undefined && wallet.availableBalance >= settings.marginPerTrade ? ok() : fail("INSUFFICIENT_AVAILABLE_BALANCE");
+      wallet?.availableBalance !== null && wallet?.availableBalance !== undefined && wallet.availableBalance >= settings.riskPerTradeUsdt ? ok() : fail("INSUFFICIENT_AVAILABLE_BALANCE");
     checks.tradingEnabled = settings.tradingEnabled ? ok() : fail("TRADING_DISABLED");
     checks.killSwitchOff = settings.killSwitch ? fail("KILL_SWITCH") : ok();
     checks.runtimeReady = runtime.health.state === "READY" ? ok() : fail("RUNTIME_NOT_READY");
@@ -407,7 +483,7 @@ export class TradingRuntimeManager {
       realExecutionMode: settings.realExecutionMode,
       masterLiveExecutionEnabled: this.baseConfig.realLiveExecutionEnabled,
       symbol,
-      configuredLeverage: settings.leverage,
+      configuredLeverage: settings.maxLeverage,
       binanceLeverage,
       leverageMatch,
       configuredMarginMode: settings.marginMode,
@@ -423,7 +499,7 @@ export class TradingRuntimeManager {
           .filter(([, check]) => !check.ok)
           .map(([name, check]) => ({ name, reason: check.reason }))
       });
-      if (leverageMatch === false) await this.auditRealEvent(account.id, symbol, "REAL_LEVERAGE_MISMATCH", { configured: settings.leverage, binance: binanceLeverage });
+      if (leverageMatch === false) await this.auditRealEvent(account.id, symbol, "REAL_LEVERAGE_MISMATCH", { configured: settings.maxLeverage, binance: binanceLeverage });
       if (marginModeMatch === false) await this.auditRealEvent(account.id, symbol, "REAL_MARGIN_MODE_MISMATCH", { configured: settings.marginMode, binance: binanceMarginMode });
     }
     return readiness;
@@ -487,10 +563,15 @@ export class TradingRuntimeManager {
   }
 
   private async validatePreTrade(account: TradingAccount, config: AppConfig, plan: EntryPlan, risk: RiskDecision): Promise<void> {
+    const dailyRisk = await this.getDailyRiskStatus(account.id, new Date(), true);
+    if (!dailyRisk.newEntriesAllowed) throw new Error(dailyRisk.blockReason ?? "DAILY_RISK_UNAVAILABLE");
+    const accountProtection = await this.getAccountProtectionStatus(account.id, true);
+    if (!accountProtection) throw new Error("ACCOUNT_PROTECTION_UNAVAILABLE");
+    if (!accountProtection.newEntriesAllowed) throw new Error(accountProtection.blockReason ?? "ACCOUNT_PROTECTION_UNAVAILABLE");
     const client = await this.createAccountClient(account.id);
     const wallet = client?.getWalletStatus ? await client.getWalletStatus() : null;
     if (!wallet?.connected || wallet.availableBalance === null) throw new Error("BINANCE_DISCONNECTED");
-    if (config.marginPerTrade > wallet.availableBalance) throw new Error("INSUFFICIENT_AVAILABLE_BALANCE");
+    if (config.riskPerTradeUsdt > wallet.availableBalance) throw new Error("INSUFFICIENT_AVAILABLE_BALANCE");
 
     const rules = await this.getSymbolRules(account.id, risk.symbol);
     const entryOrderType = config.entryMode.toUpperCase();

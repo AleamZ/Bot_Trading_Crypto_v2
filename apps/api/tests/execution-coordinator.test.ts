@@ -762,6 +762,7 @@ function realProposalGateway(proposals: MemoryRealExecutionProposalRepository, o
       supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
     }),
     loadAvailableBalance: async () => 10_000,
+    assertAccountProtection: async () => undefined,
     proposalRepository: proposals,
     auditRepository: new MemoryExecutionIntentRepository(),
     logger: fakeLogger()

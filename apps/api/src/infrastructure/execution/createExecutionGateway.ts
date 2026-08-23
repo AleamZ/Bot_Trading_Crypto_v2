@@ -17,5 +17,5 @@ export function createExecutionGateway(config: AppConfig): ExecutionGateway {
     return new LockedRealExecutionGateway();
   }
 
-  return new BinanceFuturesExecutionGateway(config.binanceApiKey, config.binanceApiSecret, config.executionMode, config.entryMode, config.leverage);
+  return new BinanceFuturesExecutionGateway(config.binanceApiKey, config.binanceApiSecret, config.executionMode, config.entryMode, config.maxLeverage);
 }

@@ -740,6 +740,17 @@ select {
   font-weight: 700;
 }
 
+input.invalid {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.12);
+}
+
+input[readonly] {
+  background: #f1f5f9;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 input {
   width: 132px;
 }
@@ -877,6 +888,13 @@ input {
 .setting-card input {
   width: 100%;
   font-size: 22px;
+}
+
+.readonly-rule strong {
+  display: block;
+  margin-top: 28px;
+  color: var(--ink);
+  font-size: 18px;
 }
 
 .segmented-control {

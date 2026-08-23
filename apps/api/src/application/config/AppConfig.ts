@@ -18,10 +18,10 @@ const schema = z.object({
   corsOrigins: z.array(z.string()).default(["http://localhost:5173", "http://127.0.0.1:5173"]),
   symbol: z.string().default("BTCUSDT"),
   watchlist: z.array(z.string()).default(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]),
-  positionSizingMode: z.literal("fixed-margin").default("fixed-margin"),
-  marginPerTrade: z.coerce.number().positive().default(200),
-  leverage: z.coerce.number().positive().default(5),
+  positionSizingMode: z.literal("risk-based").default("risk-based"),
+  riskPerTradeUsdt: z.coerce.number().positive().default(20),
   maxLeverage: z.coerce.number().positive().default(125),
+  maxMarginUsagePercent: z.coerce.number().positive().max(100).default(20),
   marginMode: z.enum(["CROSS", "ISOLATED"]).default("ISOLATED"),
   entryMode: z.enum(["limit", "market"]).default("limit"),
   minNotional: z.coerce.number().positive().default(5),
@@ -29,6 +29,8 @@ const schema = z.object({
   maxOpenPositions: z.coerce.number().int().positive().default(1),
   maxPositionPerSymbol: z.coerce.number().int().positive().default(1),
   minimumRiskReward: z.coerce.number().positive().default(2),
+  dailyProfitLimitR: z.coerce.number().positive().default(10),
+  dailyLossLimitR: z.coerce.number().positive().default(2),
   maxTradesPerDay: z.coerce.number().int().positive().default(5),
   maxDailyLossPercent: z.coerce.number().positive().default(3),
   maxConsecutiveLosses: z.coerce.number().int().positive().default(3),
@@ -85,26 +87,33 @@ export type TradingSettings = Omit<
   | "binanceRetryBaseDelayMs"
   | "postgresPoolMax"
   | "realLiveExecutionEnabled"
+  | "minNotional"
+  | "maxPositionSize"
+  | "priceTickSize"
+  | "takeProfitMode"
+  | "fixedRr"
+  | "fvgMitigation"
+  | "ltfFvgEntryMode"
+  | "maxTradesPerDay"
+  | "maxDailyLossPercent"
+  | "maxConsecutiveLosses"
+  | "cooldownAfterTradeMinutes"
 >;
 
 export const defaultTradingSettings: TradingSettings = {
   symbol: "BTCUSDT",
   watchlist: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
-  positionSizingMode: "fixed-margin",
-  marginPerTrade: 200,
-  leverage: 5,
+  positionSizingMode: "risk-based",
+  riskPerTradeUsdt: 20,
   maxLeverage: 125,
+  maxMarginUsagePercent: 20,
   marginMode: "ISOLATED",
   entryMode: "market",
-  minNotional: 5,
-  maxPositionSize: 100_000,
   maxOpenPositions: 1,
   maxPositionPerSymbol: 1,
   minimumRiskReward: 2,
-  maxTradesPerDay: 5,
-  maxDailyLossPercent: 3,
-  maxConsecutiveLosses: 3,
-  cooldownAfterTradeMinutes: 30,
+  dailyProfitLimitR: 10,
+  dailyLossLimitR: 2,
   maxDrawdownPercent: 10,
   tradingEnabled: false,
   killSwitch: false,
@@ -112,19 +121,14 @@ export const defaultTradingSettings: TradingSettings = {
   emaPeriod: 50,
   swingLeft: 2,
   swingRight: 2,
-  fvgMitigation: "ce",
-  ltfFvgEntryMode: "ce",
   stopLossBufferMode: "ticks",
   stopLossBufferTicks: 5,
   stopLossBufferPercent: 0.1,
   stopLossAtrPeriod: 14,
   stopLossAtrMultiplier: 1,
-  priceTickSize: 0.1,
   requireDisplacement: false,
   displacementBodyMultiplier: 1.5,
-  displacementLookback: 20,
-  takeProfitMode: "external-liquidity",
-  fixedRr: 2
+  displacementLookback: 20
 };
 
 const tradingSettingsSchema = schema.omit({
@@ -143,17 +147,48 @@ const tradingSettingsSchema = schema.omit({
   binanceRetryMaxAttempts: true,
   binanceRetryBaseDelayMs: true,
   postgresPoolMax: true,
-  realLiveExecutionEnabled: true
+  realLiveExecutionEnabled: true,
+  minNotional: true,
+  maxPositionSize: true,
+  priceTickSize: true,
+  takeProfitMode: true,
+  fixedRr: true,
+  fvgMitigation: true,
+  ltfFvgEntryMode: true,
+  maxTradesPerDay: true,
+  maxDailyLossPercent: true,
+  maxConsecutiveLosses: true,
+  cooldownAfterTradeMinutes: true
 });
 
 export function validateTradingSettings(input: unknown): TradingSettings {
+  const source = typeof input === "object" && input !== null ? { ...(input as Record<string, unknown>) } : {};
+  if (source.positionSizingMode === "fixed-margin") {
+    source.positionSizingMode = "risk-based";
+    delete source.marginPerTrade;
+    delete source.leverage;
+  }
+  delete source.minNotional;
+  delete source.maxPositionSize;
+  delete source.priceTickSize;
+  delete source.takeProfitMode;
+  delete source.fixedRr;
+  delete source.fvgMitigation;
+  delete source.ltfFvgEntryMode;
+  delete source.maxTradesPerDay;
+  delete source.maxDailyLossPercent;
+  delete source.maxConsecutiveLosses;
+  delete source.cooldownAfterTradeMinutes;
   const parsed = tradingSettingsSchema.parse({
     ...defaultTradingSettings,
-    ...(typeof input === "object" && input !== null ? input : {}),
-    watchlist: normalizeWatchlist((input as { watchlist?: unknown } | null)?.watchlist ?? defaultTradingSettings.watchlist)
+    ...source,
+    watchlist: normalizeWatchlist(source.watchlist ?? defaultTradingSettings.watchlist)
   });
-  if (parsed.leverage > parsed.maxLeverage) {
-    throw new Error("Leverage must be less than or equal to max leverage");
+  if (parsed.maxPositionPerSymbol !== 1) {
+    throw new Error("Only one active position per symbol is currently supported");
+  }
+  if (parsed.positionSizingMode !== "risk-based") {
+    throw new Error("Risk-based position sizing is required");
   }
   if (parsed.watchlist.length === 0 && parsed.tradingEnabled) {
     throw new Error("Watchlist cannot be empty when trading is enabled");

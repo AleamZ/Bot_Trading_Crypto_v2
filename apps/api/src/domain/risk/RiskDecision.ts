@@ -1,30 +1,22 @@
 import type { Direction } from "../trade/Direction.js";
+import type { FuturesSymbolRules } from "../symbol/SymbolRules.js";
 
 export interface RiskInput {
   symbol: string;
   direction: Direction;
   availableBalance: number;
-  marginPerTrade: number;
-  leverage: number;
+  symbolRules: FuturesSymbolRules;
+  riskPerTradeUsdt: number;
   maxLeverage: number;
+  maxMarginUsagePercent: number;
   entry: number;
   stopLoss: number;
   takeProfit: number;
   minimumRiskReward: number;
-  minNotional: number;
-  maxPositionSize: number;
   openPositions: number;
   maxOpenPositions: number;
   symbolOpenPositions: number;
   maxPositionPerSymbol: number;
-  tradesToday: number;
-  maxTradesPerDay: number;
-  dailyRealizedLoss: number;
-  dailyLossLimitPercent: number;
-  consecutiveLosses: number;
-  maxConsecutiveLosses: number;
-  lastClosedTradeAt: number | null;
-  cooldownAfterTradeMinutes: number;
   availableAt: number;
   drawdownPercent: number;
   maxDrawdownPercent: number;
@@ -39,6 +31,10 @@ export interface RiskDecision {
   symbol: string;
   margin: number;
   leverage: number;
+  requiredLeverage: number;
+  maxLeverage: number;
+  selectedLeverage: number;
+  requiredMargin: number;
   positionSize: number;
   quantity: number;
   notional: number;
@@ -47,6 +43,12 @@ export interface RiskDecision {
   takeProfit: number;
   estimatedLoss: number;
   estimatedProfit: number;
+  actualRiskUsdt: number;
+  targetRiskUsdt: number;
+  riskPerTradeUsdt: number;
+  availableBalance: number;
+  maxAllowedMargin: number;
+  marginUsagePercent: number;
   riskReward: number;
   rejectCode?: RiskRejectCode;
   createdAt: number;
@@ -56,17 +58,17 @@ export type RiskRejectCode =
   | "TRADING_DISABLED"
   | "KILL_SWITCH"
   | "INVALID_BALANCE"
-  | "INVALID_MARGIN"
+  | "INVALID_RISK_PER_TRADE"
   | "INVALID_LEVERAGE"
   | "INVALID_PRICE"
+  | "INVALID_QUANTITY"
+  | "MIN_QTY"
+  | "MAX_QTY"
   | "MARGIN_REQUIREMENT"
+  | "MAX_MARGIN_USAGE_EXCEEDED"
   | "MIN_NOTIONAL"
-  | "MAX_POSITION_SIZE"
-  | "MIN_RR_NOT_MET"
+  | "REQUIRED_LEVERAGE_EXCEEDS_MAX"
+  | "RR_BELOW_MINIMUM"
   | "MAX_OPEN_POSITIONS"
   | "POSITION_ALREADY_OPEN"
-  | "MAX_TRADES_PER_DAY"
-  | "DAILY_LOSS_LIMIT"
-  | "MAX_CONSECUTIVE_LOSSES"
-  | "COOLDOWN_ACTIVE"
-  | "DRAWDOWN_LIMIT";
+  | "MAX_DRAWDOWN_REACHED";

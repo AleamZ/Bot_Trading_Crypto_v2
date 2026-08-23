@@ -7,15 +7,16 @@ import type { Candle } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 import { detectH1Trend } from "../../domain/trend/TrendDetector.js";
 import type { Fvg } from "../../domain/fvg/Fvg.js";
-import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgMitigated } from "../../domain/fvg/FvgDetector.js";
+import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgTouched } from "../../domain/fvg/FvgDetector.js";
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
 import { detectSwings } from "../../domain/market-structure/Swing.js";
 import { selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
-import { calculateEntryPlan, calculateFvgEntry, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
+import { calculateEntryPlan, calculateFirstTouchEntry, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import { evaluateRisk } from "../../domain/risk/RiskManager.js";
 import { transitionSetupState, type SetupState } from "../../domain/setup/SetupStateMachine.js";
+import type { FuturesSymbolRules } from "../../domain/symbol/SymbolRules.js";
 
 export interface EngineState {
   setupState: SetupState;
@@ -24,26 +25,28 @@ export interface EngineState {
   h1Candles: Candle[];
   m5Candles: Candle[];
   openPositions: number;
-  tradesToday: number;
-  consecutiveLosses: number;
-  lastClosedTradeAt: number | null;
-  dailyLossPercent: number;
+  accountOpenPositions: number;
   drawdownPercent: number;
   pendingSignal: MarketStructureSignal | null;
   pendingLtfFvg: Fvg | null;
+  activeLtfFvgCluster: Fvg[];
+  frozenProtectiveCluster: Fvg[];
   pendingEntryPlan: EntryPlan | null;
   activeRisk: RiskDecision | null;
   setupEvidence: SetupEvidence;
 }
 
 export type AvailableBalanceProvider = () => Promise<number | null>;
+export type SymbolRulesProvider = (symbol: string) => Promise<FuturesSymbolRules>;
 
 export interface SetupEvidence {
   htfFvg: Fvg | null;
-  htfMitigatedAt: number | null;
+  htfFirstTouchedAt: number | null;
   ltfSignal: MarketStructureSignal | null;
   ltfFvg: Fvg | null;
-  ltfMitigatedAt: number | null;
+  ltfFirstTouchedAt: number | null;
+  activeLtfFvgCluster: Fvg[];
+  frozenProtectiveCluster: Fvg[];
   entryPlan: EntryPlan | null;
 }
 
@@ -55,6 +58,8 @@ export interface SetupDiagnostic {
   htfFvg: (Fvg & { mitigatedAt: number | null }) | null;
   ltfSignal: MarketStructureSignal | null;
   ltfFvg: (Fvg & { mitigatedAt: number | null }) | null;
+  activeLtfFvgCluster: Fvg[];
+  frozenProtectiveCluster: Fvg[];
   entryPlan: EntryPlan | null;
   evidenceCount: number;
   invariantOk: boolean;
@@ -70,6 +75,7 @@ export class TradingEngine {
     private readonly execution: ExecutionGateway,
     private readonly logger: DecisionLogger,
     private readonly availableBalanceProvider: AvailableBalanceProvider | null = null,
+    private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
     initialBalance = 10_000
   ) {
     this.events = new EventBus(repository, logger);
@@ -80,13 +86,12 @@ export class TradingEngine {
       h1Candles: [],
       m5Candles: [],
       openPositions: 0,
-      tradesToday: 0,
-      consecutiveLosses: 0,
-      lastClosedTradeAt: null,
-      dailyLossPercent: 0,
+      accountOpenPositions: 0,
       drawdownPercent: 0,
       pendingSignal: null,
       pendingLtfFvg: null,
+      activeLtfFvgCluster: [],
+      frozenProtectiveCluster: [],
       pendingEntryPlan: null,
       activeRisk: null,
       setupEvidence: emptySetupEvidence()
@@ -97,13 +102,16 @@ export class TradingEngine {
     return this.state;
   }
 
-  syncActivePosition(position: { side: "long" | "short"; quantity: number; entryPrice: number; unrealizedProfit: number; stopLoss: number | null; takeProfit: number | null } | null): void {
+  syncActivePosition(position: { side: "long" | "short"; quantity: number; entryPrice: number; unrealizedProfit: number; stopLoss: number | null; takeProfit: number | null } | null, accountOpenPositions = position ? 1 : 0): void {
+    this.state.accountOpenPositions = accountOpenPositions;
     if (!position || position.quantity <= 0) {
       if (this.state.openPositions > 0) {
         this.state.openPositions = 0;
         this.state.setupState = "WaitingTrend";
         this.state.pendingSignal = null;
         this.state.pendingLtfFvg = null;
+        this.state.activeLtfFvgCluster = [];
+        this.state.frozenProtectiveCluster = [];
         this.state.pendingEntryPlan = null;
         this.state.activeRisk = null;
         this.state.setupEvidence = emptySetupEvidence();
@@ -115,6 +123,8 @@ export class TradingEngine {
     this.state.setupState = this.state.setupState === "PositionOpened" ? "ManagingTrade" : "PositionOpened";
     this.state.pendingSignal = null;
     this.state.pendingLtfFvg = null;
+    this.state.activeLtfFvgCluster = [];
+    this.state.frozenProtectiveCluster = [];
     this.state.pendingEntryPlan = null;
     this.state.setupEvidence = emptySetupEvidence();
     this.state.trend = position.side === "long" ? "bullish" : "bearish";
@@ -124,6 +134,10 @@ export class TradingEngine {
       symbol: this.config.symbol,
       margin: 0,
       leverage: 0,
+      requiredLeverage: 0,
+      selectedLeverage: 0,
+      requiredMargin: 0,
+      maxLeverage: this.config.maxLeverage,
       positionSize: position.entryPrice * position.quantity,
       quantity: position.quantity,
       notional: position.entryPrice * position.quantity,
@@ -132,6 +146,12 @@ export class TradingEngine {
       takeProfit: position.takeProfit ?? position.entryPrice,
       estimatedLoss: 0,
       estimatedProfit: position.unrealizedProfit,
+      actualRiskUsdt: 0,
+      targetRiskUsdt: this.config.riskPerTradeUsdt,
+      riskPerTradeUsdt: this.config.riskPerTradeUsdt,
+      availableBalance: this.state.balance,
+      maxAllowedMargin: 0,
+      marginUsagePercent: 0,
       riskReward: 0,
       createdAt: Date.now()
     };
@@ -155,6 +175,7 @@ export class TradingEngine {
           ? {
               signal: this.state.pendingSignal,
               fvg: this.state.pendingLtfFvg,
+              cluster: this.state.frozenProtectiveCluster.length > 0 ? this.state.frozenProtectiveCluster : this.state.activeLtfFvgCluster,
               plan: this.state.pendingEntryPlan
             }
           : null,
@@ -178,30 +199,32 @@ export class TradingEngine {
       state: this.state.setupState,
       setupKey: evidence.htfFvg || evidence.ltfSignal || evidence.ltfFvg || evidence.entryPlan ? setupKey : null,
       trend: this.state.trend,
-      htfFvg: evidence.htfFvg ? { ...evidence.htfFvg, mitigatedAt: evidence.htfMitigatedAt } : null,
+      htfFvg: evidence.htfFvg ? { ...evidence.htfFvg, mitigatedAt: evidence.htfFirstTouchedAt } : null,
       ltfSignal: evidence.ltfSignal,
-      ltfFvg: evidence.ltfFvg ? { ...evidence.ltfFvg, mitigatedAt: evidence.ltfMitigatedAt } : null,
+      ltfFvg: evidence.ltfFvg ? { ...evidence.ltfFvg, mitigatedAt: evidence.ltfFirstTouchedAt } : null,
+      activeLtfFvgCluster: evidence.activeLtfFvgCluster,
+      frozenProtectiveCluster: evidence.frozenProtectiveCluster,
       entryPlan: evidence.entryPlan,
       evidenceCount,
       invariantOk: this.state.setupState !== "ReadyToEnter" || evidenceCount === 7
     };
   }
 
-  async onClosedCandle(candle: Candle): Promise<void> {
+  async onClosedCandle(candle: Candle, options: { historical?: boolean } = {}): Promise<void> {
     if (!candle.isClosed) return;
     if (candle.symbol !== this.config.symbol) return;
 
     if (candle.timeframe === "H1") {
       this.state.h1Candles.push(candle);
-      await this.processH1(candle);
+      await this.processH1(candle, options.historical === true);
       return;
     }
 
     this.state.m5Candles.push(candle);
-    await this.processM5(candle);
+    await this.processM5(candle, options.historical === true);
   }
 
-  private async processH1(candle: Candle): Promise<void> {
+  private async processH1(candle: Candle, historical: boolean): Promise<void> {
     const trend = detectH1Trend(this.state.h1Candles, this.config.emaPeriod);
 
     if (trend.direction !== "neutral") {
@@ -247,17 +270,22 @@ export class TradingEngine {
           fvg: invalidated,
           reason: "Closed candle fully crossed the opposite FVG boundary"
         });
-      } else if (existingFvg.status === "waiting-mitigation" && isFvgMitigated(existingFvg, candle, this.config.fvgMitigation)) {
-        const active = { ...existingFvg, status: "active" as const, activatedAt: candle.closeTime };
-        await this.repository.updateFvg(active);
-        this.state.setupEvidence.htfFvg = active;
-        this.state.setupEvidence.htfMitigatedAt = candle.closeTime;
-        this.syncSetupStateWithHtfFvg(active);
+      } else if (isFreshFvg(existingFvg) && isFvgTouched(existingFvg, candle)) {
+        const touched = {
+          ...existingFvg,
+          status: "touched" as const,
+          firstTouchedAt: candle.closeTime,
+          ...(historical ? {} : { activatedAt: candle.closeTime })
+        };
+        await this.repository.updateFvg(touched);
+        this.state.setupEvidence.htfFvg = touched;
+        this.state.setupEvidence.htfFirstTouchedAt = candle.closeTime;
+        if (!historical) this.syncSetupStateWithHtfFvg(touched);
         await this.events.publish({
           type: "FVGActivated",
           at: candle.closeTime,
-          fvg: active,
-          reason: `FVG mitigation mode ${this.config.fvgMitigation} was met`
+          fvg: touched,
+          reason: "H1 FVG first touch reached the nearest boundary"
         });
         return;
       } else {
@@ -283,7 +311,8 @@ export class TradingEngine {
     });
   }
 
-  private async processM5(candle: Candle): Promise<void> {
+  private async processM5(candle: Candle, historical: boolean): Promise<void> {
+    if (historical) return;
     if (this.state.setupState === "ReadyToEnter") {
       await this.processReadyToEnterM5Invalidation(candle);
       return;
@@ -291,7 +320,7 @@ export class TradingEngine {
     if (!["MonitoringLTF", "WaitingCHOCH", "WaitingLtfFvg", "WaitingLtfMitigation"].includes(this.state.setupState)) return;
 
     const htfFvg = await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1");
-    if (!htfFvg || htfFvg.status !== "active" || this.state.trend === "neutral") return;
+    if (!htfFvg || htfFvg.status !== "touched" || htfFvg.activatedAt === undefined || this.state.trend === "neutral") return;
     if (htfFvg.activatedAt !== undefined && candle.closeTime < htfFvg.activatedAt) return;
 
     if (!this.state.pendingSignal) {
@@ -306,7 +335,11 @@ export class TradingEngine {
       }
 
       this.state.pendingSignal = signal;
+      this.state.activeLtfFvgCluster = [];
+      this.state.frozenProtectiveCluster = [];
       this.state.setupEvidence.ltfSignal = signal;
+      this.state.setupEvidence.activeLtfFvgCluster = [];
+      this.state.setupEvidence.frozenProtectiveCluster = [];
       await this.repository.saveSignal(signal);
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingCHOCH");
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingLtfFvg");
@@ -319,60 +352,40 @@ export class TradingEngine {
       return;
     }
 
-    if (!this.state.pendingLtfFvg) {
-      const ltfFvg = detectLatestLtfFvg(this.state.m5Candles, this.state.pendingSignal.direction, this.state.pendingSignal.candleOpenTime);
-      if (!ltfFvg) return;
-
+    const ltfFvg = detectLatestLtfFvg(this.state.m5Candles, this.state.pendingSignal.direction, this.state.pendingSignal.candleOpenTime);
+    if (ltfFvg && !this.state.activeLtfFvgCluster.some((fvg) => fvg.id === ltfFvg.id)) {
       await this.repository.saveFvg(ltfFvg);
-      this.state.pendingLtfFvg = ltfFvg;
+      this.state.activeLtfFvgCluster = [...this.state.activeLtfFvgCluster, ltfFvg];
       this.state.setupEvidence.ltfFvg = ltfFvg;
-      this.state.pendingEntryPlan = this.calculatePlanForLtfFvg(ltfFvg);
-      if (!this.state.pendingEntryPlan) {
-        this.logger.warn("Pending M5 FVG ignored", { reason: "Could not build entry plan from M5 FVG" });
-        return;
-      }
+      this.state.setupEvidence.activeLtfFvgCluster = this.state.activeLtfFvgCluster;
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingLtfMitigation");
       await this.events.publish({
         type: "FVGCreated",
         at: candle.closeTime,
         fvg: ltfFvg,
-        reason: "New M5 FVG formed after BOS/CHOCH in the same direction"
+        reason: "New untouched M5 FVG joined the active setup cluster after BOS/CHOCH"
       });
-      return;
     }
 
-    if (isFvgInvalidated(this.state.pendingLtfFvg, candle)) {
-      const invalidated = { ...this.state.pendingLtfFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
-      await this.repository.updateFvg(invalidated);
-      this.state.setupEvidence.ltfFvg = invalidated;
-      this.state.pendingSignal = null;
-      this.state.pendingLtfFvg = null;
-      this.state.pendingEntryPlan = null;
-      this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
-      await this.events.publish({
-        type: "FVGInvalidated",
-        at: candle.closeTime,
-        fvg: invalidated,
-        reason: "M5 entry FVG was invalidated before entry"
-      });
-      return;
-    }
+    const triggeringFvg = this.state.activeLtfFvgCluster.find((fvg) => isFreshFvg(fvg) && isFvgTouched(fvg, candle));
+    if (!triggeringFvg) return;
 
-    if (!isFvgMitigated(this.state.pendingLtfFvg, candle, this.config.ltfFvgEntryMode)) return;
-
-    const activeLtfFvg = { ...this.state.pendingLtfFvg, status: "active" as const, activatedAt: candle.closeTime };
-    await this.repository.updateFvg(activeLtfFvg);
-    this.state.pendingLtfFvg = activeLtfFvg;
-    this.state.setupEvidence.ltfFvg = activeLtfFvg;
-    this.state.setupEvidence.ltfMitigatedAt = candle.closeTime;
+    const touchedLtfFvg = { ...triggeringFvg, status: "touched" as const, firstTouchedAt: candle.closeTime, activatedAt: candle.closeTime };
+    const frozenCluster = this.state.activeLtfFvgCluster.map((fvg) => (fvg.id === touchedLtfFvg.id ? touchedLtfFvg : fvg));
+    await this.repository.updateFvg(touchedLtfFvg);
+    this.state.pendingLtfFvg = touchedLtfFvg;
+    this.state.frozenProtectiveCluster = frozenCluster;
+    this.state.setupEvidence.ltfFvg = touchedLtfFvg;
+    this.state.setupEvidence.ltfFirstTouchedAt = candle.closeTime;
+    this.state.setupEvidence.frozenProtectiveCluster = frozenCluster;
     await this.events.publish({
       type: "FVGActivated",
       at: candle.closeTime,
-      fvg: activeLtfFvg,
-      reason: `M5 entry FVG mitigation mode ${this.config.ltfFvgEntryMode} was met`
+      fvg: touchedLtfFvg,
+      reason: "M5 FVG first touch triggered entry and froze the active protective cluster"
     });
 
-    const plan = this.calculatePlanForLtfFvg(activeLtfFvg);
+    const plan = await this.calculatePlanForLtfFvg(touchedLtfFvg, frozenCluster);
 
     if (!plan) {
       this.logger.warn("Entry plan rejected before risk manager", {
@@ -384,31 +397,23 @@ export class TradingEngine {
     this.state.setupEvidence.entryPlan = plan;
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "ReadyToEnter");
     const availableBalance = await this.getAvailableBalance();
+    const symbolRules = await this.getSymbolRules();
     const risk = evaluateRisk({
       symbol: this.config.symbol,
       direction: plan.direction,
       availableBalance,
-      marginPerTrade: this.config.marginPerTrade,
-      leverage: this.config.leverage,
+      symbolRules,
+      riskPerTradeUsdt: this.config.riskPerTradeUsdt,
       maxLeverage: this.config.maxLeverage,
+      maxMarginUsagePercent: this.config.maxMarginUsagePercent,
       entry: plan.entry,
       stopLoss: plan.stopLoss,
       takeProfit: plan.takeProfit,
       minimumRiskReward: this.config.minimumRiskReward,
-      minNotional: this.config.minNotional,
-      maxPositionSize: this.config.maxPositionSize,
-      openPositions: this.state.openPositions,
+      openPositions: this.state.accountOpenPositions,
       maxOpenPositions: this.config.maxOpenPositions,
       symbolOpenPositions: this.state.openPositions,
       maxPositionPerSymbol: this.config.maxPositionPerSymbol,
-      tradesToday: this.state.tradesToday,
-      maxTradesPerDay: this.config.maxTradesPerDay,
-      dailyRealizedLoss: availableBalance * (this.state.dailyLossPercent / 100),
-      dailyLossLimitPercent: this.config.maxDailyLossPercent,
-      consecutiveLosses: this.state.consecutiveLosses,
-      maxConsecutiveLosses: this.config.maxConsecutiveLosses,
-      lastClosedTradeAt: this.state.lastClosedTradeAt,
-      cooldownAfterTradeMinutes: this.config.cooldownAfterTradeMinutes,
       availableAt: candle.closeTime,
       drawdownPercent: this.state.drawdownPercent,
       maxDrawdownPercent: this.config.maxDrawdownPercent,
@@ -433,10 +438,9 @@ export class TradingEngine {
         tp: risk.takeProfit,
         rr: risk.riskReward,
         minimumRR: this.config.minimumRiskReward,
-        openPositions: this.state.openPositions,
+        openPositions: this.state.accountOpenPositions,
+        symbolOpenPositions: this.state.openPositions,
         maxOpenPositions: this.config.maxOpenPositions,
-        tradesToday: this.state.tradesToday,
-        maxTradesPerDay: this.config.maxTradesPerDay
       });
       return;
     }
@@ -452,16 +456,18 @@ export class TradingEngine {
       });
       this.state.pendingSignal = null;
       this.state.pendingLtfFvg = null;
+      this.state.activeLtfFvgCluster = [];
+      this.state.frozenProtectiveCluster = [];
       this.state.pendingEntryPlan = null;
       return;
     }
 
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "PositionOpened");
     this.state.openPositions += 1;
-    this.state.tradesToday += 1;
     this.state.activeRisk = risk;
     this.state.pendingSignal = null;
     this.state.pendingLtfFvg = null;
+    this.state.activeLtfFvgCluster = [];
     this.state.pendingEntryPlan = null;
     await this.events.publish({
       type: "OrderSubmitted",
@@ -489,36 +495,58 @@ export class TradingEngine {
     return 0;
   }
 
-  private calculatePlanForLtfFvg(ltfFvg: Fvg): EntryPlan | null {
+  private async calculatePlanForLtfFvg(ltfFvg: Fvg, protectiveCluster: readonly Fvg[]): Promise<EntryPlan | null> {
     const h1Swings = detectSwings(this.state.h1Candles, { left: this.config.swingLeft, right: this.config.swingRight });
-    const entry = calculateFvgEntry(ltfFvg, this.config.ltfFvgEntryMode);
+    const entry = calculateFirstTouchEntry(ltfFvg);
     const externalLiquidity = selectExternalLiquidityTarget(h1Swings, ltfFvg.direction, entry);
+    const symbolRules = await this.getSymbolRules();
     return calculateEntryPlan({
       direction: ltfFvg.direction,
-      ltfFvg,
+      triggeringFvg: ltfFvg,
+      protectiveCluster,
       m5Candles: this.state.m5Candles,
       externalLiquidityPrice: externalLiquidity?.price ?? null,
       config: {
-        entryFvgMitigation: this.config.ltfFvgEntryMode,
-        takeProfitMode: this.config.takeProfitMode,
-        fixedRr: this.config.fixedRr,
         stopLossBufferMode: this.config.stopLossBufferMode,
         stopLossBufferTicks: this.config.stopLossBufferTicks,
         stopLossBufferPercent: this.config.stopLossBufferPercent,
         stopLossAtrPeriod: this.config.stopLossAtrPeriod,
         stopLossAtrMultiplier: this.config.stopLossAtrMultiplier,
-        priceTickSize: this.config.priceTickSize
+        symbolTickSize: symbolRules.tickSize
       }
     });
   }
 
+  private async getSymbolRules(): Promise<FuturesSymbolRules> {
+    if (this.symbolRulesProvider) return this.symbolRulesProvider(this.config.symbol);
+    return {
+      symbol: this.config.symbol,
+      status: "TRADING",
+      contractType: null,
+      quoteAsset: "USDT",
+      marginAsset: "USDT",
+      pricePrecision: null,
+      quantityPrecision: null,
+      tickSize: 0.1,
+      minPrice: null,
+      maxPrice: null,
+      stepSize: 0.001,
+      minQty: 0,
+      maxQty: null,
+      minNotional: null,
+      maxLeverage: this.config.maxLeverage,
+      supportedOrderTypes: ["MARKET", "LIMIT"]
+    };
+  }
+
   private syncSetupStateWithHtfFvg(fvg: Fvg): void {
-    if (fvg.status === "waiting-mitigation") {
+    if (isFreshFvg(fvg)) {
       this.state.setupState = advanceSetupState(this.state.setupState, "WaitingMitigation");
       return;
     }
 
-    if (fvg.status === "active") {
+    if (fvg.status === "touched") {
+      this.state.setupEvidence.htfFirstTouchedAt = fvg.firstTouchedAt ?? fvg.activatedAt ?? null;
       this.state.setupState = advanceSetupState(this.state.setupState, "MonitoringLTF");
     }
   }
@@ -533,6 +561,8 @@ export class TradingEngine {
     this.state.setupEvidence.ltfFvg = invalidated;
     this.state.pendingSignal = null;
     this.state.pendingLtfFvg = null;
+    this.state.activeLtfFvgCluster = [];
+    this.state.frozenProtectiveCluster = [];
     this.state.pendingEntryPlan = null;
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
     await this.events.publish({
@@ -548,6 +578,8 @@ export class TradingEngine {
     this.state.trend = direction;
     this.state.pendingSignal = null;
     this.state.pendingLtfFvg = null;
+    this.state.activeLtfFvgCluster = [];
+    this.state.frozenProtectiveCluster = [];
     this.state.pendingEntryPlan = null;
     this.state.setupEvidence = emptySetupEvidence();
     if (this.state.openPositions === 0) {
@@ -579,23 +611,29 @@ function isDisplacementSignal(
   return strongClose && body >= averageBody * bodyMultiplier;
 }
 
+function isFreshFvg(fvg: Fvg): boolean {
+  return fvg.status === "untouched";
+}
+
 function emptySetupEvidence(): SetupEvidence {
   return {
     htfFvg: null,
-    htfMitigatedAt: null,
+    htfFirstTouchedAt: null,
     ltfSignal: null,
     ltfFvg: null,
-    ltfMitigatedAt: null,
+    ltfFirstTouchedAt: null,
+    activeLtfFvgCluster: [],
+    frozenProtectiveCluster: [],
     entryPlan: null
   };
 }
 
 export function countSetupEvidence(evidence: SetupEvidence): number {
   if (!evidence.htfFvg) return 0;
-  if (!evidence.htfMitigatedAt) return 2;
+  if (!evidence.htfFirstTouchedAt) return 2;
   if (!evidence.ltfSignal) return 3;
   if (!evidence.ltfFvg) return 4;
-  if (!evidence.ltfMitigatedAt) return 5;
+  if (!evidence.ltfFirstTouchedAt) return 5;
   return evidence.entryPlan ? 7 : 6;
 }
 

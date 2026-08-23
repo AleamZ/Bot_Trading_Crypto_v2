@@ -27,8 +27,8 @@ import { detectH1Trend } from "../../domain/trend/TrendDetector.js";
 import { calculateEntryPlan, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import { evaluateRisk } from "../../domain/risk/RiskManager.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
-import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgMitigated } from "../../domain/fvg/FvgDetector.js";
-import type { Fvg, FvgMitigationMode } from "../../domain/fvg/Fvg.js";
+import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgTouched } from "../../domain/fvg/FvgDetector.js";
+import type { Fvg } from "../../domain/fvg/Fvg.js";
 import { buildLiquidityState } from "../../domain/liquidity/LiquidityDetector.js";
 import { selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
 import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
@@ -271,8 +271,9 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
           timeframe: query.interval,
           candles,
           emaPeriod: runtimeConfig.emaPeriod,
-          marginPerTrade: runtimeConfig.marginPerTrade,
-          leverage: runtimeConfig.leverage,
+      riskPerTradeUsdt: runtimeConfig.riskPerTradeUsdt,
+      maxLeverage: runtimeConfig.maxLeverage,
+      maxMarginUsagePercent: runtimeConfig.maxMarginUsagePercent,
           manualPositions: await getManualPositions(accountClient, query.symbol, params.logger)
         });
         response.writeHead(200, noCacheHeaders("application/json", requestCorsHeaders));
@@ -676,7 +677,9 @@ async function handleTradingAccountRoute(params: {
         watchlistRows: snapshot.watchlistStatus,
         runtimeHealth: snapshot.runtimeHealth,
         execution: snapshot.execution,
-        realReadiness: snapshot.realReadiness
+        realReadiness: snapshot.realReadiness,
+        dailyRisk: snapshot.dailyRisk,
+        accountProtection: snapshot.accountProtection
       },
       corsHeaders
     );
@@ -726,7 +729,13 @@ async function handleTradingAccountRoute(params: {
       return;
     }
     const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol) : null;
-    sendJson(response, 200, await buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, marketDataForAccount(account, marketData), diagnostic), corsHeaders);
+    const symbolRules = runtimeManager ? await runtimeManager.getSymbolRules(accountId, symbol).catch(() => null) : null;
+    const analysis = await buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, marketDataForAccount(account, marketData), diagnostic, {
+      symbolTickSize: symbolRules?.tickSize ?? 0.1
+    });
+    const dailyRisk = runtimeManager ? await runtimeManager.getDailyRiskStatus(accountId) : null;
+    const accountProtection = runtimeManager ? await runtimeManager.getAccountProtectionStatus(accountId) : null;
+    sendJson(response, 200, { ...analysis, dailyRisk, accountProtection }, corsHeaders);
     return;
   }
 
@@ -754,8 +763,9 @@ async function handleTradingAccountRoute(params: {
         timeframe: query.interval,
         candles,
         emaPeriod: settings.emaPeriod,
-        marginPerTrade: settings.marginPerTrade,
-        leverage: settings.leverage,
+        riskPerTradeUsdt: settings.riskPerTradeUsdt,
+        maxLeverage: settings.maxLeverage,
+        maxMarginUsagePercent: settings.maxMarginUsagePercent,
         manualPositions,
         includeBotPositionOverlays: account.mode === "DEMO"
       }),
@@ -1003,8 +1013,9 @@ async function buildChartOverlays(params: {
   timeframe: string;
   candles: Array<{ time: number; openTime: number; closeTime: number; open: number; high: number; low: number; close: number; volume?: number }>;
   emaPeriod: number;
-  marginPerTrade: number;
-  leverage: number;
+  riskPerTradeUsdt: number;
+  maxLeverage: number;
+  maxMarginUsagePercent: number;
   manualPositions: BinanceFuturesPositionStatus[];
   includeBotPositionOverlays?: boolean;
 }): Promise<unknown> {
@@ -1072,8 +1083,8 @@ async function buildChartOverlays(params: {
     symbol: params.symbol,
     timeframe: params.timeframe,
     candles: params.candles,
-    marginPerTrade: params.marginPerTrade,
-    leverage: params.leverage,
+    riskPerTradeUsdt: params.riskPerTradeUsdt,
+    maxLeverage: params.maxLeverage,
     includeBotPositionOverlays: params.includeBotPositionOverlays ?? true
   })) {
     positions.set(String(position.id), position);
@@ -1153,13 +1164,21 @@ interface AnalysisSetupContext {
   signal: MarketStructureSignal | null;
   ltfFvg: Fvg | null;
   ltfMitigatedAt: number | null;
+  activeLtfFvgCluster: Fvg[];
+  frozenProtectiveCluster: Fvg[];
   plan: EntryPlan | null;
   entryDetail: string | null;
   invalidatedConditionId: string | null;
   invalidatedReason: string | null;
 }
 
-export async function buildSymbolAnalysis(symbol: string, config: AppConfig, marketData: BinanceFuturesMarketData, canonicalSetup: SetupDiagnostic | null = null): Promise<{
+export async function buildSymbolAnalysis(
+  symbol: string,
+  config: AppConfig,
+  marketData: BinanceFuturesMarketData,
+  canonicalSetup: SetupDiagnostic | null = null,
+  options: { symbolTickSize?: number } = {}
+): Promise<{
   symbol: string;
   checkedAt: string;
   setupState: AnalysisSetupState;
@@ -1172,20 +1191,24 @@ export async function buildSymbolAnalysis(symbol: string, config: AppConfig, mar
   };
   summary: string;
   conditions: AnalysisCondition[];
-  riskManagement: {
-    final: "WAITING_FOR_STRATEGY" | "READY_TO_TRADE" | "BLOCKED";
-    reason: string | null;
-    checks: AnalysisRiskCheck[];
-    decision: RiskDecision | null;
+    riskManagement: {
+      final: "WAITING_FOR_STRATEGY" | "READY_TO_TRADE" | "BLOCKED";
+      reason: string | null;
+      checks: AnalysisRiskCheck[];
+      decision: RiskDecision | null;
   };
   plan: EntryPlan | null;
+  fvgLifecycle: unknown;
 }> {
   const [h1Candles, m5Candles] = await Promise.all([
     marketData.getClosedCandles(symbol, "H1", Math.max(config.emaPeriod + 80, 160)),
     marketData.getClosedCandles(symbol, "M5", 360)
   ]);
   const trend = detectH1Trend(h1Candles, config.emaPeriod);
-  const setup = canonicalSetup?.symbol === symbol && canonicalSetup.setupKey ? setupFromDiagnostic(symbol, canonicalSetup) : buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config);
+  const setup =
+    canonicalSetup?.symbol === symbol && canonicalSetup.setupKey
+      ? setupFromDiagnostic(symbol, canonicalSetup)
+      : buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config, options.symbolTickSize ?? 0.1);
   const conditions = buildLifecycleConditions(setup, config);
   const riskManagement = buildAnalysisRiskManagement(setup, config);
 
@@ -1203,7 +1226,26 @@ export async function buildSymbolAnalysis(symbol: string, config: AppConfig, mar
     summary: riskManagement.final === "READY_TO_TRADE" ? "READY TO TRADE" : riskManagement.final === "BLOCKED" ? `BLOCKED: ${riskManagement.reason ?? "-"}` : buildLifecycleSummary(setup, conditions),
     conditions,
     riskManagement,
-    plan: setup.plan
+    plan: setup.plan,
+    fvgLifecycle: {
+      htf: {
+        fvg: setup.htfFvg,
+        firstTouchedAt: setup.htfMitigatedAt,
+        lifecycleState: setup.htfFvg?.status ?? null
+      },
+      ltf: {
+        activeClusterId: setup.signal ? `${symbol}:${setup.signal.id}` : null,
+        activeCluster: setup.activeLtfFvgCluster,
+        frozenProtectiveCluster: setup.frozenProtectiveCluster,
+        triggeringFvg: setup.ltfFvg,
+        firstTouchedAt: setup.ltfMitigatedAt
+      },
+      entryPlan: {
+        structuralStopBoundary: setup.plan?.structuralStopBoundary ?? null,
+        appliedBuffer: setup.plan?.stopLossBuffer ?? null,
+        targetRiskUsdt: config.riskPerTradeUsdt
+      }
+    }
   };
 }
 
@@ -1223,6 +1265,8 @@ function setupFromDiagnostic(symbol: string, diagnostic: SetupDiagnostic): Analy
     signal: diagnostic.ltfSignal,
     ltfFvg,
     ltfMitigatedAt,
+    activeLtfFvgCluster: diagnostic.activeLtfFvgCluster,
+    frozenProtectiveCluster: diagnostic.frozenProtectiveCluster,
     plan: diagnostic.invariantOk ? diagnostic.entryPlan : null,
     entryDetail: diagnostic.invariantOk ? null : "Runtime setup is missing required ReadyToEnter evidence",
     invalidatedConditionId: diagnostic.state === "Archived" ? invalidatedConditionFromDiagnostic(diagnostic) : null,
@@ -1243,7 +1287,7 @@ function analysisStateFromDiagnostic(diagnostic: SetupDiagnostic): AnalysisSetup
 
 function invalidatedConditionFromDiagnostic(diagnostic: SetupDiagnostic): string {
   if (diagnostic.ltfFvg?.status === "invalidated") return "m5-fvg-pullback";
-  if (diagnostic.htfFvg?.status === "invalidated") return "htf-fvg-mitigated";
+  if (diagnostic.htfFvg?.status === "invalidated") return "htf-fvg-first-touch";
   return "entry-plan";
 }
 
@@ -1251,7 +1295,8 @@ function buildAnalysisLifecycle(
   symbol: string,
   h1Input: readonly Candle[],
   m5Input: readonly Candle[],
-  config: AppConfig
+  config: AppConfig,
+  symbolTickSize: number
 ): AnalysisSetupContext {
   const h1Candles: Candle[] = [];
   const m5Candles: Candle[] = [];
@@ -1271,7 +1316,7 @@ function buildAnalysisLifecycle(
     }
 
     m5Candles.push(candle);
-    const result = processAnalysisM5Candle(setup, candle, h1Candles, m5Candles, config);
+    const result = processAnalysisM5Candle(setup, candle, h1Candles, m5Candles, config, symbolTickSize);
     setup = result.setup;
     if (result.invalidated) {
       lastInvalidatedSetup = result.invalidated;
@@ -1306,7 +1351,7 @@ function processAnalysisH1Candle(
   if (setup.htfFvg && ["WAITING_HTF_MITIGATION", "WAITING_M5_BOS", "WAITING_M5_FVG", "WAITING_M5_PULLBACK"].includes(setup.state)) {
     if (isFvgInvalidated(setup.htfFvg, candle)) {
       invalidatedHtfFvgId = setup.htfFvg.id;
-      invalidatedSetup = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated bởi H1 close phá boundary đối diện");
+      invalidatedSetup = invalidateAnalysisSetup(setup, "htf-fvg-first-touch", "HTF FVG bị invalidated bởi H1 close phá boundary đối diện");
       setup = createEmptyAnalysisSetup(candle.symbol);
     }
   }
@@ -1340,7 +1385,7 @@ function processAnalysisH1Candle(
   if (setup.state === "WAITING_HTF_MITIGATION" && setup.htfFvg) {
     if (isFvgInvalidated(setup.htfFvg, candle)) {
       invalidatedHtfFvgId = setup.htfFvg.id;
-      invalidatedSetup = invalidateAnalysisSetup(setup, "htf-fvg-mitigated", "HTF FVG bị invalidated trước khi mitigation");
+      invalidatedSetup = invalidateAnalysisSetup(setup, "htf-fvg-first-touch", "HTF FVG bị invalidated trước first touch");
       setup = createEmptyAnalysisSetup(candle.symbol);
       if (trend.direction !== "neutral") {
         setup = {
@@ -1362,7 +1407,7 @@ function processAnalysisH1Candle(
       return { setup, invalidated: invalidatedSetup };
     }
 
-    if (isFvgMitigated(setup.htfFvg, candle, config.fvgMitigation)) {
+    if (isFvgTouched(setup.htfFvg, candle)) {
       setup = {
         ...setup,
         state: "WAITING_M5_BOS",
@@ -1379,7 +1424,8 @@ function processAnalysisM5Candle(
   candle: Candle,
   h1Candles: readonly Candle[],
   m5Candles: readonly Candle[],
-  config: AppConfig
+  config: AppConfig,
+  symbolTickSize: number
 ): { setup: AnalysisSetupContext; invalidated: AnalysisSetupContext | null } {
   if (!setup.direction || !setup.htfFvg || setup.htfMitigatedAt === null) {
     return { setup, invalidated: null };
@@ -1405,26 +1451,34 @@ function processAnalysisM5Candle(
 
   if (setup.state === "WAITING_M5_FVG" && setup.signal) {
     const ltfFvg = detectLatestLtfFvg(m5Candles, direction, setup.signal.candleOpenTime);
-    if (ltfFvg) {
+    if (ltfFvg && !setup.activeLtfFvgCluster.some((fvg) => fvg.id === ltfFvg.id)) {
       setup = {
         ...setup,
         state: "WAITING_M5_PULLBACK",
-        ltfFvg
+        ltfFvg,
+        activeLtfFvgCluster: [...setup.activeLtfFvgCluster, ltfFvg]
       };
     }
   }
 
-  if (setup.state === "WAITING_M5_PULLBACK" && setup.ltfFvg) {
-    if (isFvgInvalidated(setup.ltfFvg, candle)) {
-      const invalidated = invalidateAnalysisSetup(setup, "m5-fvg-pullback", "M5 FVG target bị invalidated trước khi pullback mitigation");
-      return { setup: createEmptyAnalysisSetup(candle.symbol), invalidated };
+  if (setup.state === "WAITING_M5_PULLBACK" && setup.signal) {
+    const ltfFvg = detectLatestLtfFvg(m5Candles, direction, setup.signal.candleOpenTime);
+    if (ltfFvg && !setup.activeLtfFvgCluster.some((fvg) => fvg.id === ltfFvg.id)) {
+      setup = {
+        ...setup,
+        ltfFvg,
+        activeLtfFvgCluster: [...setup.activeLtfFvgCluster, ltfFvg]
+      };
     }
 
-    if (isFvgMitigated(setup.ltfFvg, candle, config.ltfFvgEntryMode)) {
-      const planCheck = calculateAnalysisEntryPlan(direction, setup.ltfFvg, h1Candles, m5Candles, config);
+    const triggeringFvg = setup.activeLtfFvgCluster.find((fvg) => fvg.status === "untouched" && isFvgTouched(fvg, candle));
+    if (triggeringFvg) {
+      const touched = { ...triggeringFvg, status: "touched" as const, firstTouchedAt: candle.closeTime, activatedAt: candle.closeTime };
+      const frozenCluster = setup.activeLtfFvgCluster.map((fvg) => (fvg.id === touched.id ? touched : fvg));
+      const planCheck = calculateAnalysisEntryPlan(direction, touched, frozenCluster, h1Candles, m5Candles, config, symbolTickSize);
       if (!planCheck.plan) {
         const invalidated = invalidateAnalysisSetup(
-          { ...setup, ltfMitigatedAt: candle.closeTime, entryDetail: planCheck.detail },
+          { ...setup, ltfFvg: touched, ltfMitigatedAt: candle.closeTime, frozenProtectiveCluster: frozenCluster, entryDetail: planCheck.detail },
           "entry-plan",
           planCheck.detail
         );
@@ -1434,7 +1488,9 @@ function processAnalysisM5Candle(
       setup = {
         ...setup,
         state: "READY_TO_ENTRY",
+        ltfFvg: touched,
         ltfMitigatedAt: candle.closeTime,
+        frozenProtectiveCluster: frozenCluster,
         plan: planCheck.plan,
         entryDetail: planCheck.detail
       };
@@ -1455,6 +1511,8 @@ function createEmptyAnalysisSetup(symbol: string): AnalysisSetupContext {
     signal: null,
     ltfFvg: null,
     ltfMitigatedAt: null,
+    activeLtfFvgCluster: [],
+    frozenProtectiveCluster: [],
     plan: null,
     entryDetail: null,
     invalidatedConditionId: null,
@@ -1481,10 +1539,10 @@ function buildLifecycleConditions(setup: AnalysisSetupContext, config: AppConfig
       setup.htfFvg ? describeFvg(setup.htfFvg) : setup.direction ? `Waiting for ${setup.direction} H1 FVG` : "Waiting for trend first"
     ),
     condition(
-      "htf-fvg-mitigated",
-      `HTF FVG mitigated (${config.fvgMitigation})`,
-      setup.htfMitigatedAt ? "PASSED" : statusFor(setup, "htf-fvg-mitigated"),
-      setup.htfMitigatedAt && setup.htfFvg ? `PASSED tại ${formatServerDate(setup.htfMitigatedAt)} · ${describeFvg(setup.htfFvg)}` : "Waiting for HTF FVG mitigation"
+      "htf-fvg-first-touch",
+      "HTF FVG first touch",
+      setup.htfMitigatedAt ? "PASSED" : statusFor(setup, "htf-fvg-first-touch"),
+      setup.htfMitigatedAt && setup.htfFvg ? `PASSED tại ${formatServerDate(setup.htfMitigatedAt)} · ${describeFvg(setup.htfFvg)}` : "Waiting for first wick touch of nearest FVG boundary"
     ),
     condition(
       "m5-structure",
@@ -1500,9 +1558,9 @@ function buildLifecycleConditions(setup: AnalysisSetupContext, config: AppConfig
     ),
     condition(
       "m5-fvg-pullback",
-      `M5 FVG pullback mitigated (${config.ltfFvgEntryMode})`,
+      "M5 FVG first touch",
       setup.ltfMitigatedAt ? "PASSED" : statusFor(setup, "m5-fvg-pullback"),
-      setup.ltfMitigatedAt && setup.ltfFvg ? `PASSED tại ${formatServerDate(setup.ltfMitigatedAt)} · ${describeFvg(setup.ltfFvg)}` : "Waiting for price pullback into stored M5 FVG"
+      setup.ltfMitigatedAt && setup.ltfFvg ? `PASSED tại ${formatServerDate(setup.ltfMitigatedAt)} · ${describeFvg(setup.ltfFvg)}` : "Waiting for first wick touch of an active-cluster M5 FVG"
     ),
     condition(
       "entry-plan",
@@ -1533,11 +1591,7 @@ function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppCon
   const waitingChecks: AnalysisRiskCheck[] = [
     riskCheck("minimum-rr", "Minimum R/R", "WAITING", "Waiting for strategy entry plan"),
     riskCheck("trading-enabled", "Trading Enabled", "WAITING", "Waiting for strategy entry plan"),
-    riskCheck("max-open-positions", "Max Open Positions", "WAITING", "Waiting for strategy entry plan"),
-    riskCheck("max-trades-per-day", "Max Trades / Day", "WAITING", "Waiting for strategy entry plan"),
-    riskCheck("daily-loss-limit", "Daily Loss Limit", "WAITING", "Waiting for strategy entry plan"),
-    riskCheck("max-consecutive-losses", "Max Consecutive Losses", "WAITING", "Waiting for strategy entry plan"),
-    riskCheck("cooldown", "Cooldown", "WAITING", "Waiting for strategy entry plan")
+    riskCheck("max-open-positions", "Max Open Positions", "WAITING", "Waiting for strategy entry plan")
   ];
 
   if (!setup.plan) {
@@ -1554,27 +1608,35 @@ function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppCon
     symbol: setup.id,
     direction: setup.plan.direction,
     availableBalance,
-    marginPerTrade: config.marginPerTrade,
-    leverage: config.leverage,
+    symbolRules: {
+      symbol: setup.id,
+      status: "TRADING",
+      contractType: null,
+      quoteAsset: "USDT",
+      marginAsset: "USDT",
+      pricePrecision: null,
+      quantityPrecision: null,
+      tickSize: 0.1,
+      minPrice: null,
+      maxPrice: null,
+      stepSize: 0.001,
+      minQty: 0,
+      maxQty: null,
+      minNotional: null,
+      maxLeverage: config.maxLeverage,
+      supportedOrderTypes: ["MARKET", "LIMIT"]
+    },
+    riskPerTradeUsdt: config.riskPerTradeUsdt,
     maxLeverage: config.maxLeverage,
+    maxMarginUsagePercent: config.maxMarginUsagePercent,
     entry: setup.plan.entry,
     stopLoss: setup.plan.stopLoss,
     takeProfit: setup.plan.takeProfit,
     minimumRiskReward: config.minimumRiskReward,
-    minNotional: config.minNotional,
-    maxPositionSize: config.maxPositionSize,
     openPositions: 0,
     maxOpenPositions: config.maxOpenPositions,
     symbolOpenPositions: 0,
     maxPositionPerSymbol: config.maxPositionPerSymbol,
-    tradesToday: 0,
-    maxTradesPerDay: config.maxTradesPerDay,
-    dailyRealizedLoss: 0,
-    dailyLossLimitPercent: config.maxDailyLossPercent,
-    consecutiveLosses: 0,
-    maxConsecutiveLosses: config.maxConsecutiveLosses,
-    lastClosedTradeAt: null,
-    cooldownAfterTradeMinutes: config.cooldownAfterTradeMinutes,
     availableAt: Date.now(),
     drawdownPercent: 0,
     maxDrawdownPercent: config.maxDrawdownPercent,
@@ -1586,11 +1648,7 @@ function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppCon
   const checks: AnalysisRiskCheck[] = [
     riskCheck("minimum-rr", "Minimum R/R", setup.plan.riskReward >= config.minimumRiskReward ? "PASSED" : "INVALIDATED", `RR thực tế ${formatServerPrice(setup.plan.riskReward)} · minimum ${formatServerPrice(config.minimumRiskReward)}`),
     riskCheck("trading-enabled", "Trading Enabled", config.tradingEnabled ? "PASSED" : "INVALIDATED", config.tradingEnabled ? "ON" : "OFF"),
-    riskCheck("max-open-positions", "Max Open Positions", decision.rejectCode === "MAX_OPEN_POSITIONS" ? "INVALIDATED" : "PASSED", `Max ${config.maxOpenPositions}`),
-    riskCheck("max-trades-per-day", "Max Trades / Day", decision.rejectCode === "MAX_TRADES_PER_DAY" ? "INVALIDATED" : "PASSED", `Max ${config.maxTradesPerDay}`),
-    riskCheck("daily-loss-limit", "Daily Loss Limit", decision.rejectCode === "DAILY_LOSS_LIMIT" ? "INVALIDATED" : "PASSED", `${formatServerPrice(config.maxDailyLossPercent)}%`),
-    riskCheck("max-consecutive-losses", "Max Consecutive Losses", decision.rejectCode === "MAX_CONSECUTIVE_LOSSES" ? "INVALIDATED" : "PASSED", `Max ${config.maxConsecutiveLosses}`),
-    riskCheck("cooldown", "Cooldown", decision.rejectCode === "COOLDOWN_ACTIVE" ? "INVALIDATED" : "PASSED", `${config.cooldownAfterTradeMinutes} minutes`)
+    riskCheck("max-open-positions", "Max Open Positions", decision.rejectCode === "MAX_OPEN_POSITIONS" ? "INVALIDATED" : "PASSED", `Max ${config.maxOpenPositions}`)
   ];
 
   return {
@@ -1608,28 +1666,28 @@ function riskCheck(id: string, label: string, status: AnalysisStatus, detail: st
 function calculateAnalysisEntryPlan(
   direction: Direction,
   ltfFvg: Fvg,
+  protectiveCluster: readonly Fvg[],
   h1Candles: readonly Candle[],
   m5Candles: readonly Candle[],
-  config: AppConfig
+  config: AppConfig,
+  symbolTickSize: number
 ): { plan: EntryPlan | null; detail: string } {
   const h1Swings = detectSwings(h1Candles, { left: config.swingLeft, right: config.swingRight });
-  const entry = calculateAnalysisFvgEntry(ltfFvg, config.ltfFvgEntryMode);
+  const entry = ltfFvg.direction === "bullish" ? ltfFvg.upper : ltfFvg.lower;
   const externalLiquidity = selectExternalLiquidityTarget(h1Swings, direction, entry);
   const plan = calculateEntryPlan({
     direction,
-    ltfFvg,
+    triggeringFvg: ltfFvg,
+    protectiveCluster,
     m5Candles,
     externalLiquidityPrice: externalLiquidity?.price ?? null,
     config: {
-      entryFvgMitigation: config.ltfFvgEntryMode,
-      takeProfitMode: config.takeProfitMode,
-      fixedRr: config.fixedRr,
       stopLossBufferMode: config.stopLossBufferMode,
       stopLossBufferTicks: config.stopLossBufferTicks,
       stopLossBufferPercent: config.stopLossBufferPercent,
       stopLossAtrPeriod: config.stopLossAtrPeriod,
       stopLossAtrMultiplier: config.stopLossAtrMultiplier,
-      priceTickSize: config.priceTickSize
+      symbolTickSize
     }
   });
 
@@ -1640,14 +1698,9 @@ function calculateAnalysisEntryPlan(
     };
   }
 
-  const stopLoss = calculateAnalysisStopLoss(direction, ltfFvg, m5Candles, config);
+  const stopLoss = calculateAnalysisStopLoss(direction, protectiveCluster, m5Candles, config, symbolTickSize);
   const riskDistance = Math.abs(entry - stopLoss);
-  const takeProfit =
-    config.takeProfitMode === "external-liquidity" && externalLiquidity
-      ? externalLiquidity.price
-      : direction === "bullish"
-        ? entry + riskDistance * config.fixedRr
-        : entry - riskDistance * config.fixedRr;
+  const takeProfit = externalLiquidity?.price ?? 0;
   const rewardDistance = direction === "bullish" ? takeProfit - entry : entry - takeProfit;
   const diagnostics = [
     `Entry ${formatServerPrice(entry)}`,
@@ -1661,7 +1714,7 @@ function calculateAnalysisEntryPlan(
   if (stopLoss <= 0) return { plan: null, detail: `Stop loss không hợp lệ. ${diagnostics}` };
   if (riskDistance <= 0) return { plan: null, detail: `Risk distance bằng 0, entry và SL trùng/không hợp lệ. ${diagnostics}` };
   if (takeProfit <= 0) return { plan: null, detail: `Take profit không hợp lệ. ${diagnostics}` };
-  if (config.takeProfitMode === "external-liquidity" && !externalLiquidity) {
+  if (!externalLiquidity) {
     return { plan: null, detail: `Không tìm thấy HTF external liquidity để đặt TP. ${diagnostics}` };
   }
   if (rewardDistance <= 0) {
@@ -1675,21 +1728,19 @@ function calculateAnalysisEntryPlan(
   return { plan: null, detail: `Entry plan không hợp lệ. ${diagnostics}` };
 }
 
-function calculateAnalysisFvgEntry(fvg: Fvg, mode: FvgMitigationMode): number {
-  if (mode === "ce") return fvg.midpoint;
-  if (fvg.direction === "bullish") return mode === "edge" ? fvg.upper : fvg.lower;
-  return mode === "edge" ? fvg.lower : fvg.upper;
+function calculateAnalysisStopLoss(direction: Direction, protectiveCluster: readonly Fvg[], candles: readonly Candle[], config: AppConfig, symbolTickSize: number): number {
+  const boundary =
+    direction === "bullish"
+      ? Math.min(...protectiveCluster.map((fvg) => fvg.lower))
+      : Math.max(...protectiveCluster.map((fvg) => fvg.upper));
+  const buffer = calculateAnalysisStopLossBuffer(boundary, candles, config, symbolTickSize);
+  return direction === "bullish" ? boundary - buffer : boundary + buffer;
 }
 
-function calculateAnalysisStopLoss(direction: Direction, fvg: Fvg, candles: readonly Candle[], config: AppConfig): number {
-  const buffer = calculateAnalysisStopLossBuffer(fvg, candles, config);
-  return direction === "bullish" ? fvg.lower - buffer : fvg.upper + buffer;
-}
-
-function calculateAnalysisStopLossBuffer(fvg: Fvg, candles: readonly Candle[], config: AppConfig): number {
-  if (config.stopLossBufferMode === "percentage") return fvg.midpoint * (config.stopLossBufferPercent / 100);
+function calculateAnalysisStopLossBuffer(boundary: number, candles: readonly Candle[], config: AppConfig, symbolTickSize: number): number {
+  if (config.stopLossBufferMode === "percentage") return boundary * (config.stopLossBufferPercent / 100);
   if (config.stopLossBufferMode === "atr") return calculateAnalysisAtr(candles, config.stopLossAtrPeriod) * config.stopLossAtrMultiplier;
-  return config.stopLossBufferTicks * config.priceTickSize;
+  return config.stopLossBufferTicks * symbolTickSize;
 }
 
 function calculateAnalysisAtr(candles: readonly Candle[], period: number): number {
@@ -1709,7 +1760,7 @@ function calculateAnalysisAtr(candles: readonly Candle[], period: number): numbe
 }
 
 function describeFvg(fvg: Fvg): string {
-  return `${fvg.direction} ${fvg.timeframe} · ${formatServerPrice(fvg.lower)} - ${formatServerPrice(fvg.upper)} · CE ${formatServerPrice(fvg.midpoint)}`;
+  return `${fvg.direction} ${fvg.timeframe} · ${formatServerPrice(fvg.lower)} - ${formatServerPrice(fvg.upper)} · ${fvg.status.toUpperCase()}`;
 }
 
 function setupStateLabel(state: AnalysisSetupState): string {
@@ -1767,8 +1818,8 @@ function buildPositionOverlays(params: {
   symbol: string;
   timeframe: string;
   candles: Array<{ time: number }>;
-  marginPerTrade: number;
-  leverage: number;
+  riskPerTradeUsdt: number;
+  maxLeverage: number;
   includeBotPositionOverlays?: boolean;
 }): Record<string, unknown>[] {
   const overlays: Record<string, unknown>[] = [];
@@ -1788,10 +1839,10 @@ function buildPositionOverlays(params: {
         entry: Number(plan.entry),
         stopLoss: Number(plan.stopLoss),
         takeProfit: Number(plan.takeProfit),
-        quantity: (params.marginPerTrade * params.leverage) / Number(plan.entry),
-        margin: params.marginPerTrade,
-        leverage: params.leverage,
-        positionSize: params.marginPerTrade * params.leverage,
+        quantity: params.riskPerTradeUsdt / Math.abs(Number(plan.entry) - Number(plan.stopLoss)),
+        margin: 0,
+        leverage: params.maxLeverage,
+        positionSize: (params.riskPerTradeUsdt / Math.abs(Number(plan.entry) - Number(plan.stopLoss))) * Number(plan.entry),
         createdAt: toSeconds(fvg.createdAt ?? latestTime),
         bars: 36
       })
@@ -2297,18 +2348,18 @@ function getRuntimeStatus(config: AppConfig, account: BinanceFuturesWalletStatus
     },
     risk: {
       positionSizingMode: config.positionSizingMode,
-      marginPerTrade: config.marginPerTrade,
-      leverage: config.leverage
+      riskPerTradeUsdt: config.riskPerTradeUsdt,
+      maxLeverage: config.maxLeverage
     },
     execution: {
       entryMode: config.entryMode
     },
     strategy: {
       emaPeriod: config.emaPeriod,
-      fvgMitigation: config.fvgMitigation,
-      ltfFvgEntryMode: config.ltfFvgEntryMode,
+      fvgLifecycle: "UNTOUCHED_FIRST_TOUCH",
+      stopLossRule: "ACTIVE_LTF_FVG_CLUSTER",
       stopLossBufferMode: config.stopLossBufferMode,
-      takeProfitMode: config.takeProfitMode
+      takeProfitRule: "HTF_LIQUIDITY"
     }
   };
 }

@@ -1,6 +1,6 @@
 import type { Candle, Timeframe } from "../market-data/Candle.js";
 import type { Direction } from "../trade/Direction.js";
-import type { Fvg, FvgMitigationMode } from "./Fvg.js";
+import type { Fvg } from "./Fvg.js";
 
 export function detectLatestHtfFvg(candles: readonly Candle[], expectedTrend: Direction): Fvg | null {
   return detectLatestFvg(candles, "H1", expectedTrend);
@@ -36,20 +36,23 @@ export function detectLatestFvg(candles: readonly Candle[], timeframe: Timeframe
   return null;
 }
 
-export function isFvgMitigated(fvg: Fvg, candle: Candle, mode: FvgMitigationMode): boolean {
+export function isFvgTouched(fvg: Fvg, candle: Candle): boolean {
   if (!candle.isClosed) {
+    return false;
+  }
+  if (candle.openTime <= fvg.thirdCandleOpenTime) {
     return false;
   }
 
   if (fvg.direction === "bullish") {
-    if (mode === "edge") return candle.low <= fvg.upper;
-    if (mode === "ce") return candle.low <= fvg.midpoint;
-    return candle.low <= fvg.lower;
+    return candle.low <= fvg.upper;
   }
 
-  if (mode === "edge") return candle.high >= fvg.lower;
-  if (mode === "ce") return candle.high >= fvg.midpoint;
-  return candle.high >= fvg.upper;
+  return candle.high >= fvg.lower;
+}
+
+export function isFvgUntouchedByCandles(fvg: Fvg, candles: readonly Candle[]): boolean {
+  return !candles.some((candle) => candle.symbol === fvg.symbol && candle.timeframe === fvg.timeframe && isFvgTouched(fvg, candle));
 }
 
 export function isFvgInvalidated(fvg: Fvg, candle: Candle): boolean {
@@ -79,7 +82,7 @@ function createFvg(
     lower,
     upper,
     midpoint: (lower + upper) / 2,
-    status: "waiting-mitigation",
+    status: "untouched",
     createdAt: c3.closeTime
   };
 }

@@ -90,6 +90,7 @@ describe("trading account HTTP flow", () => {
     FakeAccountClient.nextMarginType = "ISOLATED";
     FakeAccountClient.positionsByApiKey.clear();
     FakeAccountClient.openOrdersByApiKey.clear();
+    FakeAccountClient.walletBalanceByApiKey.clear();
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
     const cipher = new CredentialCipher(encryptionKey);
     const tradingAccounts = new TradingAccountService(accountRepository, cipher, verifier, configRepository, testConfig());
@@ -163,7 +164,7 @@ describe("trading account HTTP flow", () => {
   it("permanently deletes an inactive DEMO account and account-scoped data", async () => {
     const cookie = await register("delete-demo@example.com");
     const account = (await (await postJson("/api/trading-accounts", { name: "Demo Delete", mode: "DEMO" }, cookie)).json()).account;
-    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), marginPerTrade: 333, watchlist: ["ETHUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), riskPerTradeUsdt: 333, watchlist: ["ETHUSDT"] }, cookie);
     await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "DELETE_DEMO_KEY", apiSecret: "DELETE_SECRET" }, cookie);
     await runtimeManager.ensureRuntime(account.id);
 
@@ -287,7 +288,7 @@ describe("trading account HTTP flow", () => {
     const cookie = await register("real-ready@example.com");
     const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
     await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
-    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, leverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, maxLeverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
 
     const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } });
     expect(response.status).toBe(200);
@@ -312,7 +313,7 @@ describe("trading account HTTP flow", () => {
     const cookie = await register("real-mismatch@example.com");
     const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
     await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
-    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, leverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, maxLeverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
 
     const body = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } })).json();
 
@@ -438,12 +439,12 @@ describe("trading account HTTP flow", () => {
     const accountA = (await (await postJson("/api/trading-accounts", { name: "A", mode: "DEMO" }, cookieA)).json()).account;
     const accountB = (await (await postJson("/api/trading-accounts", { name: "B", mode: "DEMO" }, cookieB)).json()).account;
 
-    const settingsA = { ...testConfig(), marginPerTrade: 100, watchlist: ["BTCUSDT"] };
-    const settingsB = { ...testConfig(), marginPerTrade: 300, watchlist: ["ETHUSDT"] };
+    const settingsA = { ...testConfig(), riskPerTradeUsdt: 100, watchlist: ["BTCUSDT"] };
+    const settingsB = { ...testConfig(), riskPerTradeUsdt: 300, watchlist: ["ETHUSDT"] };
     expect((await putJson(`/api/trading-accounts/${accountA.id}/settings`, settingsA, cookieA)).status).toBe(200);
     expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, settingsB, cookieB)).status).toBe(200);
 
-    expect((await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/settings`, { headers: { cookie: cookieA } })).json()).marginPerTrade).toBe(100);
+    expect((await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/settings`, { headers: { cookie: cookieA } })).json()).riskPerTradeUsdt).toBe(100);
     expect((await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/watchlist`, { headers: { cookie: cookieB } })).json()).watchlist).toEqual(["ETHUSDT"]);
     expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, settingsA, cookieA)).status).toBe(404);
   });
@@ -453,25 +454,25 @@ describe("trading account HTTP flow", () => {
     const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
     const accountB = (await (await postJson("/api/trading-accounts", { name: "test2", mode: "DEMO" }, cookie)).json()).account;
 
-    const settingsA = { ...testConfig(), marginPerTrade: 10000, leverage: 100, watchlist: ["BTCUSDT"] };
-    const settingsB = { ...testConfig(), marginPerTrade: 200, leverage: 5, watchlist: ["ETHUSDT"] };
+    const settingsA = { ...testConfig(), riskPerTradeUsdt: 10000, maxLeverage: 100, watchlist: ["BTCUSDT"] };
+    const settingsB = { ...testConfig(), riskPerTradeUsdt: 200, maxLeverage: 5, watchlist: ["ETHUSDT"] };
     expect((await putJson(`/api/trading-accounts/${accountA.id}/settings`, settingsA, cookie)).status).toBe(200);
     expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, settingsB, cookie)).status).toBe(200);
 
     const loadedA = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/settings`, { headers: { cookie } })).json();
     const loadedB = await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/settings`, { headers: { cookie } })).json();
-    expect(loadedA.marginPerTrade).toBe(10000);
-    expect(loadedA.leverage).toBe(100);
-    expect(loadedB.marginPerTrade).toBe(200);
-    expect(loadedB.leverage).toBe(5);
+    expect(loadedA.riskPerTradeUsdt).toBe(10000);
+    expect(loadedA.maxLeverage).toBe(100);
+    expect(loadedB.riskPerTradeUsdt).toBe(200);
+    expect(loadedB.maxLeverage).toBe(5);
 
-    expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...settingsB, marginPerTrade: 333, leverage: 3 }, cookie)).status).toBe(200);
+    expect((await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...settingsB, riskPerTradeUsdt: 333, maxLeverage: 3 }, cookie)).status).toBe(200);
     const reloadedA = await (await fetch(`${baseUrl}/api/trading-accounts/${accountA.id}/settings`, { headers: { cookie } })).json();
     const reloadedB = await (await fetch(`${baseUrl}/api/trading-accounts/${accountB.id}/settings`, { headers: { cookie } })).json();
-    expect(reloadedA.marginPerTrade).toBe(10000);
-    expect(reloadedA.leverage).toBe(100);
-    expect(reloadedB.marginPerTrade).toBe(333);
-    expect(reloadedB.leverage).toBe(3);
+    expect(reloadedA.riskPerTradeUsdt).toBe(10000);
+    expect(reloadedA.maxLeverage).toBe(100);
+    expect(reloadedB.riskPerTradeUsdt).toBe(333);
+    expect(reloadedB.maxLeverage).toBe(3);
   });
 
   it("rejects cross-user access to account-scoped runtime routes", async () => {
@@ -492,8 +493,8 @@ describe("trading account HTTP flow", () => {
     const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
     const accountB = (await (await postJson("/api/trading-accounts", { name: "test2", mode: "DEMO" }, cookie)).json()).account;
 
-    await putJson(`/api/trading-accounts/${accountA.id}/settings`, { ...testConfig(), marginPerTrade: 900, leverage: 9, watchlist: ["BTCUSDT"] }, cookie);
-    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), marginPerTrade: 200, leverage: 5, watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${accountA.id}/settings`, { ...testConfig(), riskPerTradeUsdt: 900, maxLeverage: 9, watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), riskPerTradeUsdt: 200, maxLeverage: 5, watchlist: ["BTCUSDT"] }, cookie);
 
     await runtimeManager.ensureRuntime(accountA.id);
     await runtimeManager.ensureRuntime(accountB.id);
@@ -505,18 +506,59 @@ describe("trading account HTTP flow", () => {
     expect(engineA).toBeTruthy();
     expect(engineB).toBeTruthy();
     expect(engineA).not.toBe(engineB);
-    expect(readSnapshotSettings(snapshotA.store).marginPerTrade).toBe(900);
-    expect(readSnapshotSettings(snapshotA.store).leverage).toBe(9);
-    expect(readSnapshotSettings(snapshotB.store).marginPerTrade).toBe(200);
-    expect(readSnapshotSettings(snapshotB.store).leverage).toBe(5);
+    expect(readSnapshotSettings(snapshotA.store).riskPerTradeUsdt).toBe(900);
+    expect(readSnapshotSettings(snapshotA.store).maxLeverage).toBe(9);
+    expect(readSnapshotSettings(snapshotB.store).riskPerTradeUsdt).toBe(200);
+    expect(readSnapshotSettings(snapshotB.store).maxLeverage).toBe(5);
 
-    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), marginPerTrade: 333, leverage: 3, watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), riskPerTradeUsdt: 333, maxLeverage: 3, watchlist: ["BTCUSDT"] }, cookie);
     const reloadedA = await runtimeManager.getSnapshot(accountA.id);
     const reloadedB = await runtimeManager.getSnapshot(accountB.id);
-    expect(readSnapshotSettings(reloadedA.store).marginPerTrade).toBe(900);
-    expect(readSnapshotSettings(reloadedA.store).leverage).toBe(9);
-    expect(readSnapshotSettings(reloadedB.store).marginPerTrade).toBe(333);
-    expect(readSnapshotSettings(reloadedB.store).leverage).toBe(3);
+    expect(readSnapshotSettings(reloadedA.store).riskPerTradeUsdt).toBe(900);
+    expect(readSnapshotSettings(reloadedA.store).maxLeverage).toBe(9);
+    expect(readSnapshotSettings(reloadedB.store).riskPerTradeUsdt).toBe(333);
+    expect(readSnapshotSettings(reloadedB.store).maxLeverage).toBe(3);
+  });
+
+  it("persists account drawdown peak and locked protection state across runtime restart", async () => {
+    const cookie = await register("drawdown@example.com");
+    const accountA = (await (await postJson("/api/trading-accounts", { name: "A", mode: "DEMO" }, cookie)).json()).account;
+    const accountB = (await (await postJson("/api/trading-accounts", { name: "B", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${accountA.id}/binance-connection`, { apiKey: "DRAW_A_KEY", apiSecret: "DRAW_A_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/binance-connection`, { apiKey: "DRAW_B_KEY", apiSecret: "DRAW_B_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${accountA.id}/settings`, { ...testConfig(), maxDrawdownPercent: 10, watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${accountB.id}/settings`, { ...testConfig(), maxDrawdownPercent: 10, watchlist: ["BTCUSDT"] }, cookie);
+
+    FakeAccountClient.walletBalanceByApiKey.set("DRAW_A_KEY", 10_000);
+    FakeAccountClient.walletBalanceByApiKey.set("DRAW_B_KEY", 10_000);
+    expect((await runtimeManager.getAccountProtectionStatus(accountA.id))?.newEntriesAllowed).toBe(true);
+    FakeAccountClient.walletBalanceByApiKey.set("DRAW_A_KEY", 8_900);
+    const blocked = await runtimeManager.getAccountProtectionStatus(accountA.id);
+    const accountBStatus = await runtimeManager.getAccountProtectionStatus(accountB.id);
+
+    expect(blocked).toMatchObject({ peakEquityUsdt: 10_000, drawdownPercent: 11, newEntriesAllowed: false, blockReason: "MAX_DRAWDOWN_REACHED" });
+    expect(accountBStatus).toMatchObject({ peakEquityUsdt: 10_000, drawdownPercent: 0, newEntriesAllowed: true });
+
+    const restartedRuntimeManager = new TradingRuntimeManager(
+      testConfig(),
+      undefined,
+      accountRepository,
+      configRepository,
+      executionIntentRepository,
+      new CredentialCipher(encryptionKey),
+      new FakeMarketData(),
+      fakeLogger(),
+      (apiKey, _apiSecret, testnet) => new FakeAccountClient(apiKey, testnet),
+      new FakeSymbolMetadataService(),
+      realProposalRepository,
+      () => new FakeMarketData() as never
+    );
+    FakeAccountClient.walletBalanceByApiKey.set("DRAW_A_KEY", 10_500);
+    const afterRestart = await restartedRuntimeManager.getAccountProtectionStatus(accountA.id);
+
+    expect(afterRestart).toMatchObject({ newEntriesAllowed: false, blockReason: "MAX_DRAWDOWN_REACHED" });
+    expect(afterRestart?.maxDrawdownReachedAt).toBe(blocked?.maxDrawdownReachedAt);
+    await restartedRuntimeManager.shutdown();
   });
 
   it("uses credentials from the requested account for chart account activity", async () => {
@@ -741,6 +783,7 @@ class FakeAccountClient {
   static nextMarginType: "CROSS" | "ISOLATED" = "ISOLATED";
   static positionsByApiKey = new Map<string, BinanceFuturesPositionStatus[]>();
   static openOrdersByApiKey = new Map<string, BinanceFuturesOpenOrderStatus[]>();
+  static walletBalanceByApiKey = new Map<string, number>();
 
   constructor(
     private readonly apiKey: string,
@@ -748,12 +791,13 @@ class FakeAccountClient {
   ) {}
 
   async getWalletStatus() {
+    const walletBalance = FakeAccountClient.walletBalanceByApiKey.get(this.apiKey) ?? 10_000;
     return {
       connected: true,
       environment: this.testnet ? "testnet" as const : "live" as const,
       label: "Binance Futures account verified",
-      walletBalance: 10_000,
-      availableBalance: 10_000,
+      walletBalance,
+      availableBalance: walletBalance,
       asset: "USDT" as const,
       checkedAt: new Date().toISOString()
     };
@@ -834,7 +878,7 @@ function fakePosition(symbol: string, side: "long" | "short"): BinanceFuturesPos
     entryTime: null,
     quantity: 0.01,
     notional: 6.0374,
-    leverage: 5,
+    maxLeverage: 5,
     margin: 1.20748,
     unrealizedProfit: 0,
     stopLoss: null,

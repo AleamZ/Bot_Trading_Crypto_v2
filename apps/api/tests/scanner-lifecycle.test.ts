@@ -15,7 +15,7 @@ describe("scanner setup lifecycle", () => {
     const beforeRepository = new MemoryTradingRepository();
     const beforeScanner = new MarketScanner(config("account-a", "SOLUSDT"), beforeRepository, new NoopExecutionGateway(), fakeLogger(), beforePullbackData as never, null);
 
-    await beforeScanner.bootstrap();
+    await beforeScanner.scan();
     const beforeHome = beforeScanner.getWatchlistStatus()[0];
     const beforeDiagnostic = beforeScanner.getSetupDiagnostic("SOLUSDT");
     const beforeAnalysis = await buildSymbolAnalysis("SOLUSDT", config("account-a", "SOLUSDT"), beforePullbackData as never, beforeDiagnostic);
@@ -31,7 +31,7 @@ describe("scanner setup lifecycle", () => {
     const afterRepository = new MemoryTradingRepository();
     const afterScanner = new MarketScanner(config("account-a", "SOLUSDT"), afterRepository, new NoopExecutionGateway(), fakeLogger(), afterPullbackData as never, null);
 
-    await afterScanner.bootstrap();
+    await afterScanner.scan();
     const afterHome = afterScanner.getWatchlistStatus()[0];
     const afterDiagnostic = afterScanner.getSetupDiagnostic("SOLUSDT");
     const afterAnalysis = await buildSymbolAnalysis("SOLUSDT", config("account-a", "SOLUSDT"), afterPullbackData as never, afterDiagnostic);
@@ -41,14 +41,14 @@ describe("scanner setup lifecycle", () => {
     expect(afterAnalysis.conditions.filter((condition) => condition.status === "PASSED")).toHaveLength(7);
     expect(afterDiagnostic?.ltfFvg?.id).toBe("SOLUSDT:M5:bullish:9:10:11");
     expect(afterDiagnostic?.ltfFvg?.mitigatedAt).toBe(720_000);
-    expect(afterDiagnostic?.entryPlan?.entry).toBeCloseTo(82.46);
+    expect(afterDiagnostic?.entryPlan?.entry).toBeCloseTo(82.47);
     expect(afterDiagnostic?.entryPlan?.stopLoss).toBeCloseTo(81.95);
   });
 
   it("uses canonical runtime setup when Analysis candle history is shorter than the active ReadyToEnter setup", async () => {
     const scannerData = new StaticMarketData(solLifecycleCandles("SOLUSDT", true));
     const scanner = new MarketScanner(config("account-a", "SOLUSDT"), new MemoryTradingRepository(), new NoopExecutionGateway(), fakeLogger(), scannerData as never, null);
-    await scanner.bootstrap();
+    await scanner.scan();
 
     const diagnostic = scanner.getSetupDiagnostic("SOLUSDT");
     const shortAnalysisData = new StaticMarketData([
@@ -68,7 +68,7 @@ describe("scanner setup lifecycle", () => {
     const data = new StaticMarketData([...solLifecycleCandles("SOLUSDT", true), candle("SOLUSDT", "M5", 13, 82.4, 82.42, 81.8, 81.9)]);
     const scanner = new MarketScanner(config("account-a", "SOLUSDT"), new MemoryTradingRepository(), new NoopExecutionGateway(), fakeLogger(), data as never, null);
 
-    await scanner.bootstrap();
+    await scanner.scan();
 
     expect(scanner.getWatchlistStatus()[0]).toMatchObject({ symbol: "SOLUSDT", state: "Archived", status: "Invalidated" });
     expect(scanner.getSetupDiagnostic("SOLUSDT")?.ltfFvg?.id).toBe("SOLUSDT:M5:bullish:9:10:11");
@@ -185,7 +185,6 @@ function config(_accountId: string, symbol: string): AppConfig {
     emaPeriod: 3,
     swingLeft: 1,
     swingRight: 1,
-    takeProfitMode: "fixed-rr",
     port: 8787,
     executionMode: "testnet",
     logLevel: "info",
@@ -235,7 +234,7 @@ function solLifecycleCandles(symbol: string, includePullback: boolean): Candle[]
     candle(symbol, "H1", 1, 80, 81, 79, 80),
     candle(symbol, "H1", 2, 81, 82, 80, 81),
     candle(symbol, "H1", 3, 84, 86, 83, 85),
-    candle(symbol, "H1", 4, 85, 86, 81.4, 85),
+    candle(symbol, "H1", 4, 85, 85.5, 81.4, 85),
     candle(symbol, "M5", 5, 100, 101, 99, 100),
     candle(symbol, "M5", 6, 105, 110, 104, 108),
     candle(symbol, "M5", 7, 103, 105, 101, 102),

@@ -1,5 +1,5 @@
 import type { AppConfig } from "../config/AppConfig.js";
-import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type SetupDiagnostic } from "../engine/TradingEngine.js";
+import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type SetupDiagnostic, type SymbolRulesProvider } from "../engine/TradingEngine.js";
 import type { ExecutionGateway } from "../ports/ExecutionGateway.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { TradingRepository } from "../ports/Repositories.js";
@@ -31,7 +31,8 @@ export class MarketScanner {
     private readonly execution: ExecutionGateway,
     private readonly logger: DecisionLogger,
     private readonly marketData: BinanceFuturesMarketData,
-    private readonly availableBalanceProvider: AvailableBalanceProvider | null
+    private readonly availableBalanceProvider: AvailableBalanceProvider | null,
+    private readonly symbolRulesProvider: SymbolRulesProvider | null = null
   ) {
     for (const symbol of config.watchlist) {
       this.engines.set(symbol, this.createEngine(symbol));
@@ -75,7 +76,7 @@ export class MarketScanner {
       if (position.quantity > 0) this.activePositions.set(position.symbol, position);
     }
     for (const [symbol, engine] of this.engines) {
-      engine.syncActivePosition(this.activePositions.get(symbol) ?? null);
+      engine.syncActivePosition(this.activePositions.get(symbol) ?? null, this.activePositions.size);
     }
   }
 
@@ -132,7 +133,7 @@ export class MarketScanner {
     const engine = this.engines.get(symbol) ?? this.createEngine(symbol);
     const activePosition = this.activePositions.get(symbol);
     if (activePosition) {
-      engine.syncActivePosition(activePosition);
+      engine.syncActivePosition(activePosition, this.activePositions.size);
       this.lastScanTime.set(symbol, Date.now());
       this.logger.info(`[SCANNER] ${symbol} -> ${engine.getState().setupState} (active position)`);
       return;
@@ -150,7 +151,7 @@ export class MarketScanner {
     ].sort((a, b) => a.closeTime - b.closeTime);
 
     for (const candle of candles) {
-      await engine.onClosedCandle(candle);
+      await engine.onClosedCandle(candle, { historical: bootstrap });
       const key = closeTimeKey(symbol, candle.timeframe);
       this.lastCloseTime.set(key, Math.max(this.lastCloseTime.get(key) ?? 0, candle.closeTime));
     }
@@ -160,7 +161,7 @@ export class MarketScanner {
 
   private createEngine(symbol: string): TradingEngine {
     const symbolConfig: AppConfig = { ...this.config, symbol };
-    const engine = new TradingEngine(symbolConfig, this.repository, this.execution, this.logger, this.availableBalanceProvider);
+    const engine = new TradingEngine(symbolConfig, this.repository, this.execution, this.logger, this.availableBalanceProvider, this.symbolRulesProvider);
     this.engines.set(symbol, engine);
     return engine;
   }

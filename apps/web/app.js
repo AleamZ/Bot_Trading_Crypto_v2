@@ -30,20 +30,16 @@ const activityState = {
 };
 const defaultSettings = {
   watchlist: "",
-  positionSizingMode: "fixed-margin",
-  marginPerTrade: "200",
-  leverage: "5",
+  positionSizingMode: "risk-based",
+  riskPerTradeUsdt: "20",
   maxLeverage: "125",
+  maxMarginUsagePercent: "20",
   entryMode: "market",
-  minNotional: "5",
-  maxPositionSize: "100000",
   maxOpenPositions: "1",
   maxPositionPerSymbol: "1",
   minimumRiskReward: "2",
-  maxTradesPerDay: "5",
-  maxDailyLossPercent: "3",
-  maxConsecutiveLosses: "3",
-  cooldownAfterTradeMinutes: "30",
+  dailyProfitLimitR: "10",
+  dailyLossLimitR: "2",
   maxDrawdownPercent: "10",
   tradingEnabled: "false",
   killSwitch: "false",
@@ -51,19 +47,14 @@ const defaultSettings = {
   emaPeriod: "50",
   swingLeft: "2",
   swingRight: "2",
-  fvgMitigation: "ce",
-  ltfFvgEntryMode: "ce",
   stopLossBufferMode: "ticks",
   stopLossBufferTicks: "5",
   stopLossBufferPercent: "0.1",
   stopLossAtrPeriod: "14",
   stopLossAtrMultiplier: "1",
-  priceTickSize: "0.1",
   requireDisplacement: "false",
   displacementBodyMultiplier: "1.5",
   displacementLookback: "20",
-  takeProfitMode: "external-liquidity",
-  fixedRr: "2",
 };
 const settingsState = { ...defaultSettings };
 const realSafetyState = {
@@ -571,6 +562,8 @@ async function load() {
   const account = snapshot.binanceAccount ?? runtime.account ?? {};
   const connection = snapshot.connection ?? {};
   const runtimeHealth = snapshot.runtimeHealth ?? {};
+  const dailyRisk = snapshot.dailyRisk ?? null;
+  const accountProtection = snapshot.accountProtection ?? null;
   accountState.lastConnection = connection;
   accountState.lastBinanceAccount = account;
   const marketData = runtime.marketData ?? {};
@@ -609,7 +602,15 @@ async function load() {
     : "";
   const reconciliationError = runtimeHealth.lastReconciliationError ? ` · Error ${runtimeHealth.lastReconciliationError}` : "";
   $("engine-detail").textContent =
-    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${executionLabel}${executionReason}${readinessText}${reconciliationError} · Margin ${formatUsdt(runtime.risk?.marginPerTrade)} · Leverage ${runtime.risk?.leverage ?? "-"}x`;
+    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${executionLabel}${executionReason}${readinessText}${reconciliationError} · Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`;
+  $("daily-entry-status").textContent = dailyRisk ? dailyEntryStatusLabel(dailyRisk) : "-";
+  $("daily-risk-detail").textContent = dailyRisk
+    ? `Today Realized PnL: ${formatSignedNumber(dailyRisk.realizedR)}R (${formatSignedUsdt(dailyRisk.realizedPnlUsdt)}) · Daily Range: -${dailyRisk.dailyLossLimitR}R → +${dailyRisk.dailyProfitLimitR}R`
+    : "Daily status unavailable";
+  $("account-protection-status").textContent = accountProtection ? accountProtectionStatusLabel(accountProtection) : "-";
+  $("account-protection-detail").textContent = accountProtection
+    ? `Current Drawdown: ${formatSignedNumber(accountProtection.drawdownPercent)}% · Max Drawdown: ${accountProtection.maxDrawdownPercent}%`
+    : "Account protection unavailable";
 
   $("trend").textContent = engine.trend ?? "-";
   $("symbol").textContent = runtime.symbol ?? "-";
@@ -618,7 +619,7 @@ async function load() {
     ? `${htfFvg.direction} ${htfFvg.status}`
     : "-";
   $("fvg-detail").textContent = htfFvg
-    ? `${formatPrice(htfFvg.lower)} - ${formatPrice(htfFvg.upper)} · CE ${formatPrice(htfFvg.midpoint)}`
+    ? `${formatPrice(htfFvg.lower)} - ${formatPrice(htfFvg.upper)} · ${String(htfFvg.status ?? "-").toUpperCase()}`
     : "No active HTF FVG";
 
   activityState.events = Array.isArray(store.events) ? store.events : [];
@@ -796,6 +797,29 @@ function formatUsdt(value) {
   return `${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`;
 }
 
+function formatSignedUsdt(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  const number = Number(value);
+  return `${number >= 0 ? "+" : ""}${number.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`;
+}
+
+function formatSignedNumber(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  const number = Number(value);
+  return `${number >= 0 ? "+" : ""}${number.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+}
+
+function dailyEntryStatusLabel(dailyRisk) {
+  if (!dailyRisk?.newEntriesAllowed && dailyRisk?.blockReason === "DAILY_PROFIT_LIMIT_REACHED") return "Daily Profit Limit Reached";
+  if (!dailyRisk?.newEntriesAllowed && dailyRisk?.blockReason === "DAILY_LOSS_LIMIT_REACHED") return "Daily Loss Limit Reached";
+  return dailyRisk?.newEntriesAllowed ? "Trading Allowed" : "Daily Status Unavailable";
+}
+
+function accountProtectionStatusLabel(accountProtection) {
+  if (!accountProtection?.newEntriesAllowed && accountProtection?.blockReason === "MAX_DRAWDOWN_REACHED") return "MAX DRAWDOWN REACHED";
+  return accountProtection?.newEntriesAllowed ? "OK" : "Unavailable";
+}
+
 function formatPrice(value) {
   return Number(value).toLocaleString("en-US", { maximumFractionDigits: 4 });
 }
@@ -864,7 +888,7 @@ $("real-proposal-status-filter").addEventListener("change", () => loadRealPropos
 document.querySelectorAll("[data-real-execution-mode]").forEach((button) => {
   button.addEventListener("click", () => changeRealExecutionMode(button.dataset.realExecutionMode));
 });
-$("setting-margin-per-order").addEventListener("input", updateSettingFromInput);
+$("setting-risk-per-trade").addEventListener("input", updateSettingFromInput);
 $("setting-symbol-search").addEventListener("input", (event) => {
   symbolSearchTerm = event.target.value.trim().toUpperCase();
   renderWatchlistSettings();
@@ -879,17 +903,13 @@ $("selected-watchlist").addEventListener("click", (event) => {
   if (!button) return;
   toggleWatchlistSymbol(button.dataset.removeSymbol, false);
 });
-$("setting-leverage").addEventListener("input", updateSettingFromInput);
 $("setting-max-leverage").addEventListener("input", updateSettingFromInput);
-$("setting-min-notional").addEventListener("input", updateSettingFromInput);
-$("setting-max-position-size").addEventListener("input", updateSettingFromInput);
+$("setting-max-margin-usage").addEventListener("input", updateSettingFromInput);
 $("setting-max-open-positions").addEventListener("input", updateSettingFromInput);
 $("setting-max-position-per-symbol").addEventListener("input", updateSettingFromInput);
 $("setting-minimum-rr").addEventListener("input", updateSettingFromInput);
-$("setting-max-trades-per-day").addEventListener("input", updateSettingFromInput);
-$("setting-daily-loss-limit").addEventListener("input", updateSettingFromInput);
-$("setting-max-consecutive-losses").addEventListener("input", updateSettingFromInput);
-$("setting-cooldown").addEventListener("input", updateSettingFromInput);
+$("setting-daily-profit-limit-r").addEventListener("input", updateSettingFromInput);
+$("setting-daily-loss-limit-r").addEventListener("input", updateSettingFromInput);
 $("setting-max-drawdown").addEventListener("input", updateSettingFromInput);
 $("setting-ema-period").addEventListener("input", updateSettingFromInput);
 $("setting-swing-left").addEventListener("input", updateSettingFromInput);
@@ -898,10 +918,8 @@ $("setting-sl-buffer-ticks").addEventListener("input", updateSettingFromInput);
 $("setting-sl-buffer-percent").addEventListener("input", updateSettingFromInput);
 $("setting-sl-atr-period").addEventListener("input", updateSettingFromInput);
 $("setting-sl-atr-multiplier").addEventListener("input", updateSettingFromInput);
-$("setting-price-tick-size").addEventListener("input", updateSettingFromInput);
 $("setting-displacement-body").addEventListener("input", updateSettingFromInput);
 $("setting-displacement-lookback").addEventListener("input", updateSettingFromInput);
-$("setting-fixed-rr").addEventListener("input", updateSettingFromInput);
 document.querySelectorAll("[data-setting-group]").forEach((group) => {
   group.addEventListener("click", (event) => {
     const button = event.target.closest("[data-setting-value]");
@@ -1080,8 +1098,32 @@ function renderAnalysis(analysis) {
   );
 
   const risk = analysis.riskManagement ?? {};
-  const riskChecks = risk.checks ?? [];
-  $("analysis-risk-final").textContent = risk.final ?? "WAITING";
+  const riskChecks = [...(risk.checks ?? [])];
+  let protectionBlocked = false;
+  if (analysis.dailyRisk) {
+    const dailyRisk = analysis.dailyRisk;
+    protectionBlocked = protectionBlocked || !dailyRisk.newEntriesAllowed;
+    riskChecks.push({
+      label: "Daily Realized PnL",
+      status: "PASSED",
+      detail: `${formatSignedNumber(dailyRisk.realizedR)}R (${formatSignedUsdt(dailyRisk.realizedPnlUsdt)}) · Limits -${dailyRisk.dailyLossLimitR}R / +${dailyRisk.dailyProfitLimitR}R`
+    });
+    riskChecks.push({
+      label: "Daily Entry Gate",
+      status: dailyRisk.newEntriesAllowed ? "PASSED" : "INVALIDATED",
+      detail: `${dailyEntryStatusLabel(dailyRisk)} · Reason ${dailyRisk.blockReason ?? "-"}`
+    });
+  }
+  if (analysis.accountProtection) {
+    const accountProtection = analysis.accountProtection;
+    protectionBlocked = protectionBlocked || !accountProtection.newEntriesAllowed;
+    riskChecks.push({
+      label: "Account Gate",
+      status: accountProtection.newEntriesAllowed ? "PASSED" : "INVALIDATED",
+      detail: `${accountProtectionStatusLabel(accountProtection)} · Drawdown ${formatSignedNumber(accountProtection.drawdownPercent)}% / ${accountProtection.maxDrawdownPercent}%`
+    });
+  }
+  $("analysis-risk-final").textContent = protectionBlocked ? "BLOCKED" : risk.final ?? "WAITING";
   $("analysis-risk-checks").replaceChildren(
     ...riskChecks.map((check) => analysisConditionItem(check, null)),
   );
@@ -1151,18 +1193,14 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
 function renderSettings() {
   renderWatchlistSettings();
   renderRealSafety();
-  $("setting-margin-per-order").value = settingsState.marginPerTrade;
-  $("setting-leverage").value = settingsState.leverage;
+  $("setting-risk-per-trade").value = settingsState.riskPerTradeUsdt;
   $("setting-max-leverage").value = settingsState.maxLeverage;
-  $("setting-min-notional").value = settingsState.minNotional;
-  $("setting-max-position-size").value = settingsState.maxPositionSize;
+  $("setting-max-margin-usage").value = settingsState.maxMarginUsagePercent;
   $("setting-max-open-positions").value = settingsState.maxOpenPositions;
   $("setting-max-position-per-symbol").value = settingsState.maxPositionPerSymbol;
   $("setting-minimum-rr").value = settingsState.minimumRiskReward;
-  $("setting-max-trades-per-day").value = settingsState.maxTradesPerDay;
-  $("setting-daily-loss-limit").value = settingsState.maxDailyLossPercent;
-  $("setting-max-consecutive-losses").value = settingsState.maxConsecutiveLosses;
-  $("setting-cooldown").value = settingsState.cooldownAfterTradeMinutes;
+  $("setting-daily-profit-limit-r").value = settingsState.dailyProfitLimitR;
+  $("setting-daily-loss-limit-r").value = settingsState.dailyLossLimitR;
   $("setting-max-drawdown").value = settingsState.maxDrawdownPercent;
   $("setting-ema-period").value = settingsState.emaPeriod;
   $("setting-swing-left").value = settingsState.swingLeft;
@@ -1171,10 +1209,9 @@ function renderSettings() {
   $("setting-sl-buffer-percent").value = settingsState.stopLossBufferPercent;
   $("setting-sl-atr-period").value = settingsState.stopLossAtrPeriod;
   $("setting-sl-atr-multiplier").value = settingsState.stopLossAtrMultiplier;
-  $("setting-price-tick-size").value = settingsState.priceTickSize;
   $("setting-displacement-body").value = settingsState.displacementBodyMultiplier;
   $("setting-displacement-lookback").value = settingsState.displacementLookback;
-  $("setting-fixed-rr").value = settingsState.fixedRr;
+  updateConditionalSettingVisibility();
 
   document.querySelectorAll("[data-setting-group]").forEach((group) => {
     const value = settingsState[group.dataset.settingGroup];
@@ -1198,6 +1235,18 @@ function renderRealSafety() {
     button.classList.toggle("active", button.dataset.realExecutionMode === mode);
   });
   renderRealProposals();
+}
+
+function updateConditionalSettingVisibility() {
+  const displacementOn = settingsState.requireDisplacement === "true";
+  $("setting-displacement-body-card").hidden = !displacementOn;
+  $("setting-displacement-lookback-card").hidden = !displacementOn;
+
+  const bufferMode = settingsState.stopLossBufferMode;
+  $("setting-sl-buffer-ticks-card").hidden = bufferMode !== "ticks";
+  $("setting-sl-buffer-percent-card").hidden = bufferMode !== "percentage";
+  $("setting-sl-atr-period-card").hidden = bufferMode !== "atr";
+  $("setting-sl-atr-multiplier-card").hidden = bufferMode !== "atr";
 }
 
 function realExecutionModeDescription(mode) {
@@ -1344,43 +1393,28 @@ async function transitionProposal(proposalId, action) {
 }
 
 function updateSettingFromInput(event) {
-  const fieldById = {
-    "setting-watchlist": "watchlist",
-    "setting-margin-per-order": "marginPerTrade",
-    "setting-leverage": "leverage",
-    "setting-max-leverage": "maxLeverage",
-    "setting-min-notional": "minNotional",
-    "setting-max-position-size": "maxPositionSize",
-    "setting-max-open-positions": "maxOpenPositions",
-    "setting-max-position-per-symbol": "maxPositionPerSymbol",
-    "setting-minimum-rr": "minimumRiskReward",
-    "setting-max-trades-per-day": "maxTradesPerDay",
-    "setting-daily-loss-limit": "maxDailyLossPercent",
-    "setting-max-consecutive-losses": "maxConsecutiveLosses",
-    "setting-cooldown": "cooldownAfterTradeMinutes",
-    "setting-max-drawdown": "maxDrawdownPercent",
-    "setting-ema-period": "emaPeriod",
-    "setting-swing-left": "swingLeft",
-    "setting-swing-right": "swingRight",
-    "setting-sl-buffer-ticks": "stopLossBufferTicks",
-    "setting-sl-buffer-percent": "stopLossBufferPercent",
-    "setting-sl-atr-period": "stopLossAtrPeriod",
-    "setting-sl-atr-multiplier": "stopLossAtrMultiplier",
-    "setting-price-tick-size": "priceTickSize",
-    "setting-displacement-body": "displacementBodyMultiplier",
-    "setting-displacement-lookback": "displacementLookback",
-    "setting-fixed-rr": "fixedRr",
-  };
-  const field = fieldById[event.target.id];
+  const field = settingFieldByInputId[event.target.id];
   if (!field) return;
-  settingsState[field] = event.target.value;
-  saveSettings();
+  const rule = numericSettingRules[field];
+  const value = sanitizeNumericDraft(event.target.value, rule);
+  if (event.target.value !== value) {
+    event.target.value = value;
+  }
+  settingsState[field] = value;
+  event.target.classList.toggle("invalid", value === "");
+  $("settings-status").textContent = value === "" ? `${rule.label} is required` : "Unsaved changes";
 }
 
 async function saveSettings() {
   const accountId = accountState.activeAccount?.id ?? null;
   if (!accountId) {
     $("settings-status").textContent = "Select a trading account";
+    return;
+  }
+  const validation = validateSettingsDraft();
+  if (!validation.ok) {
+    $("settings-status").textContent = validation.message;
+    validation.element?.focus();
     return;
   }
   const settingsPath = `/api/trading-accounts/${accountId}/settings`;
@@ -1413,19 +1447,15 @@ function settingsFromApi(settings) {
     ...settings,
     watchlist: Array.isArray(settings.watchlist) ? settings.watchlist.join(",") : String(settings.watchlist ?? defaultSettings.watchlist),
     positionSizingMode: String(settings.positionSizingMode ?? defaultSettings.positionSizingMode),
-    marginPerTrade: String(settings.marginPerTrade ?? defaultSettings.marginPerTrade),
-    leverage: String(settings.leverage ?? defaultSettings.leverage),
+    riskPerTradeUsdt: String(settings.riskPerTradeUsdt ?? defaultSettings.riskPerTradeUsdt),
     maxLeverage: String(settings.maxLeverage ?? defaultSettings.maxLeverage),
+    maxMarginUsagePercent: String(settings.maxMarginUsagePercent ?? defaultSettings.maxMarginUsagePercent),
     entryMode: String(settings.entryMode ?? defaultSettings.entryMode),
-    minNotional: String(settings.minNotional ?? defaultSettings.minNotional),
-    maxPositionSize: String(settings.maxPositionSize ?? defaultSettings.maxPositionSize),
     maxOpenPositions: String(settings.maxOpenPositions ?? defaultSettings.maxOpenPositions),
     maxPositionPerSymbol: String(settings.maxPositionPerSymbol ?? defaultSettings.maxPositionPerSymbol),
     minimumRiskReward: String(settings.minimumRiskReward ?? defaultSettings.minimumRiskReward),
-    maxTradesPerDay: String(settings.maxTradesPerDay ?? defaultSettings.maxTradesPerDay),
-    maxDailyLossPercent: String(settings.maxDailyLossPercent ?? defaultSettings.maxDailyLossPercent),
-    maxConsecutiveLosses: String(settings.maxConsecutiveLosses ?? defaultSettings.maxConsecutiveLosses),
-    cooldownAfterTradeMinutes: String(settings.cooldownAfterTradeMinutes ?? defaultSettings.cooldownAfterTradeMinutes),
+    dailyProfitLimitR: String(settings.dailyProfitLimitR ?? defaultSettings.dailyProfitLimitR),
+    dailyLossLimitR: String(settings.dailyLossLimitR ?? defaultSettings.dailyLossLimitR),
     maxDrawdownPercent: String(settings.maxDrawdownPercent ?? defaultSettings.maxDrawdownPercent),
     tradingEnabled: String(settings.tradingEnabled ?? "false"),
     killSwitch: String(settings.killSwitch ?? "false"),
@@ -1433,19 +1463,14 @@ function settingsFromApi(settings) {
     emaPeriod: String(settings.emaPeriod ?? defaultSettings.emaPeriod),
     swingLeft: String(settings.swingLeft ?? defaultSettings.swingLeft),
     swingRight: String(settings.swingRight ?? defaultSettings.swingRight),
-    fvgMitigation: String(settings.fvgMitigation ?? defaultSettings.fvgMitigation),
-    ltfFvgEntryMode: String(settings.ltfFvgEntryMode ?? defaultSettings.ltfFvgEntryMode),
     stopLossBufferMode: String(settings.stopLossBufferMode ?? defaultSettings.stopLossBufferMode),
     stopLossBufferTicks: String(settings.stopLossBufferTicks ?? defaultSettings.stopLossBufferTicks),
     stopLossBufferPercent: String(settings.stopLossBufferPercent ?? defaultSettings.stopLossBufferPercent),
     stopLossAtrPeriod: String(settings.stopLossAtrPeriod ?? defaultSettings.stopLossAtrPeriod),
     stopLossAtrMultiplier: String(settings.stopLossAtrMultiplier ?? defaultSettings.stopLossAtrMultiplier),
-    priceTickSize: String(settings.priceTickSize ?? defaultSettings.priceTickSize),
     requireDisplacement: String(settings.requireDisplacement ?? "false"),
     displacementBodyMultiplier: String(settings.displacementBodyMultiplier ?? defaultSettings.displacementBodyMultiplier),
     displacementLookback: String(settings.displacementLookback ?? defaultSettings.displacementLookback),
-    takeProfitMode: String(settings.takeProfitMode ?? defaultSettings.takeProfitMode),
-    fixedRr: String(settings.fixedRr ?? defaultSettings.fixedRr),
   };
 }
 
@@ -1455,40 +1480,136 @@ function settingsPayload() {
     watchlist,
     symbol: watchlist[0] ?? "BTCUSDT",
     positionSizingMode: settingsState.positionSizingMode,
-    marginPerTrade: Number(settingsState.marginPerTrade),
-    leverage: Number(settingsState.leverage),
-    maxLeverage: Number(settingsState.maxLeverage),
+    riskPerTradeUsdt: settingNumber("riskPerTradeUsdt"),
+    maxLeverage: settingNumber("maxLeverage"),
+    maxMarginUsagePercent: settingNumber("maxMarginUsagePercent"),
     entryMode: settingsState.entryMode,
-    minNotional: Number(settingsState.minNotional),
-    maxPositionSize: Number(settingsState.maxPositionSize),
-    maxOpenPositions: Number(settingsState.maxOpenPositions),
-    maxPositionPerSymbol: Number(settingsState.maxPositionPerSymbol),
-    minimumRiskReward: Number(settingsState.minimumRiskReward),
-    maxTradesPerDay: Number(settingsState.maxTradesPerDay),
-    maxDailyLossPercent: Number(settingsState.maxDailyLossPercent),
-    maxConsecutiveLosses: Number(settingsState.maxConsecutiveLosses),
-    cooldownAfterTradeMinutes: Number(settingsState.cooldownAfterTradeMinutes),
-    maxDrawdownPercent: Number(settingsState.maxDrawdownPercent),
+    maxOpenPositions: settingNumber("maxOpenPositions"),
+    maxPositionPerSymbol: settingNumber("maxPositionPerSymbol"),
+    minimumRiskReward: settingNumber("minimumRiskReward"),
+    dailyProfitLimitR: settingNumber("dailyProfitLimitR"),
+    dailyLossLimitR: settingNumber("dailyLossLimitR"),
+    maxDrawdownPercent: settingNumber("maxDrawdownPercent"),
     tradingEnabled: settingsState.tradingEnabled === "true",
     killSwitch: settingsState.killSwitch === "true",
     realExecutionMode: settingsState.realExecutionMode,
-    emaPeriod: Number(settingsState.emaPeriod),
-    swingLeft: Number(settingsState.swingLeft),
-    swingRight: Number(settingsState.swingRight),
-    fvgMitigation: settingsState.fvgMitigation,
-    ltfFvgEntryMode: settingsState.ltfFvgEntryMode,
+    emaPeriod: settingNumber("emaPeriod"),
+    swingLeft: settingNumber("swingLeft"),
+    swingRight: settingNumber("swingRight"),
     stopLossBufferMode: settingsState.stopLossBufferMode,
-    stopLossBufferTicks: Number(settingsState.stopLossBufferTicks),
-    stopLossBufferPercent: Number(settingsState.stopLossBufferPercent),
-    stopLossAtrPeriod: Number(settingsState.stopLossAtrPeriod),
-    stopLossAtrMultiplier: Number(settingsState.stopLossAtrMultiplier),
-    priceTickSize: Number(settingsState.priceTickSize),
+    stopLossBufferTicks: settingNumber("stopLossBufferTicks"),
+    stopLossBufferPercent: settingNumber("stopLossBufferPercent"),
+    stopLossAtrPeriod: settingNumber("stopLossAtrPeriod"),
+    stopLossAtrMultiplier: settingNumber("stopLossAtrMultiplier"),
     requireDisplacement: settingsState.requireDisplacement === "true",
-    displacementBodyMultiplier: Number(settingsState.displacementBodyMultiplier),
-    displacementLookback: Number(settingsState.displacementLookback),
-    takeProfitMode: settingsState.takeProfitMode,
-    fixedRr: Number(settingsState.fixedRr),
+    displacementBodyMultiplier: settingNumber("displacementBodyMultiplier"),
+    displacementLookback: settingNumber("displacementLookback"),
   };
+}
+
+function settingNumber(field) {
+  return parseSettingNumber(settingsState[field]);
+}
+
+function parseSettingNumber(value) {
+  return Number(String(value ?? "").trim().replace(",", "."));
+}
+
+const settingFieldByInputId = {
+  "setting-risk-per-trade": "riskPerTradeUsdt",
+  "setting-max-leverage": "maxLeverage",
+  "setting-max-margin-usage": "maxMarginUsagePercent",
+  "setting-max-open-positions": "maxOpenPositions",
+  "setting-max-position-per-symbol": "maxPositionPerSymbol",
+  "setting-minimum-rr": "minimumRiskReward",
+  "setting-daily-profit-limit-r": "dailyProfitLimitR",
+  "setting-daily-loss-limit-r": "dailyLossLimitR",
+  "setting-max-drawdown": "maxDrawdownPercent",
+  "setting-ema-period": "emaPeriod",
+  "setting-swing-left": "swingLeft",
+  "setting-swing-right": "swingRight",
+  "setting-sl-buffer-ticks": "stopLossBufferTicks",
+  "setting-sl-buffer-percent": "stopLossBufferPercent",
+  "setting-sl-atr-period": "stopLossAtrPeriod",
+  "setting-sl-atr-multiplier": "stopLossAtrMultiplier",
+  "setting-displacement-body": "displacementBodyMultiplier",
+  "setting-displacement-lookback": "displacementLookback",
+};
+
+const numericSettingRules = {
+  riskPerTradeUsdt: { id: "setting-risk-per-trade", label: "Risk per Trade", min: 0, exclusiveMin: true },
+  maxLeverage: { id: "setting-max-leverage", label: "Max Leverage", min: 1, max: 125, integer: true },
+  maxMarginUsagePercent: { id: "setting-max-margin-usage", label: "Max Margin Usage", min: 0, exclusiveMin: true, max: 100 },
+  maxOpenPositions: { id: "setting-max-open-positions", label: "Max Open Positions", min: 1, integer: true },
+  maxPositionPerSymbol: { id: "setting-max-position-per-symbol", label: "Max Position Per Symbol", min: 1, max: 1, integer: true },
+  minimumRiskReward: { id: "setting-minimum-rr", label: "Minimum R/R", min: 0, exclusiveMin: true },
+  dailyProfitLimitR: { id: "setting-daily-profit-limit-r", label: "Daily Profit Limit (R)", min: 0, exclusiveMin: true },
+  dailyLossLimitR: { id: "setting-daily-loss-limit-r", label: "Daily Loss Limit (R)", min: 0, exclusiveMin: true },
+  maxDrawdownPercent: { id: "setting-max-drawdown", label: "Max Drawdown", min: 0, exclusiveMin: true },
+  emaPeriod: { id: "setting-ema-period", label: "EMA Period", min: 1, integer: true },
+  swingLeft: { id: "setting-swing-left", label: "Swing Left", min: 1, integer: true },
+  swingRight: { id: "setting-swing-right", label: "Swing Right", min: 1, integer: true },
+  stopLossBufferTicks: { id: "setting-sl-buffer-ticks", label: "Buffer Ticks", min: 0 },
+  stopLossBufferPercent: { id: "setting-sl-buffer-percent", label: "Buffer Percent", min: 0 },
+  stopLossAtrPeriod: { id: "setting-sl-atr-period", label: "ATR Period", min: 1, integer: true },
+  stopLossAtrMultiplier: { id: "setting-sl-atr-multiplier", label: "ATR Multiplier", min: 0 },
+  displacementBodyMultiplier: { id: "setting-displacement-body", label: "Body Multiplier", min: 0, exclusiveMin: true },
+  displacementLookback: { id: "setting-displacement-lookback", label: "Body Lookback", min: 1, integer: true },
+};
+
+function sanitizeNumericDraft(value, rule) {
+  const source = String(value ?? "");
+  if (rule.integer) return source.replace(/\D/g, "");
+
+  let separatorSeen = false;
+  let result = "";
+  for (const char of source) {
+    if (/\d/.test(char)) {
+      result += char;
+      continue;
+    }
+    if ((char === "." || char === ",") && !separatorSeen) {
+      separatorSeen = true;
+      result += char;
+    }
+  }
+  return result;
+}
+
+function validateSettingsDraft() {
+  clearSettingValidation();
+  for (const [field, rule] of Object.entries(numericSettingRules)) {
+    const element = $(rule.id);
+    const rawValue = String(settingsState[field] ?? "").trim();
+    const value = parseSettingNumber(rawValue);
+    if (rawValue === "") {
+      element.classList.add("invalid");
+      return { ok: false, message: `${rule.label} is required`, element };
+    }
+    const invalidNumber = !Number.isFinite(value);
+    const belowMin = rule.exclusiveMin ? value <= rule.min : value < rule.min;
+    const aboveMax = rule.max !== undefined && value > rule.max;
+    const invalidInteger = rule.integer && !Number.isInteger(value);
+    if (invalidNumber || belowMin || aboveMax || invalidInteger) {
+      element.classList.add("invalid");
+      return { ok: false, message: validationMessage(rule), element };
+    }
+  }
+  if (settingsState.tradingEnabled === "true" && getSelectedWatchlist().length === 0) {
+    return { ok: false, message: "Watchlist cannot be empty when trading is enabled", element: $("setting-symbol-search") };
+  }
+  return { ok: true, message: "", element: null };
+}
+
+function clearSettingValidation() {
+  Object.values(numericSettingRules).forEach((rule) => $(rule.id).classList.remove("invalid"));
+}
+
+function validationMessage(rule) {
+  if (rule.max !== undefined && rule.min === rule.max) return `${rule.label} must be ${rule.min}`;
+  if (rule.integer) return `${rule.label} must be a whole number ${rule.min ?? 0} or higher`;
+  if (rule.max !== undefined) return `${rule.label} must be between ${rule.exclusiveMin ? "above " : ""}${rule.min} and ${rule.max}`;
+  return `${rule.label} must be ${rule.exclusiveMin ? "greater than" : "at least"} ${rule.min}`;
 }
 
 function renderWatchlistSettings() {

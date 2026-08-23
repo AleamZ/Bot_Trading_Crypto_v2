@@ -1,9 +1,11 @@
 import type { TradingSettings } from "../../application/config/AppConfig.js";
+import type { AccountProtectionState } from "../../application/risk/AccountProtectionService.js";
 import type { TradingRuntimeConfigRepository } from "../../application/trading-account/TradingRuntimeConfigRepository.js";
 
 export class MemoryTradingRuntimeConfigRepository implements TradingRuntimeConfigRepository {
   private readonly settings = new Map<string, TradingSettings>();
   private readonly watchlists = new Map<string, string[]>();
+  private readonly accountProtection = new Map<string, AccountProtectionState>();
 
   async ensureDefaults(tradingAccountId: string, defaults: TradingSettings): Promise<void> {
     if (!this.settings.has(tradingAccountId)) this.settings.set(tradingAccountId, cloneSettings(defaults));
@@ -27,9 +29,19 @@ export class MemoryTradingRuntimeConfigRepository implements TradingRuntimeConfi
     this.watchlists.set(tradingAccountId, [...new Set(symbols)]);
   }
 
+  async getAccountProtectionState(tradingAccountId: string): Promise<AccountProtectionState | null> {
+    const state = this.accountProtection.get(tradingAccountId);
+    return state ? { ...state } : null;
+  }
+
+  async saveAccountProtectionState(state: AccountProtectionState): Promise<void> {
+    this.accountProtection.set(state.tradingAccountId, { ...state });
+  }
+
   async deleteAccountData(tradingAccountId: string): Promise<void> {
     this.settings.delete(tradingAccountId);
     this.watchlists.delete(tradingAccountId);
+    this.accountProtection.delete(tradingAccountId);
   }
 }
 

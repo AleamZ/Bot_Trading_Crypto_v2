@@ -42,7 +42,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
     const quantity = formatRuleNumber(validation.normalized.quantity);
 
-    await this.setLeverage(symbol);
+    await this.setLeverage(symbol, risk.leverage);
 
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
@@ -151,10 +151,10 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     return this.signedPost("/fapi/v1/order", params, `Binance ${type} order failed`);
   }
 
-  private async setLeverage(symbol: string): Promise<void> {
+  private async setLeverage(symbol: string, leverage: number): Promise<void> {
     const params = new URLSearchParams({
       symbol,
-      leverage: String(Math.trunc(this.leverage)),
+      leverage: String(Math.trunc(leverage)),
       timestamp: String(Date.now())
     });
     await this.signedPost("/fapi/v1/leverage", params, "Binance leverage update failed");

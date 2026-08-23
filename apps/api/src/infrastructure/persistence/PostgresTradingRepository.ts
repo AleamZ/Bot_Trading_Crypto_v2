@@ -61,7 +61,7 @@ export class PostgresTradingRepository implements TradingRepository {
       [symbol, timeframe ?? null, this.tradingAccountId]
     );
     for (const row of result.rows as Array<{ payload: Fvg }>) {
-      if (row.payload.status === "active" || row.payload.status === "waiting-mitigation") {
+      if (isUsableFvgStatus(row.payload.status)) {
         return row.payload;
       }
     }
@@ -138,6 +138,10 @@ export class PostgresTradingRepository implements TradingRepository {
   private recordPrefix(): string {
     return this.tradingAccountId ? `account:${this.tradingAccountId}:` : "";
   }
+}
+
+function isUsableFvgStatus(status: Fvg["status"]): boolean {
+  return status === "untouched" || status === "touched" || status === "active" || status === "waiting-mitigation";
 }
 
 export async function createRepository(databaseUrl?: string): Promise<TradingRepository> {

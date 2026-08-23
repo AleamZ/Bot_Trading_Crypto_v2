@@ -24,7 +24,7 @@ export class MemoryTradingRepository implements TradingRepository {
   async getActiveOrWaitingFvg(symbol: string, timeframe?: Fvg["timeframe"]): Promise<Fvg | null> {
     return (
       [...this.fvgs.values()]
-        .filter((fvg) => fvg.symbol === symbol && (!timeframe || fvg.timeframe === timeframe) && (fvg.status === "active" || fvg.status === "waiting-mitigation"))
+        .filter((fvg) => fvg.symbol === symbol && (!timeframe || fvg.timeframe === timeframe) && isUsableFvgStatus(fvg.status))
         .sort((a, b) => b.createdAt - a.createdAt)[0] ?? null
     );
   }
@@ -68,4 +68,8 @@ export class MemoryTradingRepository implements TradingRepository {
       databaseStatus: this.status
     };
   }
+}
+
+function isUsableFvgStatus(status: Fvg["status"]): boolean {
+  return status === "untouched" || status === "touched" || status === "active" || status === "waiting-mitigation";
 }

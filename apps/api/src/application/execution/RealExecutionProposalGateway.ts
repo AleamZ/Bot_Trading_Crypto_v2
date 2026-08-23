@@ -18,6 +18,7 @@ export interface RealExecutionProposalGatewayOptions {
   binanceConnected: () => boolean;
   loadSymbolRules: (symbol: string) => Promise<FuturesSymbolRules>;
   loadAvailableBalance: () => Promise<number | null>;
+  assertAccountProtection: () => Promise<void>;
   proposalRepository: RealExecutionProposalRepository;
   auditRepository: ExecutionIntentRepository;
   logger: DecisionLogger;
@@ -29,6 +30,7 @@ export class RealExecutionProposalGateway implements ExecutionGateway {
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision): Promise<SubmittedOrder> {
     const config = this.options.config();
     this.assertGate(config);
+    await this.options.assertAccountProtection();
     const rules = await this.options.loadSymbolRules(risk.symbol);
     const validation = validateAgainstSymbolRules(rules, {
       symbol: risk.symbol,
@@ -41,7 +43,7 @@ export class RealExecutionProposalGateway implements ExecutionGateway {
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
     const availableBalance = await this.options.loadAvailableBalance();
     if (availableBalance === null) throw new Error("BINANCE_DISCONNECTED");
-    if (config.marginPerTrade > availableBalance) throw new Error("INSUFFICIENT_AVAILABLE_BALANCE");
+    if (risk.margin > availableBalance) throw new Error("INSUFFICIENT_AVAILABLE_BALANCE");
 
     const setupKey = buildSetupKey(this.options.tradingAccountId, plan, risk);
     const status: RealExecutionProposalStatus = config.realExecutionMode === "DRY_RUN" ? "DRY_RUN" : "PENDING";
@@ -73,7 +75,7 @@ export class RealExecutionProposalGateway implements ExecutionGateway {
       strategySnapshot: {
         entryMode: config.entryMode,
         realExecutionMode: config.realExecutionMode,
-        takeProfitMode: config.takeProfitMode,
+        takeProfitRule: "HTF_LIQUIDITY",
         minimumRiskReward: config.minimumRiskReward
       },
       riskSnapshot: { ...risk },

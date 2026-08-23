@@ -7,7 +7,7 @@ import type { Candle } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 import { detectH1Trend } from "../../domain/trend/TrendDetector.js";
 import type { Fvg } from "../../domain/fvg/Fvg.js";
-import { detectLatestHtfFvg, detectLatestLtfFvg, isFvgInvalidated, isFvgTouched } from "../../domain/fvg/FvgDetector.js";
+import { detectFvgs, detectLatestLtfFvg, isFvgInvalidated, isFvgTouched, reconstructFvgLifecycle } from "../../domain/fvg/FvgDetector.js";
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
 import { detectSwings } from "../../domain/market-structure/Swing.js";
@@ -248,67 +248,74 @@ export class TradingEngine {
 
     if (this.state.trend === "neutral") return;
 
-    let invalidatedFvgId: string | null = null;
-
-    const existingFvg = await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1");
-    if (existingFvg) {
-      if (this.state.setupState === "Archived") {
-        this.resetArchivedSetup(trend.direction);
-      }
-      this.state.setupEvidence.htfFvg = existingFvg;
-      this.syncSetupStateWithHtfFvg(existingFvg);
-
-      if (isFvgInvalidated(existingFvg, candle)) {
-        const invalidated = { ...existingFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
-        invalidatedFvgId = invalidated.id;
-        await this.repository.updateFvg(invalidated);
-        this.state.setupEvidence.htfFvg = invalidated;
-        this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
-        await this.events.publish({
-          type: "FVGInvalidated",
-          at: candle.closeTime,
-          fvg: invalidated,
-          reason: "Closed candle fully crossed the opposite FVG boundary"
-        });
-      } else if (isFreshFvg(existingFvg) && isFvgTouched(existingFvg, candle)) {
-        const touched = {
-          ...existingFvg,
-          status: "touched" as const,
-          firstTouchedAt: candle.closeTime,
-          ...(historical ? {} : { activatedAt: candle.closeTime })
-        };
-        await this.repository.updateFvg(touched);
-        this.state.setupEvidence.htfFvg = touched;
-        this.state.setupEvidence.htfFirstTouchedAt = candle.closeTime;
-        if (!historical) this.syncSetupStateWithHtfFvg(touched);
-        await this.events.publish({
-          type: "FVGActivated",
-          at: candle.closeTime,
-          fvg: touched,
-          reason: "H1 FVG first touch reached the nearest boundary"
-        });
-        return;
-      } else {
-        return;
-      }
+    const htfFvgs = await this.syncHtfFvgCandidates(candle, historical);
+    const currentEvidence = this.state.setupEvidence.htfFvg ? htfFvgs.find((fvg) => fvg.id === this.state.setupEvidence.htfFvg?.id) ?? null : null;
+    if (currentEvidence?.status === "invalidated") {
+      this.state.setupEvidence.htfFvg = currentEvidence;
+      this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
+      await this.events.publish({
+        type: "FVGInvalidated",
+        at: candle.closeTime,
+        fvg: currentEvidence,
+        reason: "Closed candle fully crossed the opposite FVG boundary"
+      });
     }
 
-    const fvg = detectLatestHtfFvg(this.state.h1Candles, this.state.trend);
-    if (!fvg || fvg.id === invalidatedFvgId) return;
+    const touched = htfFvgs.find((fvg) => fvg.status === "touched" && fvg.id === currentEvidence?.id);
+    if (touched && !historical && touched.firstTouchedAt === candle.closeTime) {
+      const activated = historical || touched.activatedAt !== undefined ? touched : { ...touched, activatedAt: touched.firstTouchedAt ?? candle.closeTime };
+      await this.repository.updateFvg(activated);
+      this.state.setupEvidence.htfFvg = activated;
+      this.state.setupEvidence.htfFirstTouchedAt = activated.firstTouchedAt ?? activated.activatedAt ?? null;
+      this.syncSetupStateWithHtfFvg(activated);
+      await this.events.publish({
+        type: "FVGActivated",
+        at: candle.closeTime,
+        fvg: activated,
+        reason: "H1 FVG first touch reached the nearest boundary"
+      });
+      return;
+    }
 
+    const selected = selectNearestFreshHtfFvg(htfFvgs, this.state.trend, candle.close);
+    if (!selected) {
+      const latestTouched = htfFvgs
+        .filter((fvg) => fvg.status === "touched")
+        .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id))[0];
+      if (latestTouched) {
+        this.state.setupEvidence.htfFvg = latestTouched;
+        this.state.setupEvidence.htfFirstTouchedAt = latestTouched.firstTouchedAt ?? latestTouched.activatedAt ?? null;
+        this.syncSetupStateWithHtfFvg(latestTouched);
+      }
+      if (touched) {
+        this.state.setupEvidence.htfFvg = touched;
+        this.state.setupEvidence.htfFirstTouchedAt = touched.firstTouchedAt ?? touched.activatedAt ?? null;
+        this.syncSetupStateWithHtfFvg(touched);
+        return;
+      }
+      return;
+    }
     if (this.state.setupState === "Archived") {
       this.resetArchivedSetup(trend.direction);
     }
-    await this.repository.saveFvg(fvg);
-    this.state.setupEvidence = { ...emptySetupEvidence(), htfFvg: fvg };
-    this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "FVGDetected");
-    this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingMitigation");
-    await this.events.publish({
-      type: "FVGCreated",
-      at: candle.closeTime,
-      fvg,
-      reason: "Three closed H1 candles formed a valid trend-aligned FVG"
-    });
+    if (this.state.setupEvidence.htfFvg?.id !== selected.id) {
+      if (!["WaitingTrend", "TrendConfirmed", "FVGDetected", "WaitingMitigation", "Archived"].includes(this.state.setupState)) {
+        this.resetArchivedSetup(trend.direction);
+      }
+      this.state.setupEvidence = { ...emptySetupEvidence(), htfFvg: selected };
+      this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "FVGDetected");
+      this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingMitigation");
+      await this.events.publish({
+        type: "FVGCreated",
+        at: candle.closeTime,
+        fvg: selected,
+        reason: "Selected nearest fresh same-direction H1 FVG by first reachable boundary"
+      });
+      return;
+    }
+
+    this.state.setupEvidence.htfFvg = selected;
+    this.syncSetupStateWithHtfFvg(selected);
   }
 
   private async processM5(candle: Candle, historical: boolean): Promise<void> {
@@ -319,9 +326,10 @@ export class TradingEngine {
     }
     if (!["MonitoringLTF", "WaitingCHOCH", "WaitingLtfFvg", "WaitingLtfMitigation"].includes(this.state.setupState)) return;
 
-    const htfFvg = await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1");
-    if (!htfFvg || htfFvg.status !== "touched" || htfFvg.activatedAt === undefined || this.state.trend === "neutral") return;
-    if (htfFvg.activatedAt !== undefined && candle.closeTime < htfFvg.activatedAt) return;
+    const htfFvg = this.state.setupEvidence.htfFvg ?? (await this.repository.getActiveOrWaitingFvg(this.config.symbol, "H1"));
+    const htfActivatedAt = htfFvg?.activatedAt ?? htfFvg?.firstTouchedAt;
+    if (!htfFvg || htfFvg.status !== "touched" || htfActivatedAt === undefined || this.state.trend === "neutral") return;
+    if (candle.closeTime < htfActivatedAt) return;
 
     if (!this.state.pendingSignal) {
       const signal = detectM5StructureSignal(this.state.m5Candles, this.state.trend, {
@@ -477,6 +485,22 @@ export class TradingEngine {
     });
   }
 
+  private async syncHtfFvgCandidates(candle: Candle, historical: boolean): Promise<Fvg[]> {
+    const detected = detectFvgs(this.state.h1Candles, "H1", this.state.trend as Direction);
+    const lifecycles = detected.map((fvg) => {
+      const lifecycle = reconstructFvgLifecycle(fvg, this.state.h1Candles);
+      if (!historical && lifecycle.status === "touched" && lifecycle.firstTouchedAt === candle.closeTime) {
+        return { ...lifecycle, activatedAt: candle.closeTime };
+      }
+      return lifecycle;
+    });
+
+    for (const fvg of lifecycles) {
+      await this.repository.saveFvg(fvg);
+    }
+    return lifecycles;
+  }
+
   private async getAvailableBalance(): Promise<number> {
     if (!this.availableBalanceProvider) return this.state.balance;
 
@@ -613,6 +637,25 @@ function isDisplacementSignal(
 
 function isFreshFvg(fvg: Fvg): boolean {
   return fvg.status === "untouched";
+}
+
+function selectNearestFreshHtfFvg(fvgs: readonly Fvg[], direction: Direction, currentPrice: number): Fvg | null {
+  const candidates = fvgs
+    .filter((fvg) => fvg.timeframe === "H1" && fvg.direction === direction && fvg.status === "untouched")
+    .map((fvg) => {
+      const boundary = direction === "bullish" ? fvg.upper : fvg.lower;
+      const distance = direction === "bullish" ? currentPrice - boundary : boundary - currentPrice;
+      return { fvg, distance };
+    })
+    .filter((item) => item.distance >= 0);
+
+  candidates.sort((a, b) => {
+    if (a.distance !== b.distance) return a.distance - b.distance;
+    if (a.fvg.createdAt !== b.fvg.createdAt) return b.fvg.createdAt - a.fvg.createdAt;
+    return a.fvg.id.localeCompare(b.fvg.id);
+  });
+
+  return candidates[0]?.fvg ?? null;
 }
 
 function emptySetupEvidence(): SetupEvidence {

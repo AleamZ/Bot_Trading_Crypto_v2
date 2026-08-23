@@ -9,6 +9,7 @@ import type {
 import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import { formatRuleNumber, normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../../domain/symbol/SymbolRules.js";
+import { PostEntryProtectionError } from "../../application/execution/PostEntryProtectionError.js";
 
 type BinanceOrderSide = "BUY" | "SELL";
 type EntryMode = "limit" | "market";
@@ -47,8 +48,30 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
     const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatRuleNumber(normalizePrice(plan.entry, rules.tickSize)), context?.clientEntryOrderId);
-    const stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
-    const takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
+    const partialOrder = (): SubmittedOrder => ({
+      orderId: String(entry.orderId),
+      ...(context?.clientEntryOrderId ? { clientEntryOrderId: context.clientEntryOrderId } : {}),
+      ...(context?.clientStopOrderId ? { clientStopOrderId: context.clientStopOrderId } : {}),
+      ...(context?.clientTakeProfitOrderId ? { clientTakeProfitOrderId: context.clientTakeProfitOrderId } : {}),
+      mode: this.mode
+    });
+
+    let stopLoss: BinanceOrderResponse;
+    try {
+      stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
+    } catch (error) {
+      throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), partialOrder());
+    }
+
+    let takeProfit: BinanceOrderResponse;
+    try {
+      takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
+    } catch (error) {
+      throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), {
+        ...partialOrder(),
+        stopLossOrderId: String(stopLoss.orderId)
+      });
+    }
 
     return {
       orderId: String(entry.orderId),

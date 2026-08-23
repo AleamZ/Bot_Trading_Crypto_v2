@@ -7,6 +7,7 @@ import { isRecoverableExecutionGateway } from "../ports/ExecutionGateway.js";
 import { buildSetupKey, sideFromDirection, type ExecutionIntent, type ExecutionIntentStatus } from "./ExecutionIntent.js";
 import type { ExecutionIntentRepository } from "./ExecutionIntentRepository.js";
 import { classifyExecutionError } from "./ExecutionErrors.js";
+import { isPostEntryProtectionError } from "./PostEntryProtectionError.js";
 import { backoffDelay, sleep, type RetryPolicyOptions } from "./RetryPolicy.js";
 
 export interface ExecutionCoordinatorOptions {
@@ -158,6 +159,24 @@ export class ExecutionCoordinator implements ExecutionGateway {
         return await this.options.delegate.submitBracketOrder(plan, risk, context);
       } catch (error) {
         lastError = error;
+        if (isPostEntryProtectionError(error)) {
+          await this.options.repository.transitionStatus(intent.id, ["ENTRY_SUBMITTING"], "ENTRY_FILLED", {
+            binanceEntryOrderId: error.submittedOrder.orderId,
+            binanceStopOrderId: error.submittedOrder.stopLossOrderId ?? null,
+            binanceTakeProfitOrderId: error.submittedOrder.takeProfitOrderId ?? null,
+            clientEntryOrderId: error.submittedOrder.clientEntryOrderId ?? context.clientEntryOrderId,
+            clientStopOrderId: error.submittedOrder.clientStopOrderId ?? context.clientStopOrderId,
+            clientTakeProfitOrderId: error.submittedOrder.clientTakeProfitOrderId ?? context.clientTakeProfitOrderId,
+            lastError: null
+          });
+          await this.audit("PROTECTION_INCOMPLETE_AFTER_ENTRY", intent, {
+            orderId: error.submittedOrder.orderId,
+            stopOrderId: error.submittedOrder.stopLossOrderId ?? null,
+            takeProfitOrderId: error.submittedOrder.takeProfitOrderId ?? null,
+            error: error.message
+          });
+          return error.submittedOrder;
+        }
         const classified = classifyExecutionError(error);
         if (classified.ambiguous && isRecoverableExecutionGateway(this.options.delegate)) {
           const found = await this.options.delegate.findOrderByClientOrderId(risk.symbol, context.clientEntryOrderId);

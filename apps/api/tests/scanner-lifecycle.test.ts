@@ -175,6 +175,61 @@ describe("scanner setup lifecycle", () => {
     expect(accountBScanner.getWatchlistStatus()[0]).toMatchObject({ symbol: "BNBUSDT", conditions: "0/7" });
     expect(accountAScanner.getEngine("BNBUSDT")).not.toBe(accountBScanner.getEngine("BNBUSDT"));
   });
+
+  it("selects the nearest untouched same-direction H1 FVG instead of the oldest candidate", async () => {
+    const scanner = new MarketScanner(
+      config("account-a", "ADAUSDT"),
+      new MemoryTradingRepository(),
+      new NoopExecutionGateway(),
+      fakeLogger(),
+      new StaticMarketData(twoUntouchedBullishHtfFvgs("ADAUSDT")) as never,
+      null
+    );
+
+    await scanner.scan();
+
+    const diagnostic = scanner.getSetupDiagnostic("ADAUSDT");
+    expect(diagnostic?.state).toBe("WaitingMitigation");
+    expect(diagnostic?.htfFvg?.id).toBe("ADAUSDT:H1:bullish:5:6:7");
+    expect(diagnostic?.htfFvg?.status).toBe("untouched");
+  });
+
+  it("does not let a historically touched H1 FVG return as a fresh candidate", async () => {
+    const scanner = new MarketScanner(
+      config("account-a", "ADAUSDT"),
+      new MemoryTradingRepository(),
+      new NoopExecutionGateway(),
+      fakeLogger(),
+      new StaticMarketData(touchedBullishHtfFvg("ADAUSDT")) as never,
+      null
+    );
+
+    await scanner.bootstrap();
+
+    const diagnostic = scanner.getSetupDiagnostic("ADAUSDT");
+    expect(diagnostic?.htfFvg?.id).toBe("ADAUSDT:H1:bullish:1:2:3");
+    expect(diagnostic?.htfFvg?.status).toBe("touched");
+    expect(diagnostic?.htfFvg?.mitigatedAt).toBe(240_000);
+    expect(diagnostic?.state).toBe("MonitoringLTF");
+  });
+
+  it("does not let an old touched H1 FVG block a newer fresh nearest candidate", async () => {
+    const scanner = new MarketScanner(
+      config("account-a", "ADAUSDT"),
+      new MemoryTradingRepository(),
+      new NoopExecutionGateway(),
+      fakeLogger(),
+      new StaticMarketData([...touchedBullishHtfFvg("ADAUSDT"), ...newBullishHtfSetupAfterInvalidation("ADAUSDT")]) as never,
+      null
+    );
+
+    await scanner.bootstrap();
+
+    const diagnostic = scanner.getSetupDiagnostic("ADAUSDT");
+    expect(diagnostic?.state).toBe("WaitingMitigation");
+    expect(diagnostic?.htfFvg?.id).toBe("ADAUSDT:H1:bullish:5:6:7");
+    expect(diagnostic?.htfFvg?.status).toBe("untouched");
+  });
 });
 
 function config(_accountId: string, symbol: string): AppConfig {
@@ -226,6 +281,27 @@ function newBullishHtfSetupAfterInvalidation(symbol: string): Candle[] {
     candle(symbol, "H1", 5, 930, 980, 850, 950),
     candle(symbol, "H1", 6, 950, 970, 900, 960),
     candle(symbol, "H1", 7, 1180, 1250, 1000, 1200)
+  ];
+}
+
+function twoUntouchedBullishHtfFvgs(symbol: string): Candle[] {
+  return [
+    candle(symbol, "H1", 1, 80, 90, 70, 80),
+    candle(symbol, "H1", 2, 82, 85, 80, 82),
+    candle(symbol, "H1", 3, 98, 100, 95, 98),
+    candle(symbol, "H1", 4, 99, 101, 96, 99),
+    candle(symbol, "H1", 5, 104, 105, 100, 104),
+    candle(symbol, "H1", 6, 105, 106, 104, 105),
+    candle(symbol, "H1", 7, 120, 122, 108, 120)
+  ];
+}
+
+function touchedBullishHtfFvg(symbol: string): Candle[] {
+  return [
+    candle(symbol, "H1", 1, 80, 90, 70, 80),
+    candle(symbol, "H1", 2, 82, 96, 80, 82),
+    candle(symbol, "H1", 3, 98, 100, 95, 98),
+    candle(symbol, "H1", 4, 99, 101, 94, 99)
   ];
 }
 

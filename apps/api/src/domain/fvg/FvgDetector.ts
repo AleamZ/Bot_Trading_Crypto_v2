@@ -13,27 +13,58 @@ export function detectLatestLtfFvg(candles: readonly Candle[], expectedDirection
 }
 
 export function detectLatestFvg(candles: readonly Candle[], timeframe: Timeframe, expectedDirection: Direction): Fvg | null {
+  return detectFvgs(candles, timeframe, expectedDirection).at(-1) ?? null;
+}
+
+export function detectFvgs(candles: readonly Candle[], timeframe: Timeframe, expectedDirection: Direction): Fvg[] {
   const closed = candles.filter((candle) => candle.timeframe === timeframe && candle.isClosed);
   if (closed.length < 3) {
-    return null;
+    return [];
   }
 
-  const c1 = closed[closed.length - 3];
-  const c2 = closed[closed.length - 2];
-  const c3 = closed[closed.length - 1];
-  if (!c1 || !c2 || !c3) {
-    return null;
+  const fvgs: Fvg[] = [];
+  for (let index = 2; index < closed.length; index += 1) {
+    const c1 = closed[index - 2];
+    const c2 = closed[index - 1];
+    const c3 = closed[index];
+    if (!c1 || !c2 || !c3) continue;
+
+    if (expectedDirection === "bullish" && c3.low > c1.high) {
+      fvgs.push(createFvg(c1, c2, c3, "bullish", c1.high, c3.low));
+    }
+
+    if (expectedDirection === "bearish" && c3.high < c1.low) {
+      fvgs.push(createFvg(c1, c2, c3, "bearish", c3.high, c1.low));
+    }
   }
 
-  if (expectedDirection === "bullish" && c3.low > c1.high) {
-    return createFvg(c1, c2, c3, "bullish", c1.high, c3.low);
+  return fvgs;
+}
+
+export function reconstructFvgLifecycle(fvg: Fvg, candles: readonly Candle[]): Fvg {
+  let firstTouchedAt = fvg.firstTouchedAt ?? null;
+  const subsequent = candles
+    .filter((candle) => candle.symbol === fvg.symbol && candle.timeframe === fvg.timeframe && candle.isClosed && candle.openTime > fvg.thirdCandleOpenTime)
+    .sort((a, b) => a.openTime - b.openTime);
+
+  for (const candle of subsequent) {
+    if (isFvgInvalidated(fvg, candle)) {
+      return {
+        ...fvg,
+        status: "invalidated",
+        ...(firstTouchedAt !== null ? { firstTouchedAt } : {}),
+        invalidatedAt: candle.closeTime
+      };
+    }
+    if (firstTouchedAt === null && isFvgTouched(fvg, candle)) {
+      firstTouchedAt = candle.closeTime;
+    }
   }
 
-  if (expectedDirection === "bearish" && c3.high < c1.low) {
-    return createFvg(c1, c2, c3, "bearish", c3.high, c1.low);
+  if (firstTouchedAt !== null) {
+    return { ...fvg, status: "touched", firstTouchedAt };
   }
-
-  return null;
+  return { ...fvg, status: "untouched" };
 }
 
 export function isFvgTouched(fvg: Fvg, candle: Candle): boolean {

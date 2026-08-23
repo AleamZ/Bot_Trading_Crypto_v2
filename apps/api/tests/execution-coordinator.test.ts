@@ -26,6 +26,7 @@ import { createExecutionGateway } from "../src/infrastructure/execution/createEx
 import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
 import { LockedRealExecutionGateway } from "../src/infrastructure/execution/LockedRealExecutionGateway.js";
 import { isRecoverableExecutionGateway } from "../src/application/ports/ExecutionGateway.js";
+import { PostEntryProtectionError } from "../src/application/execution/PostEntryProtectionError.js";
 
 describe("ExecutionCoordinator", () => {
   it("submits the same setup only once across repeated scanner calls", async () => {
@@ -114,6 +115,51 @@ describe("ExecutionCoordinator", () => {
     expect(intent?.status).toBe("PROTECTION_INCOMPLETE");
     expect(intent?.binanceStopOrderId).toBe("stop-1");
     expect(intent?.binanceTakeProfitOrderId).toBeNull();
+  });
+
+  it("keeps an accepted entry repairable when SL submission fails before TP is submitted", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway([
+      new PostEntryProtectionError("Binance STOP_MARKET order failed 400", { orderId: "entry-1", mode: "testnet" })
+    ]);
+    const coordinator = coordinatorFor("account-a", repository, delegate);
+
+    const order = await coordinator.submitBracketOrder(plan(), risk());
+    const intent = (await repository.listByAccount("account-a"))[0];
+
+    expect(order.orderId).toBe("entry-1");
+    expect(intent?.status).toBe("PROTECTION_INCOMPLETE");
+    expect(intent?.binanceEntryOrderId).toBe("entry-1");
+    expect(intent?.binanceStopOrderId).toBeNull();
+    expect(intent?.binanceTakeProfitOrderId).toBeNull();
+    expect(await repository.listOpenByAccount("account-a")).toHaveLength(1);
+  });
+
+  it("keeps an accepted entry repairable when TP submission fails after SL succeeds", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway([
+      new PostEntryProtectionError("Binance TAKE_PROFIT_MARKET order failed 400", { orderId: "entry-1", stopLossOrderId: "stop-1", mode: "testnet" })
+    ]);
+    const coordinator = coordinatorFor("account-a", repository, delegate);
+
+    await coordinator.submitBracketOrder(plan(), risk());
+    const intent = (await repository.listByAccount("account-a"))[0];
+
+    expect(intent?.status).toBe("PROTECTION_INCOMPLETE");
+    expect(intent?.binanceEntryOrderId).toBe("entry-1");
+    expect(intent?.binanceStopOrderId).toBe("stop-1");
+    expect(intent?.binanceTakeProfitOrderId).toBeNull();
+  });
+
+  it("allows terminal failure when entry is rejected before acceptance", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway([new Error("Binance entry order failed 400: invalid quantity")]);
+    const coordinator = coordinatorFor("account-a", repository, delegate);
+
+    await expect(coordinator.submitBracketOrder(plan(), risk())).rejects.toThrow("INVALID_ORDER");
+    const intent = (await repository.listByAccount("account-a"))[0];
+    expect(intent?.status).toBe("FAILED");
+    expect(await repository.listOpenByAccount("account-a")).toHaveLength(0);
   });
 
   it("keeps executions isolated for two accounts trading the same symbol", async () => {

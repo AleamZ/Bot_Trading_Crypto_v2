@@ -63,8 +63,10 @@ describe("Binance signed account source routing", () => {
     await new BinanceFuturesAccountClient("DEMO_KEY", "DEMO_SECRET", true).getOpenOrders("BTCUSDT");
     await new BinanceFuturesAccountClient("REAL_KEY", "REAL_SECRET", false).getOpenOrders("BTCUSDT");
 
-    expect(urls[0]).toContain("https://demo-fapi.binance.com/fapi/v1/openOrders");
-    expect(urls[1]).toContain("https://fapi.binance.com/fapi/v1/openOrders");
+    expect(urls.some((url) => url.includes("https://demo-fapi.binance.com/fapi/v1/openOrders"))).toBe(true);
+    expect(urls.some((url) => url.includes("https://demo-fapi.binance.com/fapi/v1/openAlgoOrders"))).toBe(true);
+    expect(urls.some((url) => url.includes("https://fapi.binance.com/fapi/v1/openOrders"))).toBe(true);
+    expect(urls.some((url) => url.includes("https://fapi.binance.com/fapi/v1/openAlgoOrders"))).toBe(true);
   });
 });
 
@@ -269,6 +271,20 @@ describe("trading account HTTP flow", () => {
     const saved = await accountRepository.findBinanceConnection(account.id);
     expect(saved?.apiKeyEncrypted).not.toContain("ABCD1234WXYZ");
     expect(saved?.apiSecretEncrypted).not.toContain("secret-value");
+  });
+
+  it("recovers stale trading account ERROR status after successful Binance account auth", async () => {
+    const cookie = await register("stale-status@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
+    await accountRepository.updateTradingAccountStatus(account.id, "ERROR", new Date().toISOString());
+
+    const response = await fetch(`${baseUrl}/api/trading-accounts/${account.id}/binance-account`, { headers: { cookie } });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.account.connected).toBe(true);
+    expect((await accountRepository.findTradingAccountById(account.id))?.status).toBe("CONNECTED");
   });
 
   it("maps DEMO to Testnet and REAL to Mainnet", async () => {
@@ -561,6 +577,49 @@ describe("trading account HTTP flow", () => {
     await restartedRuntimeManager.shutdown();
   });
 
+  it("exposes recovered snapshot after initial reconciliation even when scanner bootstrap is still waiting on market data", async () => {
+    const cookie = await register("restart-bootstrap@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Restart", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "RESTART_KEY", apiSecret: "RESTART_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, watchlist: ["XRPUSDT"], symbol: "XRPUSDT" }, cookie);
+    await accountRepository.updateTradingAccountStatus(account.id, "ERROR", new Date().toISOString());
+    FakeAccountClient.positionsByApiKey.set("RESTART_KEY", [fakePosition("XRPUSDT", "long")]);
+    FakeAccountClient.openOrdersByApiKey.set("RESTART_KEY", [
+      fakeProtectionOrder("XRPUSDT", "STOP_MARKET", "smc_restart_S", "stop-1"),
+      fakeProtectionOrder("XRPUSDT", "TAKE_PROFIT_MARKET", "smc_restart_T", "tp-1")
+    ]);
+
+    const restartedRuntimeManager = new TradingRuntimeManager(
+      testConfig(),
+      undefined,
+      accountRepository,
+      configRepository,
+      executionIntentRepository,
+      new CredentialCipher(encryptionKey),
+      new HangingMarketData(),
+      fakeLogger(),
+      (apiKey, apiSecret, testnet) => {
+        accountClientFactoryCalls.push({ apiKey, apiSecret, testnet });
+        return new FakeAccountClient(apiKey, testnet);
+      },
+      new FakeSymbolMetadataService(),
+      realProposalRepository,
+      () => new HangingMarketData() as never
+    );
+
+    const snapshot = await Promise.race([
+      restartedRuntimeManager.getSnapshot(account.id),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("SNAPSHOT_BLOCKED_BY_BOOTSTRAP")), 500))
+    ]);
+
+    expect(snapshot.runtimeHealth).toMatchObject({ state: "READY", reconciliationStatus: "OK" });
+    expect(snapshot.watchlistStatus[0]).toMatchObject({ symbol: "XRPUSDT", state: "ManagingTrade", position: "LONG", status: "Position Open", positionSource: "binance" });
+    expect((await accountRepository.findTradingAccountById(account.id))?.status).toBe("CONNECTED");
+    expect(accountClientFactoryCalls.filter((call) => call.apiKey === "RESTART_KEY" && call.testnet).length).toBeGreaterThan(0);
+
+    await restartedRuntimeManager.shutdown();
+  });
+
   it("uses credentials from the requested account for chart account activity", async () => {
     const cookie = await register("a@example.com");
     const accountA = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
@@ -778,6 +837,12 @@ class FakeMarketData {
   }
 }
 
+class HangingMarketData extends FakeMarketData {
+  override async getClosedCandles(): Promise<never> {
+    return new Promise<never>(() => undefined);
+  }
+}
+
 class FakeAccountClient {
   static nextLeverage = 20;
   static nextMarginType: "CROSS" | "ISOLATED" = "ISOLATED";
@@ -902,6 +967,20 @@ function fakeOpenOrder(symbol: string, clientOrderId: string): BinanceFuturesOpe
     reduceOnly: false,
     createdAt: Date.now(),
     updatedAt: Date.now()
+  };
+}
+
+function fakeProtectionOrder(symbol: string, type: "STOP_MARKET" | "TAKE_PROFIT_MARKET", clientOrderId: string, orderId: string): BinanceFuturesOpenOrderStatus {
+  return {
+    ...fakeOpenOrder(symbol, clientOrderId),
+    id: `binance:open-order:${symbol}:${orderId}`,
+    orderId,
+    side: "SELL",
+    type,
+    price: null,
+    stopPrice: type === "STOP_MARKET" ? 590 : 620,
+    quantity: 1,
+    reduceOnly: true
   };
 }
 

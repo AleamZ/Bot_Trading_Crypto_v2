@@ -13,11 +13,17 @@ import { detectM5StructureSignal } from "../src/domain/market-structure/Structur
 import { evaluateRisk } from "../src/domain/risk/RiskManager.js";
 import { transitionSetupState } from "../src/domain/setup/SetupStateMachine.js";
 import { LiquidityManager, buildLiquidityState, selectExternalLiquidityTarget } from "../src/domain/liquidity/LiquidityDetector.js";
-import { normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../src/domain/symbol/SymbolRules.js";
+import { formatRuleNumber, normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../src/domain/symbol/SymbolRules.js";
 
 describe("Binance symbol rules", () => {
   it("normalizes quantity down to step size", () => {
     expect(normalizeQuantity(0.00129, 0.001)).toBe(0.001);
+  });
+
+  it("formats exchange rule numbers without stripping integer zeros", () => {
+    expect(formatRuleNumber(100)).toBe("100");
+    expect(formatRuleNumber(100.5)).toBe("100.5");
+    expect(formatRuleNumber(0.1)).toBe("0.1");
   });
 
   it("normalizes price down to tick size", () => {
@@ -501,6 +507,29 @@ describe("trading settings", () => {
 
     expect(settings.watchlist).toEqual(["BTCUSDT", "ETHUSDT"]);
     expect(settings.minimumRiskReward).toBe(2);
+  });
+
+  it("strips obsolete production settings and keeps only the risk-based active contract", () => {
+    const settings = validateTradingSettings({
+      ...defaultTradingSettings,
+      positionSizingMode: "fixed-margin",
+      marginPerTrade: 100,
+      leverage: 20,
+      fvgMitigation: "full",
+      ltfFvgEntryMode: "edge",
+      takeProfitMode: "fixed-rr",
+      fixedRr: 9,
+      maxTradesPerDay: 99
+    });
+
+    expect(settings.positionSizingMode).toBe("risk-based");
+    expect(settings).not.toHaveProperty("marginPerTrade");
+    expect(settings).not.toHaveProperty("leverage");
+    expect(settings).not.toHaveProperty("fvgMitigation");
+    expect(settings).not.toHaveProperty("ltfFvgEntryMode");
+    expect(settings).not.toHaveProperty("takeProfitMode");
+    expect(settings).not.toHaveProperty("fixedRr");
+    expect(settings).not.toHaveProperty("maxTradesPerDay");
   });
 
   it("rejects invalid trading settings", () => {

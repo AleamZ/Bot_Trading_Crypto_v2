@@ -193,7 +193,9 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
 export async function createTradingAccountRepository(databaseUrl?: string): Promise<TradingAccountRepository> {
   if (!databaseUrl) return new MemoryTradingAccountRepository();
   const repository = new PostgresTradingAccountRepository(databaseUrl);
-  await repository.migrate();
+  await repository.migrate().catch((error: unknown) => {
+    console.warn(`[postgres] trading account migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
+  });
   return repository;
 }
 

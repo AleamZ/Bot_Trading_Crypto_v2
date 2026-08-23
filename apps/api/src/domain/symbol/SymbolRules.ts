@@ -74,7 +74,8 @@ export function validateAgainstSymbolRules(rules: FuturesSymbolRules, input: Sym
 
 export function formatRuleNumber(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0";
-  return value.toFixed(Math.min(decimalPlaces(value), 12)).replace(/\.?0+$/, "");
+  const fixed = value.toFixed(Math.min(decimalPlaces(value), 12));
+  return fixed.includes(".") ? fixed.replace(/\.?0+$/, "") : fixed;
 }
 
 function normalizeDown(value: number, increment: number): number {

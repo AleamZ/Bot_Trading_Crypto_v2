@@ -197,8 +197,7 @@ export class TradingRuntimeManager {
     const watchlist = await this.configRepository.getWatchlist(account.id);
     const config = { ...this.baseConfig, ...settings, watchlist, symbol: watchlist[0] ?? settings.symbol };
     const configRef: RuntimeConfigRef = { current: config };
-    const repository = this.databaseUrl ? new PostgresTradingRepository(this.databaseUrl, account.id) : new MemoryTradingRepository();
-    if (this.databaseUrl && "migrate" in repository) await (repository as PostgresTradingRepository).migrate();
+    const repository = await this.createRuntimeTradingRepository(account.id);
     await repository.saveTradingSettings(config);
     const health = createRecoveringHealth();
     const rawExecution = await this.createExecutionGateway(account, config.entryMode, config.maxLeverage);
@@ -255,11 +254,7 @@ export class TradingRuntimeManager {
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
     this.runtimes.set(account.id, runtime);
     await this.reconcileRuntime(runtime);
-    await scanner.bootstrap().catch((error: unknown) => {
-      this.logger.warn("[RUNTIME] bootstrap failed", { tradingAccountId: account.id, error: error instanceof Error ? error.message : String(error) });
-    });
-    runtime.health.lastScanAt = new Date().toISOString();
-    scanner.start();
+    this.startScannerBootstrap(runtime);
     runtime.reconciliationTimer = setInterval(() => {
       this.reconcileRuntime(runtime).catch((error: unknown) => {
         runtime.health.state = "DEGRADED";
@@ -270,6 +265,42 @@ export class TradingRuntimeManager {
       });
     }, this.baseConfig.reconciliationIntervalMs);
     return runtime;
+  }
+
+  private async createRuntimeTradingRepository(accountId: string): Promise<TradingRepository> {
+    if (!this.databaseUrl) return new MemoryTradingRepository();
+    try {
+      const repository = new PostgresTradingRepository(this.databaseUrl, accountId);
+      await repository.migrate();
+      return repository;
+    } catch (error) {
+      this.logger.warn("[RUNTIME] trading record repository unavailable; using memory fallback", {
+        tradingAccountId: accountId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return new MemoryTradingRepository({
+        database: "memory",
+        connected: true,
+        reason: "Trading record repository unavailable during runtime recovery"
+      });
+    }
+  }
+
+  private startScannerBootstrap(runtime: AccountRuntime): void {
+    if (runtime.scannerBootstrapStarted) return;
+    runtime.scannerBootstrapStarted = true;
+    runtime.scannerBootstrapInFlight = runtime.scanner
+      .bootstrap()
+      .catch((error: unknown) => {
+        this.logger.warn("[RUNTIME] bootstrap failed", { tradingAccountId: runtime.account.id, error: error instanceof Error ? error.message : String(error) });
+      })
+      .finally(() => {
+        runtime.health.lastScanAt = new Date().toISOString();
+        if (!this.shuttingDown && runtime.reconciliationTimer !== null) {
+          runtime.scanner.start();
+        }
+        runtime.scannerBootstrapInFlight = null;
+      });
   }
 
   async refreshRuntime(accountId: string): Promise<void> {
@@ -354,7 +385,7 @@ export class TradingRuntimeManager {
     return {
       engine: runtime.scanner.getPrimaryEngine().getDashboardState(),
       store: await runtime.repository.getDashboardSnapshot(),
-      watchlistStatus: runtime.scanner.getWatchlistStatus(),
+      watchlistStatus: reconcileWatchlistStatus(runtime.scanner.getWatchlistStatus(), runtime.lastPositions, runtime.configRef.current.executionMode),
       runtimeHealth: { ...runtime.health },
       execution,
       realReadiness,
@@ -743,6 +774,7 @@ export class TradingRuntimeManager {
       runtime.reconciliationGateway
     );
     const activity = await this.getAccountActivity(runtime.account.id, undefined, 100);
+    runtime.lastPositions = activity.positions;
     runtime.scanner.syncPositions(activity.positions);
     runtime.health.lastReconciliationAt = result.checkedAt;
     runtime.health.lastReconciliationError = result.error;
@@ -750,9 +782,17 @@ export class TradingRuntimeManager {
     if (result.status === "OK") {
       runtime.health.state = "READY";
       runtime.health.reconciliationSuccess += 1;
+      if (runtime.account.status !== "CONNECTED") {
+        await this.accountRepository.updateTradingAccountStatus(runtime.account.id, "CONNECTED", result.checkedAt);
+        runtime.account.status = "CONNECTED";
+        runtime.account.updatedAt = result.checkedAt;
+      }
     } else if (result.status === "CONNECTION_LOST") {
       runtime.health.state = "DISCONNECTED";
       runtime.health.reconciliationFailure += 1;
+      await this.accountRepository.updateTradingAccountStatus(runtime.account.id, "ERROR", result.checkedAt);
+      runtime.account.status = "ERROR";
+      runtime.account.updatedAt = result.checkedAt;
     } else {
       runtime.health.state = "DEGRADED";
       runtime.health.reconciliationFailure += 1;
@@ -874,6 +914,9 @@ async function readAccountRuntimeData<T>(label: string, read: () => Promise<T[]>
 class AccountRuntime {
   reconciliationTimer: NodeJS.Timeout | null = null;
   reconciliationInFlight: Promise<ReconciliationResult> | null = null;
+  scannerBootstrapStarted = false;
+  scannerBootstrapInFlight: Promise<void> | null = null;
+  lastPositions: BinanceFuturesPositionStatus[] = [];
 
   constructor(
     readonly account: TradingAccount,
@@ -885,6 +928,38 @@ class AccountRuntime {
     readonly configRef: RuntimeConfigRef,
     readonly reconciliationGateway: RecoverableExecutionGateway | undefined
   ) {}
+}
+
+function reconcileWatchlistStatus(
+  rows: WatchlistStatus[],
+  positions: readonly BinanceFuturesPositionStatus[],
+  executionMode: AppConfig["executionMode"]
+): WatchlistStatus[] {
+  const positionsBySymbol = new Map(positions.filter((position) => position.quantity > 0).map((position) => [position.symbol, position]));
+  return rows.map((row) => {
+    const position = positionsBySymbol.get(row.symbol);
+    if (position) {
+      return {
+        ...row,
+        state: "ManagingTrade",
+        conditions: "—",
+        rr: null,
+        position: position.side === "short" ? "SHORT" : "LONG",
+        status: "Position Open",
+        positionSource: "binance"
+      };
+    }
+
+    if (row.position !== "Open" && row.position !== "Paper") {
+      return { ...row, position: "None", positionSource: "binance" };
+    }
+
+    if (executionMode === "paper") {
+      return { ...row, rr: null, position: "Paper", status: "Simulated", positionSource: "paper" };
+    }
+
+    return { ...row, rr: null, position: "None", status: "Unsynced", positionSource: "engine" };
+  });
 }
 
 class GatedRecoverableExecutionGateway implements RecoverableExecutionGateway {

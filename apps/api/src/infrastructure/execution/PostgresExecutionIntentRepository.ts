@@ -179,7 +179,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
 export async function createExecutionIntentRepository(databaseUrl?: string): Promise<ExecutionIntentRepository> {
   if (!databaseUrl) return new MemoryExecutionIntentRepository();
   const repository = new PostgresExecutionIntentRepository(databaseUrl);
-  await repository.migrate();
+  await repository.migrate().catch((error: unknown) => {
+    console.warn(`[postgres] execution intent migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
+  });
   return repository;
 }
 

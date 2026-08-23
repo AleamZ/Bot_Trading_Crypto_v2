@@ -1110,6 +1110,7 @@ function buildActivePositionAnalysis(symbol: string, position: BinanceFuturesPos
   return {
     symbol,
     checkedAt: new Date().toISOString(),
+    analysisSource: "active-position",
     setupState: "ORDER_PLACED",
     setupStatus: "MANAGING_TRADE",
     trend: { direction: position.side === "long" ? "bullish" : "bearish", ema: null, close: null, reason: "Active Binance Futures position" },
@@ -1181,6 +1182,7 @@ export async function buildSymbolAnalysis(
 ): Promise<{
   symbol: string;
   checkedAt: string;
+  analysisSource: "runtime" | "diagnostic-fallback";
   setupState: AnalysisSetupState;
   setupStatus: string;
   trend: {
@@ -1209,12 +1211,14 @@ export async function buildSymbolAnalysis(
     canonicalSetup?.symbol === symbol && canonicalSetup.setupKey
       ? setupFromDiagnostic(symbol, canonicalSetup)
       : buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config, options.symbolTickSize ?? 0.1);
+  const analysisSource = canonicalSetup?.symbol === symbol && canonicalSetup.setupKey ? "runtime" : "diagnostic-fallback";
   const conditions = buildLifecycleConditions(setup, config);
   const riskManagement = buildAnalysisRiskManagement(setup, config);
 
   return {
     symbol,
     checkedAt: new Date().toISOString(),
+    analysisSource,
     setupState: setup.state,
     setupStatus: setupStateLabel(setup.state),
     trend: {

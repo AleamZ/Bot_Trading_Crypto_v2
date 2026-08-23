@@ -168,7 +168,9 @@ export class PostgresRealExecutionProposalRepository implements RealExecutionPro
 export async function createRealExecutionProposalRepository(databaseUrl?: string): Promise<RealExecutionProposalRepository> {
   if (!databaseUrl) return new MemoryRealExecutionProposalRepository();
   const repository = new PostgresRealExecutionProposalRepository(databaseUrl);
-  await repository.migrate();
+  await repository.migrate().catch((error: unknown) => {
+    console.warn(`[postgres] real execution proposal migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
+  });
   return repository;
 }
 

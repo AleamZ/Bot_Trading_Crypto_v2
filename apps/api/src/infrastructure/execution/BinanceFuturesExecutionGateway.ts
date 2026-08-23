@@ -17,6 +17,7 @@ type EntryMode = "limit" | "market";
 export class BinanceFuturesExecutionGateway implements RecoverableExecutionGateway {
   private readonly baseUrl: string;
   private readonly symbolRules = new Map<string, FuturesSymbolRules>();
+  private readonly marketPrices = new Map<string, { expiresAt: number; price: number }>();
 
   constructor(
     private readonly apiKey: string,
@@ -42,6 +43,9 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     });
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
     const quantity = formatRuleNumber(validation.normalized.quantity);
+    if (this.entryMode === "market") {
+      await this.validateMarketOrderNotional(symbol, validation.normalized.quantity, rules);
+    }
 
     await this.setLeverage(symbol, risk.leverage);
 
@@ -56,27 +60,27 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       mode: this.mode
     });
 
-    let stopLoss: BinanceOrderResponse;
+    let stopLoss: BinanceAlgoOrderResponse;
     try {
-      stopLoss = await this.submitTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
+      stopLoss = await this.submitAlgoTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
     } catch (error) {
       throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), partialOrder());
     }
 
-    let takeProfit: BinanceOrderResponse;
+    let takeProfit: BinanceAlgoOrderResponse;
     try {
-      takeProfit = await this.submitTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
+      takeProfit = await this.submitAlgoTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
     } catch (error) {
       throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), {
         ...partialOrder(),
-        stopLossOrderId: String(stopLoss.orderId)
+        stopLossOrderId: String(stopLoss.algoId)
       });
     }
 
     return {
       orderId: String(entry.orderId),
-      stopLossOrderId: String(stopLoss.orderId),
-      takeProfitOrderId: String(takeProfit.orderId),
+      stopLossOrderId: String(stopLoss.algoId),
+      takeProfitOrderId: String(takeProfit.algoId),
       ...(context?.clientEntryOrderId ? { clientEntryOrderId: context.clientEntryOrderId } : {}),
       ...(context?.clientStopOrderId ? { clientStopOrderId: context.clientStopOrderId } : {}),
       ...(context?.clientTakeProfitOrderId ? { clientTakeProfitOrderId: context.clientTakeProfitOrderId } : {}),
@@ -108,7 +112,10 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       leverage: 1
     });
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
-    const order = await this.submitTriggerOrder(
+    const existing = await this.findAlgoOrderByClientAlgoId(request.clientOrderId);
+    if (existing) return toExecutionOrderLookupResult(existing, request.symbol, request.clientOrderId);
+
+    const order = await this.submitAlgoTriggerOrder(
       request.symbol,
       request.type,
       request.side,
@@ -128,6 +135,17 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     });
     try {
       await this.signedDelete("/fapi/v1/order", params, "Binance order cancel failed");
+    } catch (error) {
+      if (!isOrderNotFound(error)) throw error;
+    }
+    const algoParams = new URLSearchParams({
+      symbol,
+      clientAlgoId: clientOrderId,
+      timestamp: String(Date.now()),
+      recvWindow: "5000"
+    });
+    try {
+      await this.signedDelete("/fapi/v1/algoOrder", algoParams, "Binance algo order cancel failed");
     } catch (error) {
       if (!isOrderNotFound(error)) throw error;
     }
@@ -151,27 +169,28 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     return this.signedPost("/fapi/v1/order", params, "Binance entry order failed");
   }
 
-  private async submitTriggerOrder(
+  private async submitAlgoTriggerOrder(
     symbol: string,
     type: "STOP_MARKET" | "TAKE_PROFIT_MARKET",
     side: BinanceOrderSide,
     quantity: string,
-    stopPrice: string,
+    triggerPrice: string,
     clientOrderId?: string
-  ): Promise<BinanceOrderResponse> {
+  ): Promise<BinanceAlgoOrderResponse> {
     const params = new URLSearchParams({
+      algoType: "CONDITIONAL",
       symbol,
       side,
       type,
       quantity,
-      stopPrice,
+      triggerPrice,
       reduceOnly: "true",
       workingType: "CONTRACT_PRICE",
       timestamp: String(Date.now())
     });
-    if (clientOrderId) params.set("newClientOrderId", clientOrderId);
+    if (clientOrderId) params.set("clientAlgoId", clientOrderId);
 
-    return this.signedPost("/fapi/v1/order", params, `Binance ${type} order failed`);
+    return this.signedPost("/fapi/v1/algoOrder", params, `Binance ${type} algo order failed`);
   }
 
   private async setLeverage(symbol: string, leverage: number): Promise<void> {
@@ -183,7 +202,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     await this.signedPost("/fapi/v1/leverage", params, "Binance leverage update failed");
   }
 
-  private async signedPost(path: string, params: URLSearchParams, label: string): Promise<BinanceOrderResponse> {
+  private async signedPost<T extends BinanceOrderResponse | BinanceAlgoOrderResponse>(path: string, params: URLSearchParams, label: string): Promise<T> {
     params.set("signature", this.sign(params.toString()));
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
@@ -195,7 +214,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       throw new Error(`${label} ${response.status}: ${await response.text()}`);
     }
 
-    return (await response.json()) as BinanceOrderResponse;
+    return (await response.json()) as T;
   }
 
   private async signedGet<T>(path: string, queryParams: Record<string, string>): Promise<T> {
@@ -212,7 +231,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     return (await response.json()) as T;
   }
 
-  private async signedDelete(path: string, params: URLSearchParams, label: string): Promise<BinanceOrderResponse> {
+  private async signedDelete(path: string, params: URLSearchParams, label: string): Promise<BinanceOrderResponse | BinanceAlgoOrderResponse> {
     params.set("signature", this.sign(params.toString()));
     const response = await fetch(`${this.baseUrl}${path}?${params.toString()}`, {
       method: "DELETE",
@@ -267,6 +286,41 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     this.symbolRules.set(symbol, rules);
     return rules;
   }
+
+  private async validateMarketOrderNotional(symbol: string, quantity: number, rules: FuturesSymbolRules): Promise<void> {
+    if (rules.minNotional === null) return;
+    const price = await this.getCurrentPrice(symbol);
+    const notional = quantity * price;
+    if (notional < rules.minNotional) {
+      throw new Error("MIN_NOTIONAL");
+    }
+  }
+
+  private async getCurrentPrice(symbol: string): Promise<number> {
+    const cached = this.marketPrices.get(symbol);
+    if (cached && cached.expiresAt > Date.now()) return cached.price;
+
+    const url = new URL("/fapi/v1/ticker/price", this.baseUrl);
+    url.searchParams.set("symbol", symbol);
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Binance ticker price failed ${response.status}: ${await response.text()}`);
+    }
+    const body = (await response.json()) as { price?: string };
+    const price = Number(body.price ?? 0);
+    if (!Number.isFinite(price) || price <= 0) throw new Error("MARKET_PRICE_UNAVAILABLE");
+    this.marketPrices.set(symbol, { expiresAt: Date.now() + 5_000, price });
+    return price;
+  }
+
+  private async findAlgoOrderByClientAlgoId(clientAlgoId: string): Promise<BinanceAlgoOrderResponse | null> {
+    try {
+      return await this.signedGet<BinanceAlgoOrderResponse>("/fapi/v1/algoOrder", { clientAlgoId });
+    } catch (error) {
+      if (isOrderNotFound(error)) return null;
+      throw error;
+    }
+  }
 }
 
 interface BinanceOrderResponse {
@@ -280,6 +334,22 @@ interface BinanceOrderResponse {
   origQty?: string;
   executedQty?: string;
   avgPrice?: string;
+}
+
+interface BinanceAlgoOrderResponse {
+  algoId?: number | string;
+  clientAlgoId?: string;
+  algoType?: string;
+  symbol?: string;
+  side?: string;
+  type?: string;
+  orderType?: string;
+  algoStatus?: string;
+  reduceOnly?: boolean | string;
+  closePosition?: boolean | string;
+  quantity?: string;
+  triggerPrice?: string;
+  actualPrice?: string;
 }
 
 interface BinanceExchangeInfo {
@@ -309,18 +379,19 @@ function oppositeSide(side: BinanceOrderSide): BinanceOrderSide {
   return side === "BUY" ? "SELL" : "BUY";
 }
 
-function toExecutionOrderLookupResult(order: BinanceOrderResponse, fallbackSymbol: string, fallbackClientOrderId: string): ExecutionOrderLookupResult {
+function toExecutionOrderLookupResult(order: BinanceOrderResponse | BinanceAlgoOrderResponse, fallbackSymbol: string, fallbackClientOrderId: string): ExecutionOrderLookupResult {
+  const isAlgo = "algoId" in order || "clientAlgoId" in order || "orderType" in order;
   return {
-    orderId: String(order.orderId ?? fallbackClientOrderId),
-    clientOrderId: String(order.clientOrderId ?? fallbackClientOrderId),
+    orderId: String(isAlgo ? (order as BinanceAlgoOrderResponse).algoId ?? fallbackClientOrderId : (order as BinanceOrderResponse).orderId ?? fallbackClientOrderId),
+    clientOrderId: String(isAlgo ? (order as BinanceAlgoOrderResponse).clientAlgoId ?? fallbackClientOrderId : (order as BinanceOrderResponse).clientOrderId ?? fallbackClientOrderId),
     symbol: String(order.symbol ?? fallbackSymbol),
     side: String(order.side ?? "-"),
-    type: String(order.type ?? "-"),
-    status: String(order.status ?? "NEW"),
-    reduceOnly: order.reduceOnly === true || order.reduceOnly === "true",
-    originalQuantity: Number(order.origQty ?? 0),
-    executedQuantity: Number(order.executedQty ?? 0),
-    averagePrice: numberOrNull(order.avgPrice)
+    type: String(isAlgo ? (order as BinanceAlgoOrderResponse).orderType ?? (order as BinanceAlgoOrderResponse).type ?? "-" : (order as BinanceOrderResponse).type ?? "-"),
+    status: String(isAlgo ? (order as BinanceAlgoOrderResponse).algoStatus ?? "NEW" : (order as BinanceOrderResponse).status ?? "NEW"),
+    reduceOnly: order.reduceOnly === true || order.reduceOnly === "true" || (order as BinanceAlgoOrderResponse).closePosition === true || (order as BinanceAlgoOrderResponse).closePosition === "true",
+    originalQuantity: Number(isAlgo ? (order as BinanceAlgoOrderResponse).quantity ?? 0 : (order as BinanceOrderResponse).origQty ?? 0),
+    executedQuantity: isAlgo ? 0 : Number((order as BinanceOrderResponse).executedQty ?? 0),
+    averagePrice: isAlgo ? numberOrNull((order as BinanceAlgoOrderResponse).actualPrice) : numberOrNull((order as BinanceOrderResponse).avgPrice)
   };
 }
 

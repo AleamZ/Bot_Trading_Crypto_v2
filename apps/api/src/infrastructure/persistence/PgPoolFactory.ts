@@ -12,7 +12,8 @@ export function getPostgresPool(connectionString: string): pg.Pool {
     connectionString,
     max,
     idleTimeoutMillis: readMillis("POSTGRES_IDLE_TIMEOUT_MS", 30_000),
-    connectionTimeoutMillis: readMillis("POSTGRES_CONNECTION_TIMEOUT_MS", 5_000)
+    connectionTimeoutMillis: readMillis("POSTGRES_CONNECTION_TIMEOUT_MS", 5_000),
+    query_timeout: readMillis("POSTGRES_QUERY_TIMEOUT_MS", 10_000)
   };
   const pool = new pg.Pool(ssl ? { ...options, ssl } : options);
   pool.on("error", (error) => {

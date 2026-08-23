@@ -157,7 +157,9 @@ export async function createAuthRepository(databaseUrl?: string): Promise<AuthRe
   if (!databaseUrl) return new MemoryAuthRepository();
 
   const repository = new PostgresAuthRepository(databaseUrl);
-  await repository.migrate();
+  await repository.migrate().catch((error: unknown) => {
+    console.warn(`[postgres] auth migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
+  });
   return repository;
 }
 

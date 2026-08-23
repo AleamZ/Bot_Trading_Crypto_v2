@@ -1079,7 +1079,8 @@ async function loadAnalysis() {
 
 function renderAnalysis(analysis) {
   const conditions = analysis.conditions ?? [];
-  $("analysis-status").textContent = `${analysis.symbol ?? "-"} · ${conditions.length} conditions checked`;
+  const sourceLabel = analysis.analysisSource === "runtime" ? "Runtime setup" : analysis.analysisSource === "active-position" ? "Active position" : "Diagnostic fallback";
+  $("analysis-status").textContent = `${analysis.symbol ?? "-"} · ${sourceLabel} · ${conditions.length} conditions checked`;
   $("analysis-symbol-label").textContent = analysis.symbol ?? "-";
   $("analysis-checked-at").textContent = analysis.checkedAt ? new Date(analysis.checkedAt).toLocaleString() : "-";
   $("analysis-trend").textContent = analysis.trend?.direction ?? "-";

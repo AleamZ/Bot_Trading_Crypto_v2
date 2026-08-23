@@ -12,9 +12,10 @@ export interface WatchlistStatus {
   state: string;
   conditions: string;
   rr: number | null;
-  position: "None" | "Open" | "Paper";
+  position: "None" | "Open" | "Paper" | "LONG" | "SHORT";
   status: string;
   lastScanAt: string | null;
+  positionSource?: "binance" | "paper" | "engine";
 }
 
 export class MarketScanner {

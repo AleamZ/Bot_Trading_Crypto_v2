@@ -198,7 +198,11 @@ export class TradingAccountService {
     const apiKey = this.cipher.decrypt(connection.apiKeyEncrypted);
     const apiSecret = this.cipher.decrypt(connection.apiSecretEncrypted);
     try {
-      return toSafeBinanceAccount(await this.verifier.verify({ mode: account.mode, apiKey, apiSecret }));
+      const info = await this.verifier.verify({ mode: account.mode, apiKey, apiSecret });
+      if (account.status !== "CONNECTED") {
+        await this.repository.updateTradingAccountStatus(account.id, "CONNECTED", info.checkedAt);
+      }
+      return toSafeBinanceAccount(info);
     } catch (error) {
       const code = error instanceof BinanceVerificationError ? error.code : "BINANCE_UNAVAILABLE";
       await this.repository.updateTradingAccountStatus(account.id, "ERROR", new Date().toISOString());

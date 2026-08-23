@@ -182,6 +182,8 @@ export class PostgresTradingRuntimeConfigRepository implements TradingRuntimeCon
 export async function createTradingRuntimeConfigRepository(databaseUrl?: string): Promise<TradingRuntimeConfigRepository> {
   if (!databaseUrl) return new MemoryTradingRuntimeConfigRepository();
   const repository = new PostgresTradingRuntimeConfigRepository(databaseUrl);
-  await repository.migrate();
+  await repository.migrate().catch((error: unknown) => {
+    console.warn(`[postgres] runtime config migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
+  });
   return repository;
 }

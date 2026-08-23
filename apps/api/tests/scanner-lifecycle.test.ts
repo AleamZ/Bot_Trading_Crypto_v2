@@ -59,6 +59,8 @@ describe("scanner setup lifecycle", () => {
     const stateless = await buildSymbolAnalysis("SOLUSDT", config("account-a", "SOLUSDT"), shortAnalysisData as never, null);
 
     expect(scanner.getWatchlistStatus()[0]).toMatchObject({ state: "ReadyToEnter", conditions: "7/7" });
+    expect(canonical.analysisSource).toBe("runtime");
+    expect(stateless.analysisSource).toBe("diagnostic-fallback");
     expect(canonical.setupState).toBe("READY_TO_ENTRY");
     expect(canonical.conditions.filter((condition) => condition.status === "PASSED")).toHaveLength(7);
     expect(stateless.setupState).not.toBe("READY_TO_ENTRY");

@@ -174,8 +174,11 @@ export class BinanceFuturesAccountClient {
   }
 
   async getOpenOrders(symbol?: string): Promise<BinanceFuturesOpenOrderStatus[]> {
-    const orders = await this.signedGet<OpenOrder[]>("/fapi/v1/openOrders", symbol ? { symbol } : {});
-    return orders.map(toOpenOrderStatus);
+    const [orders, algoOrders] = await Promise.all([
+      this.signedGet<OpenOrder[]>("/fapi/v1/openOrders", symbol ? { symbol } : {}),
+      this.signedGet<OpenAlgoOrder[]>("/fapi/v1/openAlgoOrders", symbol ? { symbol } : {}).catch(() => [])
+    ]);
+    return [...orders, ...algoOrders.map(toOpenOrder)].map(toOpenOrderStatus);
   }
 
   async getOrderHistory(symbol: string, limit = 100): Promise<BinanceFuturesOrderHistoryStatus[]> {
@@ -281,12 +284,18 @@ interface OrderHistoryItem extends OpenOrder {
 
 interface OpenAlgoOrder {
   symbol: string;
+  algoId?: number | string;
+  clientAlgoId?: string;
   side?: BinanceExitSide;
   orderType?: string;
+  algoStatus?: string;
   triggerPrice?: string;
   price?: string;
+  quantity?: string;
   reduceOnly?: boolean | string;
   closePosition?: boolean | string;
+  createTime?: number;
+  updateTime?: number;
 }
 
 interface UserTrade {
@@ -407,12 +416,18 @@ function toSecondsOrNull(value: number | undefined): number | null {
 
 function toOpenOrder(order: OpenAlgoOrder): OpenOrder {
   const mapped: OpenOrder = { symbol: order.symbol };
+  if (order.algoId !== undefined) mapped.orderId = order.algoId;
+  if (order.clientAlgoId !== undefined) mapped.clientOrderId = order.clientAlgoId;
   if (order.side !== undefined) mapped.side = order.side;
   if (order.orderType !== undefined) mapped.type = order.orderType;
+  if (order.algoStatus !== undefined) mapped.status = order.algoStatus;
   if (order.triggerPrice !== undefined) mapped.stopPrice = order.triggerPrice;
   if (order.price !== undefined) mapped.price = order.price;
+  if (order.quantity !== undefined) mapped.origQty = order.quantity;
   if (order.reduceOnly !== undefined) mapped.reduceOnly = order.reduceOnly;
   if (order.closePosition !== undefined) mapped.closePosition = order.closePosition;
+  if (order.createTime !== undefined) mapped.time = order.createTime;
+  if (order.updateTime !== undefined) mapped.updateTime = order.updateTime;
   return mapped;
 }
 

@@ -339,6 +339,40 @@ describe("risk and state", () => {
     expect(decision.estimatedLoss).toBe(50);
   });
 
+  it("rejects risk decisions that require leverage above the symbol effective maximum", () => {
+    const bnbRules = { ...symbolRules(), symbol: "BNBUSDT", maxQty: null, maxLeverage: 75 };
+
+    const rejected = evaluateRisk(
+      riskInput({
+        symbol: "BNBUSDT",
+        symbolRules: bnbRules,
+        riskPerTradeUsdt: 100,
+        maxLeverage: 125,
+        maxMarginUsagePercent: 100,
+        availableBalance: 100,
+        entry: 100,
+        stopLoss: 99,
+        takeProfit: 103
+      })
+    );
+    const accepted = evaluateRisk(
+      riskInput({
+        symbol: "BNBUSDT",
+        symbolRules: bnbRules,
+        riskPerTradeUsdt: 100,
+        maxLeverage: 125,
+        maxMarginUsagePercent: 100,
+        availableBalance: 134,
+        entry: 100,
+        stopLoss: 99,
+        takeProfit: 103
+      })
+    );
+
+    expect(rejected).toMatchObject({ accepted: false, rejectCode: "REQUIRED_LEVERAGE_EXCEEDS_MAX", selectedLeverage: 100 });
+    expect(accepted).toMatchObject({ accepted: true, selectedLeverage: 75 });
+  });
+
   it("rejects entries below minimum RR but passes at the threshold", () => {
     expect(evaluateRisk(riskInput({ takeProfit: 107.5, minimumRiskReward: 2 }))).toMatchObject({
       accepted: false,

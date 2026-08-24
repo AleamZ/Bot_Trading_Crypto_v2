@@ -2342,13 +2342,15 @@ function toSeconds(value: unknown): number {
 }
 
 function getRuntimeStatus(config: AppConfig, account: BinanceFuturesWalletStatus): unknown {
+  const marketDataEnvironment = account.environment === "live" ? "MAINNET" : "TESTNET";
   return {
     symbol: config.symbol,
     executionMode: config.executionMode,
     account,
     marketData: {
       connected: true,
-      label: config.binanceTestnet ? "Binance Futures Testnet market data" : "Binance Futures Live market data"
+      environment: marketDataEnvironment,
+      label: marketDataEnvironment === "TESTNET" ? "Binance Futures Testnet market data" : "Binance Futures Mainnet market data"
     },
     risk: {
       positionSizingMode: config.positionSizingMode,

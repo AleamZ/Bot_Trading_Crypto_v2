@@ -160,7 +160,8 @@ const tradingSettingsSchema = schema.omit({
   maxTradesPerDay: true,
   maxDailyLossPercent: true,
   maxConsecutiveLosses: true,
-  cooldownAfterTradeMinutes: true
+  cooldownAfterTradeMinutes: true,
+  localTradingRuntimeEnabled: true
 });
 
 export function validateTradingSettings(input: unknown): TradingSettings {

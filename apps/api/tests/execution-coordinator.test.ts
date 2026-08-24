@@ -16,10 +16,12 @@ import type { ExecutionIntentRepository } from "../src/application/execution/Exe
 import type { DecisionLogger } from "../src/application/ports/Logger.js";
 import type { EntryPlan } from "../src/domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../src/domain/risk/RiskDecision.js";
+import { evaluateRisk } from "../src/domain/risk/RiskManager.js";
 import type { AppConfig } from "../src/application/config/AppConfig.js";
 import { defaultTradingSettings } from "../src/application/config/AppConfig.js";
 import { MarketScanner } from "../src/application/scanner/MarketScanner.js";
 import type { BinanceFuturesMarketData } from "../src/infrastructure/market-data/BinanceFuturesMarketData.js";
+import type { FuturesSymbolRules } from "../src/domain/symbol/SymbolRules.js";
 import { MemoryExecutionIntentRepository } from "../src/infrastructure/execution/MemoryExecutionIntentRepository.js";
 import { MemoryRealExecutionProposalRepository } from "../src/infrastructure/execution/MemoryRealExecutionProposalRepository.js";
 import { createExecutionGateway } from "../src/infrastructure/execution/createExecutionGateway.js";
@@ -433,6 +435,93 @@ describe("RealExecutionProposalGateway", () => {
     expect(saved[0]).toMatchObject({ status: "DRY_RUN", normalizedQuantity: 10, normalizedStopLoss: 95, normalizedTakeProfit: 110 });
   });
 
+  it("persists TEST-ONLY controlled DRY_RUN proposal parameters without submitting a Binance order", async () => {
+    const proposals = new MemoryRealExecutionProposalRepository();
+    const audit = new MemoryExecutionIntentRepository();
+    const availableBalance = 1_000;
+    const targetRisk = 20;
+    const rules = symbolRules();
+    const controlledPlan: EntryPlan = {
+      direction: "bullish",
+      entry: 100,
+      structuralStopBoundary: 97.5,
+      stopLossBuffer: 0.5,
+      stopLoss: 97,
+      takeProfit: 109,
+      riskReward: 3,
+      triggeringFvgId: "controlled-ltf-fvg",
+      protectiveClusterFvgIds: ["controlled-ltf-fvg", "controlled-cluster-fvg"],
+      reason: "TEST-ONLY CONTROLLED INPUT"
+    };
+    const controlledRisk = evaluateRisk({
+      symbol: "BTCUSDT",
+      direction: "bullish",
+      availableBalance,
+      symbolRules: rules,
+      riskPerTradeUsdt: targetRisk,
+      maxLeverage: 75,
+      maxMarginUsagePercent: 80,
+      entry: controlledPlan.entry,
+      stopLoss: controlledPlan.stopLoss,
+      takeProfit: controlledPlan.takeProfit,
+      minimumRiskReward: 2,
+      openPositions: 0,
+      maxOpenPositions: 1,
+      symbolOpenPositions: 0,
+      maxPositionPerSymbol: 1,
+      availableAt: 1,
+      drawdownPercent: 0,
+      maxDrawdownPercent: 10,
+      tradingEnabled: true,
+      killSwitch: false,
+      createdAt: 1
+    });
+    const gateway = realProposalGateway(
+      proposals,
+      { realExecutionMode: "DRY_RUN", tradingEnabled: true, maxLeverage: 75, maxMarginUsagePercent: 80 },
+      { availableBalance, auditRepository: audit, symbolRules: rules }
+    );
+
+    expect(controlledRisk.accepted).toBe(true);
+    await expect(gateway.submitBracketOrder(controlledPlan, controlledRisk)).rejects.toThrow("REAL_DRY_RUN_CREATED");
+
+    const saved = (await proposals.listByAccount("account-real"))[0];
+    expect(saved).toMatchObject({
+      status: "DRY_RUN",
+      symbol: "BTCUSDT",
+      direction: "bullish",
+      requestedEntryType: "market",
+      requestedEntryPrice: 100,
+      normalizedEntryPrice: null,
+      requestedQuantity: 6.666,
+      normalizedQuantity: 6.666,
+      requestedStopLoss: 97,
+      normalizedStopLoss: 97,
+      requestedTakeProfit: 109,
+      normalizedTakeProfit: 109,
+      estimatedNotional: 666.6,
+      estimatedMargin: 666.6,
+      configuredLeverage: 1,
+      configuredMarginMode: "ISOLATED",
+      symbolTickSize: 0.1,
+      symbolStepSize: 0.001,
+      symbolMinQty: 0.001,
+      symbolMinNotional: 5
+    });
+    expect(saved?.riskSnapshot).toMatchObject({
+      targetRiskUsdt: targetRisk,
+      actualRiskUsdt: 19.998,
+      availableBalance,
+      maxAllowedMargin: 800,
+      marginUsagePercent: 66.66,
+      selectedLeverage: 1,
+      riskReward: 3
+    });
+    expect(saved?.strategySnapshot).toMatchObject({ realExecutionMode: "DRY_RUN", takeProfitRule: "HTF_LIQUIDITY", minimumRiskReward: 2 });
+    expect(await audit.listByAccount("account-real")).toHaveLength(0);
+    expect((await audit.listAuditEvents("account-real")).map((event) => event.type)).toEqual(["REAL_DRY_RUN_CREATED"]);
+  });
+
   it("creates one PENDING proposal in APPROVAL_REQUIRED mode for duplicate setup", async () => {
     const proposals = new MemoryRealExecutionProposalRepository();
     const gateway = realProposalGateway(proposals, { realExecutionMode: "APPROVAL_REQUIRED", tradingEnabled: true });
@@ -781,7 +870,15 @@ function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   };
 }
 
-function realProposalGateway(proposals: MemoryRealExecutionProposalRepository, overrides: Partial<AppConfig> = {}): RealExecutionProposalGateway {
+function realProposalGateway(
+  proposals: MemoryRealExecutionProposalRepository,
+  overrides: Partial<AppConfig> = {},
+  options: {
+    availableBalance?: number;
+    auditRepository?: MemoryExecutionIntentRepository;
+    symbolRules?: FuturesSymbolRules;
+  } = {}
+): RealExecutionProposalGateway {
   const config = appConfig({ executionMode: "live", marginMode: "ISOLATED", ...overrides });
   return new RealExecutionProposalGateway({
     tradingAccountId: "account-real",
@@ -789,30 +886,34 @@ function realProposalGateway(proposals: MemoryRealExecutionProposalRepository, o
     runtimeReady: () => true,
     reconciliationHealthy: () => true,
     binanceConnected: () => true,
-    loadSymbolRules: async () => ({
-      symbol: "BTCUSDT",
-      status: "TRADING",
-      contractType: "PERPETUAL",
-      quoteAsset: "USDT",
-      marginAsset: "USDT",
-      pricePrecision: 1,
-      quantityPrecision: 3,
-      tickSize: 0.1,
-      minPrice: 0.1,
-      maxPrice: null,
-      stepSize: 0.001,
-      minQty: 0.001,
-      maxQty: 100,
-      minNotional: 5,
-      maxLeverage: 125,
-      supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
-    }),
-    loadAvailableBalance: async () => 10_000,
+    loadSymbolRules: async () => options.symbolRules ?? symbolRules(),
+    loadAvailableBalance: async () => options.availableBalance ?? 10_000,
     assertAccountProtection: async () => undefined,
     proposalRepository: proposals,
-    auditRepository: new MemoryExecutionIntentRepository(),
+    auditRepository: options.auditRepository ?? new MemoryExecutionIntentRepository(),
     logger: fakeLogger()
   });
+}
+
+function symbolRules(): FuturesSymbolRules {
+  return {
+    symbol: "BTCUSDT",
+    status: "TRADING",
+    contractType: "PERPETUAL",
+    quoteAsset: "USDT",
+    marginAsset: "USDT",
+    pricePrecision: 1,
+    quantityPrecision: 3,
+    tickSize: 0.1,
+    minPrice: 0.1,
+    maxPrice: null,
+    stepSize: 0.001,
+    minQty: 0.001,
+    maxQty: 100,
+    minNotional: 5,
+    maxLeverage: 125,
+    supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
+  };
 }
 
 function plan(): EntryPlan {

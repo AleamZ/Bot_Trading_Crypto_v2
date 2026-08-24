@@ -6,6 +6,9 @@ export interface BinanceFuturesWalletStatus {
   label: string;
   walletBalance: number | null;
   availableBalance: number | null;
+  canTrade?: boolean | null;
+  canDeposit?: boolean | null;
+  canWithdraw?: boolean | null;
   asset: "USDT";
   checkedAt: string;
 }
@@ -120,6 +123,9 @@ export class BinanceFuturesAccountClient {
     const body = (await response.json()) as {
       totalWalletBalance?: string;
       availableBalance?: string;
+      canTrade?: boolean;
+      canDeposit?: boolean;
+      canWithdraw?: boolean;
       assets?: Array<{ asset: string; walletBalance?: string; availableBalance?: string }>;
     };
     const usdt = body.assets?.find((asset) => asset.asset === "USDT");
@@ -130,6 +136,9 @@ export class BinanceFuturesAccountClient {
       label: "Binance Futures account verified",
       walletBalance: Number(usdt?.walletBalance ?? body.totalWalletBalance ?? 0),
       availableBalance: Number(usdt?.availableBalance ?? body.availableBalance ?? 0),
+      canTrade: body.canTrade ?? null,
+      canDeposit: body.canDeposit ?? null,
+      canWithdraw: body.canWithdraw ?? null,
       asset: "USDT",
       checkedAt: new Date().toISOString()
     };

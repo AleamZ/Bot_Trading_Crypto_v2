@@ -1,4 +1,4 @@
-import type { TradingSettings } from "../../application/config/AppConfig.js";
+import { validateTradingSettings, type TradingSettings } from "../../application/config/AppConfig.js";
 import type { AccountProtectionState } from "../../application/risk/AccountProtectionService.js";
 import type { TradingRuntimeConfigRepository } from "../../application/trading-account/TradingRuntimeConfigRepository.js";
 
@@ -14,11 +14,11 @@ export class MemoryTradingRuntimeConfigRepository implements TradingRuntimeConfi
 
   async getSettings(tradingAccountId: string): Promise<TradingSettings | null> {
     const settings = this.settings.get(tradingAccountId);
-    return settings ? cloneSettings(settings) : null;
+    return settings ? validateTradingSettings(cloneSettings(settings)) : null;
   }
 
   async saveSettings(tradingAccountId: string, settings: TradingSettings): Promise<void> {
-    this.settings.set(tradingAccountId, cloneSettings(settings));
+    this.settings.set(tradingAccountId, validateTradingSettings(settings));
   }
 
   async getWatchlist(tradingAccountId: string): Promise<string[]> {

@@ -1,9 +1,10 @@
 import { createServer, type Server } from "node:http";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthService } from "../src/application/auth/AuthService.js";
 import { BinanceVerificationError, type BinanceAccountInfo, type BinanceAccountVerifier } from "../src/application/trading-account/BinanceAccountVerifier.js";
 import { TradingAccountService } from "../src/application/trading-account/TradingAccountService.js";
-import { defaultTradingSettings, type AppConfig } from "../src/application/config/AppConfig.js";
+import { defaultTradingSettings, validateTradingSettings, type AppConfig } from "../src/application/config/AppConfig.js";
 import { createHttpHandler } from "../src/presentation/http/Server.js";
 import { MemoryAuthRepository } from "../src/infrastructure/auth/MemoryAuthRepository.js";
 import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
@@ -70,6 +71,101 @@ describe("Binance signed account source routing", () => {
   });
 });
 
+describe("DEMO and REAL settings schema/UI parity", () => {
+  it("normalizes DEMO and REAL settings through the same supported schema and validation", () => {
+    const demoSettings = validateTradingSettings({
+      ...defaultTradingSettings,
+      riskPerTradeUsdt: 11,
+      maxLeverage: 30,
+      marginMode: "CROSS",
+      watchlist: ["BTCUSDT"]
+    });
+    const realSettings = validateTradingSettings({
+      ...defaultTradingSettings,
+      riskPerTradeUsdt: 22,
+      maxLeverage: 40,
+      marginMode: "ISOLATED",
+      positionSizingMode: "fixed-margin",
+      marginPerTrade: 500,
+      leverage: 12,
+      fixedRr: 9,
+      fvgMitigation: "full",
+      ltfFvgEntryMode: "edge",
+      localTradingRuntimeEnabled: true,
+      watchlist: ["ethusdt", "ETHUSDT"]
+    } as never);
+
+    expect(supportedSettingKeys(demoSettings)).toEqual(supportedSettingKeys(realSettings));
+    expect(demoSettings).toMatchObject({ riskPerTradeUsdt: 11, maxLeverage: 30, marginMode: "CROSS", watchlist: ["BTCUSDT"] });
+    expect(realSettings).toMatchObject({ riskPerTradeUsdt: 22, maxLeverage: 40, marginMode: "ISOLATED", positionSizingMode: "risk-based", watchlist: ["ETHUSDT"] });
+    expect(realSettings).not.toHaveProperty("marginPerTrade");
+    expect(realSettings).not.toHaveProperty("leverage");
+    expect(realSettings).not.toHaveProperty("fixedRr");
+    expect(realSettings).not.toHaveProperty("fvgMitigation");
+    expect(realSettings).not.toHaveProperty("ltfFvgEntryMode");
+    expect(realSettings).not.toHaveProperty("localTradingRuntimeEnabled");
+
+    const invalidDrafts = [
+      { maxPositionPerSymbol: 2 },
+      { tradingEnabled: true, watchlist: [] },
+      { maxLeverage: 0 },
+      { marginMode: "PORTFOLIO" }
+    ];
+    for (const draft of invalidDrafts) {
+      expect(() => validateTradingSettings({ ...defaultTradingSettings, ...draft })).toThrow();
+      expect(() => validateTradingSettings({ ...defaultTradingSettings, ...draft, realExecutionMode: "LOCKED" })).toThrow();
+    }
+  });
+
+  it("renders the same normal settings fields while keeping REAL-only safety separate", () => {
+    const html = readFileSync(new URL("../../web/index.html", import.meta.url), "utf8");
+    const app = readFileSync(new URL("../../web/app.js", import.meta.url), "utf8");
+    const normalInputIds = [
+      "setting-symbol-search",
+      "setting-risk-per-trade",
+      "setting-max-leverage",
+      "setting-max-margin-usage",
+      "setting-max-open-positions",
+      "setting-max-position-per-symbol",
+      "setting-ema-period",
+      "setting-swing-left",
+      "setting-swing-right",
+      "setting-displacement-body",
+      "setting-displacement-lookback",
+      "setting-minimum-rr",
+      "setting-sl-buffer-ticks",
+      "setting-sl-buffer-percent",
+      "setting-sl-atr-period",
+      "setting-sl-atr-multiplier",
+      "setting-daily-profit-limit-r",
+      "setting-daily-loss-limit-r",
+      "setting-max-drawdown"
+    ];
+    const normalSegmentGroups = [
+      "marginMode",
+      "requireDisplacement",
+      "entryMode",
+      "stopLossBufferMode",
+      "tradingEnabled",
+      "killSwitch"
+    ];
+
+    for (const id of normalInputIds) expect(html).toContain(`id="${id}"`);
+    for (const group of normalSegmentGroups) expect(html).toContain(`data-setting-group="${group}"`);
+    expect(app).toContain('marginMode: "ISOLATED"');
+    expect(app).toContain("marginMode: String(settings.marginMode ?? defaultSettings.marginMode)");
+    expect(app).toContain("marginMode: settingsState.marginMode");
+
+    expect(html).toContain('id="real-execution-safety" hidden');
+    expect(html).toContain('id="real-execution-mode-control"');
+    expect(html).toContain("data-real-execution-mode=\"LOCKED\"");
+    expect(app).toContain('const isReal = accountState.activeAccount?.mode === "REAL";');
+    expect(app).toContain('$("real-execution-safety").hidden = !isReal;');
+    expect(app).toContain('$("real-proposals-section").hidden = !isReal;');
+    expect(app).toContain('if (!account || account.mode !== "REAL") return;');
+  });
+});
+
 describe("trading account HTTP flow", () => {
   let server: Server;
   let baseUrl: string;
@@ -93,6 +189,7 @@ describe("trading account HTTP flow", () => {
     FakeAccountClient.positionsByApiKey.clear();
     FakeAccountClient.openOrdersByApiKey.clear();
     FakeAccountClient.walletBalanceByApiKey.clear();
+    FakeAccountClient.maxLeverageBySymbol.clear();
     const auth = new AuthService(new MemoryAuthRepository(), sessionSecret);
     const cipher = new CredentialCipher(encryptionKey);
     const tradingAccounts = new TradingAccountService(accountRepository, cipher, verifier, configRepository, testConfig());
@@ -300,6 +397,29 @@ describe("trading account HTTP flow", () => {
     expect((await (await fetch(`${baseUrl}/api/trading-accounts/${real.id}/binance-account`, { headers: { cookie } })).json()).account.environment).toBe("MAINNET");
   });
 
+  it("reports account-scoped market-data environment without inheriting global BINANCE_TESTNET", async () => {
+    const cookie = await register("market-env@example.com");
+    const demo = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookie)).json()).account;
+    const real = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${demo.id}/binance-connection`, { apiKey: "DEMO_MARKET_KEY", apiSecret: "DEMO_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${real.id}/binance-connection`, { apiKey: "REAL_MARKET_KEY", apiSecret: "REAL_SECRET" }, cookie);
+
+    const demoSnapshot = await (await fetch(`${baseUrl}/api/trading-accounts/${demo.id}/snapshot`, { headers: { cookie } })).json();
+    const realSnapshot = await (await fetch(`${baseUrl}/api/trading-accounts/${real.id}/snapshot`, { headers: { cookie } })).json();
+
+    expect(testConfig().binanceTestnet).toBe(true);
+    expect(demoSnapshot.runtime.marketData).toMatchObject({
+      environment: "TESTNET",
+      label: "Binance Futures Testnet market data"
+    });
+    expect(realSnapshot.runtime.marketData).toMatchObject({
+      environment: "MAINNET",
+      label: "Binance Futures Mainnet market data"
+    });
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "DEMO_MARKET_KEY", apiSecret: "DEMO_SECRET", testnet: true });
+    expect(accountClientFactoryCalls).toContainEqual({ apiKey: "REAL_MARKET_KEY", apiSecret: "REAL_SECRET", testnet: false });
+  });
+
   it("reports REAL readiness while execution remains locked and never returns secrets", async () => {
     const cookie = await register("real-ready@example.com");
     const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
@@ -313,9 +433,11 @@ describe("trading account HTTP flow", () => {
 
     expect(body.readiness).toMatchObject({
       accountReady: true,
+      accountOperationalReady: true,
       mode: "REAL",
       executionLocked: true,
       executionReason: "REAL_EXECUTION_LOCKED",
+      realExecutionPermission: { locked: true, reason: "REAL_EXECUTION_LOCKED" },
       checks: { realExecutionLocked: { ok: false, reason: "REAL_EXECUTION_LOCKED" } }
     });
     expect(bodyText).not.toContain("secret-value");
@@ -323,7 +445,7 @@ describe("trading account HTTP flow", () => {
     expect(accountClientFactoryCalls).toContainEqual({ apiKey: "ABCD1234WXYZ", apiSecret: "secret-value", testnet: false });
   });
 
-  it("reports REAL leverage and margin mode mismatches", async () => {
+  it("reports REAL leverage as diagnostic and margin mode mismatch as an operational blocker", async () => {
     FakeAccountClient.nextLeverage = 10;
     FakeAccountClient.nextMarginType = "CROSS";
     const cookie = await register("real-mismatch@example.com");
@@ -335,13 +457,86 @@ describe("trading account HTTP flow", () => {
 
     expect(body.readiness).toMatchObject({
       accountReady: false,
+      accountOperationalReady: false,
       binanceLeverage: 10,
       leverageMatch: false,
       binanceMarginMode: "CROSS",
       marginModeMatch: false
     });
-    expect(body.readiness.checks.leverageValid.reason).toBe("LEVERAGE_MISMATCH");
+    expect(body.readiness.checks.leverageValid).toEqual({ ok: true, reason: null });
     expect(body.readiness.checks.marginModeKnown.reason).toBe("MARGIN_MODE_MISMATCH");
+  });
+
+  it("allows REAL operational readiness when only current Binance leverage differs from dynamic bot leverage", async () => {
+    FakeAccountClient.nextLeverage = 10;
+    FakeAccountClient.nextMarginType = "ISOLATED";
+    const cookie = await register("real-dynamic-leverage@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, maxLeverage: 20, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] }, cookie);
+
+    const body = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(body.readiness).toMatchObject({
+      accountReady: true,
+      accountOperationalReady: true,
+      executionLocked: true,
+      executionReason: "REAL_EXECUTION_LOCKED",
+      binanceLeverage: 10,
+      configuredLeverage: 20,
+      symbolMaxLeverage: 125,
+      effectiveMaxLeverage: 20,
+      leverageMatch: false,
+      marginModeMatch: true,
+      realExecutionPermission: { locked: true, reason: "REAL_EXECUTION_LOCKED" }
+    });
+    expect(body.readiness.checks.leverageValid).toEqual({ ok: true, reason: null });
+    expect(body.readiness.checks.realExecutionLocked).toEqual({ ok: false, reason: "REAL_EXECUTION_LOCKED" });
+  });
+
+  it("uses symbol effective max leverage without turning lower symbol max into a global REAL readiness failure", async () => {
+    FakeAccountClient.nextLeverage = 10;
+    FakeAccountClient.nextMarginType = "CROSS";
+    FakeAccountClient.maxLeverageBySymbol.set("BNBUSDT", 75);
+    FakeAccountClient.maxLeverageBySymbol.set("BTCUSDT", 125);
+    const cookie = await register("real-effective-leverage@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, credentials(), cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, maxLeverage: 125, marginMode: "CROSS", watchlist: ["BNBUSDT", "BTCUSDT"] }, cookie);
+
+    const bnb = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BNBUSDT`, { headers: { cookie } })).json();
+    const btc = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(bnb.readiness).toMatchObject({
+      accountOperationalReady: true,
+      configuredLeverage: 125,
+      symbolMaxLeverage: 75,
+      effectiveMaxLeverage: 75
+    });
+    expect(bnb.readiness.checks.leverageValid).toEqual({ ok: true, reason: null });
+    expect(btc.readiness).toMatchObject({
+      accountOperationalReady: true,
+      configuredLeverage: 125,
+      symbolMaxLeverage: 125,
+      effectiveMaxLeverage: 125
+    });
+    expect(btc.readiness.checks.leverageValid).toEqual({ ok: true, reason: null });
+  });
+
+  it("keeps zero REAL balance not ready even when symbol configuration is otherwise valid", async () => {
+    FakeAccountClient.nextLeverage = 10;
+    FakeAccountClient.nextMarginType = "CROSS";
+    FakeAccountClient.walletBalanceByApiKey.set("ZERO_REAL_KEY", 0);
+    const cookie = await register("real-zero-balance@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "ZERO_REAL_KEY", apiSecret: "ZERO_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, marginMode: "CROSS", watchlist: ["BTCUSDT"] }, cookie);
+
+    const body = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/readiness?symbol=BTCUSDT`, { headers: { cookie } })).json();
+
+    expect(body.readiness.accountOperationalReady).toBe(false);
+    expect(body.readiness.checks.balanceAvailable).toEqual({ ok: false, reason: "INSUFFICIENT_AVAILABLE_BALANCE" });
+    expect(body.readiness.checks.realExecutionLocked).toEqual({ ok: false, reason: "REAL_EXECUTION_LOCKED" });
   });
 
   it("keeps two REAL readiness checks isolated on the same symbol", async () => {
@@ -489,6 +684,88 @@ describe("trading account HTTP flow", () => {
     expect(reloadedA.maxLeverage).toBe(100);
     expect(reloadedB.riskPerTradeUsdt).toBe(333);
     expect(reloadedB.maxLeverage).toBe(3);
+  });
+
+  it("keeps TC bot DEMO and REAL222 settings isolated while exposing matching normalized keys", async () => {
+    const cookie = await register("tc-real222@example.com");
+    const tcBot = (await (await postJson("/api/trading-accounts", { name: "TC bot", mode: "DEMO" }, cookie)).json()).account;
+    const real222 = (await (await postJson("/api/trading-accounts", { name: "REAL222", mode: "REAL" }, cookie)).json()).account;
+    const tcBotSettings = {
+      ...testConfig(),
+      riskPerTradeUsdt: 101,
+      maxLeverage: 25,
+      marginMode: "CROSS",
+      minimumRiskReward: 2.5,
+      watchlist: ["BTCUSDT"]
+    };
+    const real222Settings = {
+      ...testConfig(),
+      riskPerTradeUsdt: 202,
+      maxLeverage: 40,
+      marginMode: "ISOLATED",
+      minimumRiskReward: 3.5,
+      watchlist: ["ETHUSDT"]
+    };
+
+    expect((await putJson(`/api/trading-accounts/${tcBot.id}/settings`, tcBotSettings, cookie)).status).toBe(200);
+    expect((await putJson(`/api/trading-accounts/${real222.id}/settings`, real222Settings, cookie)).status).toBe(200);
+
+    const loadedTcBot = await (await fetch(`${baseUrl}/api/trading-accounts/${tcBot.id}/settings`, { headers: { cookie } })).json();
+    const loadedReal222 = await (await fetch(`${baseUrl}/api/trading-accounts/${real222.id}/settings`, { headers: { cookie } })).json();
+    expect(supportedSettingKeys(loadedTcBot)).toEqual(supportedSettingKeys(loadedReal222));
+    expect(loadedTcBot).toMatchObject({ riskPerTradeUsdt: 101, maxLeverage: 25, marginMode: "CROSS", minimumRiskReward: 2.5, watchlist: ["BTCUSDT"] });
+    expect(loadedReal222).toMatchObject({ riskPerTradeUsdt: 202, maxLeverage: 40, marginMode: "ISOLATED", minimumRiskReward: 3.5, watchlist: ["ETHUSDT"] });
+
+    expect((await putJson(`/api/trading-accounts/${tcBot.id}/settings`, { ...tcBotSettings, riskPerTradeUsdt: 303, marginMode: "ISOLATED" }, cookie)).status).toBe(200);
+    const realAfterTcChange = await (await fetch(`${baseUrl}/api/trading-accounts/${real222.id}/settings`, { headers: { cookie } })).json();
+    expect(realAfterTcChange).toMatchObject({ riskPerTradeUsdt: 202, maxLeverage: 40, marginMode: "ISOLATED", watchlist: ["ETHUSDT"] });
+
+    expect((await putJson(`/api/trading-accounts/${real222.id}/settings`, { ...real222Settings, riskPerTradeUsdt: 404, marginMode: "CROSS" }, cookie)).status).toBe(200);
+    const tcAfterRealChange = await (await fetch(`${baseUrl}/api/trading-accounts/${tcBot.id}/settings`, { headers: { cookie } })).json();
+    const realAfterRealChange = await (await fetch(`${baseUrl}/api/trading-accounts/${real222.id}/settings`, { headers: { cookie } })).json();
+    expect(tcAfterRealChange).toMatchObject({ riskPerTradeUsdt: 303, maxLeverage: 25, marginMode: "ISOLATED", watchlist: ["BTCUSDT"] });
+    expect(realAfterRealChange).toMatchObject({ riskPerTradeUsdt: 404, maxLeverage: 40, marginMode: "CROSS", watchlist: ["ETHUSDT"] });
+  });
+
+  it("normalizes legacy fixed-margin settings without resetting valid current settings", async () => {
+    const cookie = await register("legacy-settings@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Legacy", mode: "REAL" }, cookie)).json()).account;
+    await configRepository.saveSettings(account.id, {
+      ...testConfig(),
+      positionSizingMode: "fixed-margin",
+      marginPerTrade: 500,
+      leverage: 7,
+      fixedRr: 9,
+      fvgMitigation: "full",
+      ltfFvgEntryMode: "edge",
+      riskPerTradeUsdt: 42,
+      minimumRiskReward: 3,
+      maxOpenPositions: 4,
+      realExecutionMode: "DRY_RUN",
+      watchlist: ["btcusdt", "ETHUSDT", "btcusdt"]
+    } as never);
+
+    const loaded = await (await fetch(`${baseUrl}/api/trading-accounts/${account.id}/settings`, { headers: { cookie } })).json();
+    const runtime = await runtimeManager.ensureRuntime(account.id);
+    const snapshot = await runtimeManager.getSnapshot(account.id);
+    const snapshotSettings = readSnapshotSettings(snapshot.store);
+
+    expect(loaded).toMatchObject({
+      positionSizingMode: "risk-based",
+      riskPerTradeUsdt: 42,
+      minimumRiskReward: 3,
+      maxOpenPositions: 4,
+      realExecutionMode: "DRY_RUN",
+      watchlist: ["BTCUSDT", "ETHUSDT"]
+    });
+    expect(loaded).not.toHaveProperty("marginPerTrade");
+    expect(loaded).not.toHaveProperty("leverage");
+    expect(loaded).not.toHaveProperty("fixedRr");
+    expect(loaded).not.toHaveProperty("fvgMitigation");
+    expect(loaded).not.toHaveProperty("ltfFvgEntryMode");
+    expect(snapshotSettings.positionSizingMode).toBe("risk-based");
+    expect(snapshotSettings.riskPerTradeUsdt).toBe(42);
+    expect(runtime.scanner.getPrimaryEngine().constructor.name).toBe("TradingEngine");
   });
 
   it("rejects cross-user access to account-scoped runtime routes", async () => {
@@ -718,6 +995,28 @@ describe("trading account HTTP flow", () => {
     expect(runtimeManager.getEngineForTest(accountA.id, "BTCUSDT")).not.toBe(runtimeManager.getEngineForTest(accountB.id, "BTCUSDT"));
   });
 
+  it("uses the same strategy engine implementation for DEMO and REAL runtimes while REAL execution stays locked", async () => {
+    const cookie = await register("same-strategy@example.com");
+    const demo = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookie)).json()).account;
+    const real = (await (await postJson("/api/trading-accounts", { name: "Real", mode: "REAL" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${demo.id}/settings`, { ...testConfig(), watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${real.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, realExecutionMode: "DRY_RUN", watchlist: ["BTCUSDT"] }, cookie);
+    await putJson(`/api/trading-accounts/${demo.id}/binance-connection`, { apiKey: "SAME_DEMO_KEY", apiSecret: "DEMO_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${real.id}/binance-connection`, { apiKey: "SAME_REAL_KEY", apiSecret: "REAL_SECRET" }, cookie);
+
+    await runtimeManager.ensureRuntime(demo.id);
+    await runtimeManager.ensureRuntime(real.id);
+    const demoEngine = runtimeManager.getEngineForTest(demo.id, "BTCUSDT");
+    const realEngine = runtimeManager.getEngineForTest(real.id, "BTCUSDT");
+    const realSnapshot = await runtimeManager.getSnapshot(real.id);
+
+    expect(demoEngine).toBeTruthy();
+    expect(realEngine).toBeTruthy();
+    expect(demoEngine?.constructor).toBe(realEngine?.constructor);
+    expect(realSnapshot.execution).toEqual({ enabled: false, reason: "REAL_EXECUTION_LOCKED" });
+    await expect(new LockedRealExecutionGateway().submitBracketOrder({} as never, {} as never)).rejects.toThrow("REAL_EXECUTION_LOCKED");
+  });
+
   async function register(email: string): Promise<string> {
     const response = await postJson("/api/auth/register", { email, password: "password123" });
     const cookie = response.headers.get("set-cookie");
@@ -849,6 +1148,7 @@ class FakeAccountClient {
   static positionsByApiKey = new Map<string, BinanceFuturesPositionStatus[]>();
   static openOrdersByApiKey = new Map<string, BinanceFuturesOpenOrderStatus[]>();
   static walletBalanceByApiKey = new Map<string, number>();
+  static maxLeverageBySymbol = new Map<string, number>();
 
   constructor(
     private readonly apiKey: string,
@@ -896,7 +1196,7 @@ class FakeAccountClient {
   }
 
   async getLeverageBrackets(symbol: string) {
-    return [{ symbol, maxInitialLeverage: 125 }];
+    return [{ symbol, maxInitialLeverage: FakeAccountClient.maxLeverageBySymbol.get(symbol) ?? 125 }];
   }
 }
 
@@ -928,6 +1228,10 @@ function readSnapshotSettings(store: unknown): AppConfig {
   const settings = (store as { tradingSettings?: AppConfig }).tradingSettings;
   if (!settings) throw new Error("Expected snapshot trading settings");
   return settings;
+}
+
+function supportedSettingKeys(settings: Record<string, unknown>): string[] {
+  return Object.keys(settings).sort();
 }
 
 function credentials(): { apiKey: string; apiSecret: string } {

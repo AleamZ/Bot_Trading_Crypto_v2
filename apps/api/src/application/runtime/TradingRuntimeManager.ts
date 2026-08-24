@@ -87,13 +87,20 @@ export interface ReadinessCheck {
 
 export interface RealTradingReadinessResult {
   accountReady: boolean;
+  accountOperationalReady: boolean;
   mode: "DEMO" | "REAL";
   executionLocked: boolean;
   executionReason: "READY" | "REAL_EXECUTION_LOCKED";
+  realExecutionPermission: {
+    locked: boolean;
+    reason: "READY" | "REAL_EXECUTION_LOCKED";
+  };
   realExecutionMode: "LOCKED" | "DRY_RUN" | "APPROVAL_REQUIRED";
   masterLiveExecutionEnabled: boolean;
   symbol: string;
   configuredLeverage: number;
+  symbolMaxLeverage: number | null;
+  effectiveMaxLeverage: number;
   binanceLeverage: number | null;
   leverageMatch: boolean | null;
   configuredMarginMode: "CROSS" | "ISOLATED";
@@ -473,14 +480,16 @@ export class TradingRuntimeManager {
       wallet = await client.getWalletStatus().catch(() => null);
     }
     checks.accountReachable = wallet?.connected ? ok() : fail("BINANCE_UNREACHABLE");
-    checks.futuresPermission = wallet?.connected ? ok() : fail("FUTURES_PERMISSION_MISSING");
+    checks.futuresPermission = wallet?.connected && wallet.canTrade !== false ? ok() : fail("FUTURES_PERMISSION_MISSING");
 
     let rules: FuturesSymbolRules | null = null;
+    let effectiveMaxLeverage = settings.maxLeverage;
     try {
       rules = await this.getSymbolRules(account.id, symbol);
+      effectiveMaxLeverage = Math.min(settings.maxLeverage, rules.maxLeverage ?? settings.maxLeverage);
       checks.symbolRulesLoaded = ok();
       checks.marginAssetSupported = rules.marginAsset === "USDT" || rules.marginAsset === null ? ok() : fail("MARGIN_ASSET_UNSUPPORTED");
-      checks.leverageValid = rules.maxLeverage === null || settings.maxLeverage <= rules.maxLeverage ? ok() : fail("LEVERAGE_EXCEEDS_BINANCE_MAX");
+      checks.leverageValid = effectiveMaxLeverage > 0 ? ok() : fail("LEVERAGE_EXCEEDS_BINANCE_MAX");
     } catch {
       checks.symbolRulesLoaded = fail("SYMBOL_RULES_UNAVAILABLE");
       checks.marginAssetSupported = fail("SYMBOL_RULES_UNAVAILABLE");
@@ -492,7 +501,6 @@ export class TradingRuntimeManager {
     const binanceMarginMode = symbolState?.marginType ?? null;
     const leverageMatch = binanceLeverage === null ? null : binanceLeverage === settings.maxLeverage;
     const marginModeMatch = binanceMarginMode === null || binanceMarginMode === "UNKNOWN" ? null : binanceMarginMode === settings.marginMode;
-    if (leverageMatch === false) checks.leverageValid = fail("LEVERAGE_MISMATCH");
     checks.marginModeKnown = marginModeMatch === null ? fail("MARGIN_MODE_UNKNOWN") : marginModeMatch ? ok() : fail("MARGIN_MODE_MISMATCH");
 
     checks.balanceAvailable =
@@ -509,13 +517,20 @@ export class TradingRuntimeManager {
 
     const readiness: RealTradingReadinessResult = {
       accountReady,
+      accountOperationalReady: accountReady,
       mode: account.mode,
       executionLocked: account.mode === "REAL",
       executionReason: account.mode === "REAL" ? "REAL_EXECUTION_LOCKED" : "READY",
+      realExecutionPermission: {
+        locked: account.mode === "REAL",
+        reason: account.mode === "REAL" ? "REAL_EXECUTION_LOCKED" : "READY"
+      },
       realExecutionMode: settings.realExecutionMode,
       masterLiveExecutionEnabled: this.baseConfig.realLiveExecutionEnabled,
       symbol,
       configuredLeverage: settings.maxLeverage,
+      symbolMaxLeverage: rules?.maxLeverage ?? null,
+      effectiveMaxLeverage,
       binanceLeverage,
       leverageMatch,
       configuredMarginMode: settings.marginMode,

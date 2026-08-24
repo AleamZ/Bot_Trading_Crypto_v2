@@ -2,7 +2,7 @@ import pg from "pg";
 import crypto from "node:crypto";
 import { getPostgresPool } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
-import type { TradingSettings } from "../../application/config/AppConfig.js";
+import { validateTradingSettings, type TradingSettings } from "../../application/config/AppConfig.js";
 import type { AccountProtectionState } from "../../application/risk/AccountProtectionService.js";
 import type { TradingRuntimeConfigRepository } from "../../application/trading-account/TradingRuntimeConfigRepository.js";
 import { MemoryTradingRuntimeConfigRepository } from "./MemoryTradingRuntimeConfigRepository.js";
@@ -96,16 +96,17 @@ export class PostgresTradingRuntimeConfigRepository implements TradingRuntimeCon
       cooldownAfterTradeMinutes: _legacyCooldownAfterTradeMinutes,
       ...stored
     } = payload;
-    return stored as TradingSettings;
+    return validateTradingSettings(stored);
   }
 
   async saveSettings(tradingAccountId: string, settings: TradingSettings): Promise<void> {
     const now = new Date().toISOString();
+    const normalized = validateTradingSettings(settings);
     await this.pool.query(
       `insert into trading_settings (id, trading_account_id, payload, created_at, updated_at)
        values ($1, $2, $3, $4, $4)
        on conflict (trading_account_id) do update set payload = excluded.payload, updated_at = excluded.updated_at`,
-      [crypto.randomUUID(), tradingAccountId, settings, now]
+      [crypto.randomUUID(), tradingAccountId, normalized, now]
     );
   }
 

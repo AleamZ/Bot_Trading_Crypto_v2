@@ -7,7 +7,7 @@ const dist = join(root, "dist");
 const apiBaseUrl =
   process.env.VITE_API_BASE_URL ??
   process.env.API_BASE_URL ??
-  (process.env.VERCEL || process.env.NODE_ENV === "production" ? "" : "http://localhost:8787");
+  "/api";
 
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
@@ -18,7 +18,5 @@ await Promise.all([
   cp(join(root, "styles.css"), join(dist, "styles.css")),
   cp(join(root, "chart"), join(dist, "chart"), { recursive: true })
 ]);
-await writeFile(
-  join(dist, "config.js"),
-  `window.__APP_CONFIG__ = ${JSON.stringify({ API_BASE_URL: apiBaseUrl })};\n`
-);
+const configText = `window.__APP_CONFIG__ = ${JSON.stringify({ API_BASE_URL: apiBaseUrl })};\n`;
+await Promise.all([writeFile(join(dist, "config.js"), configText), writeFile(join(dist, "app-config.js"), configText)]);

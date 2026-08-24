@@ -65,7 +65,8 @@ const schema = z.object({
   binanceRetryMaxAttempts: z.coerce.number().int().positive().default(3),
   binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500),
   postgresPoolMax: z.coerce.number().int().positive().max(10).default(2),
-  realLiveExecutionEnabled: z.coerce.boolean().default(false)
+  realLiveExecutionEnabled: z.coerce.boolean().default(false),
+  localTradingRuntimeEnabled: z.coerce.boolean().default(false)
 });
 
 export type AppConfig = z.infer<typeof schema>;
@@ -98,6 +99,7 @@ export type TradingSettings = Omit<
   | "maxDailyLossPercent"
   | "maxConsecutiveLosses"
   | "cooldownAfterTradeMinutes"
+  | "localTradingRuntimeEnabled"
 >;
 
 export const defaultTradingSettings: TradingSettings = {
@@ -221,7 +223,8 @@ export function loadConfig(): AppConfig {
     binanceRetryMaxAttempts: process.env.BINANCE_RETRY_MAX_ATTEMPTS,
     binanceRetryBaseDelayMs: process.env.BINANCE_RETRY_BASE_DELAY_MS,
     postgresPoolMax: process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX,
-    realLiveExecutionEnabled: process.env.REAL_LIVE_EXECUTION_ENABLED
+    realLiveExecutionEnabled: process.env.REAL_LIVE_EXECUTION_ENABLED,
+    localTradingRuntimeEnabled: process.env.LOCAL_TRADING_RUNTIME_ENABLED
   });
   validateProductionConfig(parsed);
   return parsed;

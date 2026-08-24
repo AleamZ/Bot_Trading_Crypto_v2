@@ -1,8 +1,10 @@
+import { config as loadDotenv } from "dotenv";
 import { cp, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+loadDotenv({ path: join(root, ".env"), override: false });
 const dist = join(root, "dist");
 const apiBaseUrl =
   process.env.VITE_API_BASE_URL ??

@@ -102,7 +102,12 @@ const server = startHttpServer({
 
 async function bootstrap(): Promise<void> {
   logger.warn("Legacy global scanner is disabled; authenticated UI uses account-scoped TradingRuntimeManager");
-  await runtimeManager.start();
+  const localRuntimeAllowed = config.nodeEnv !== "development" || config.localTradingRuntimeEnabled;
+  if (localRuntimeAllowed) {
+    await runtimeManager.start();
+  } else {
+    logger.warn("Development trading runtimes disabled; set LOCAL_TRADING_RUNTIME_ENABLED=true to opt in");
+  }
   appState.bootstrapComplete = true;
   logger.info("Runtime bootstrap complete", runtimeManager.getOperationalStatus());
 }

@@ -1,10 +1,12 @@
 import { createServer } from "node:http";
+import { config as loadDotenv } from "dotenv";
 import { readFile, writeFile } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+loadDotenv({ path: join(root, ".env"), override: false });
 const port = Number(process.env.WEB_PORT ?? process.env.PORT ?? 5173);
 const apiBaseUrl = process.env.VITE_API_BASE_URL ?? process.env.API_BASE_URL ?? "http://localhost:8787";
 

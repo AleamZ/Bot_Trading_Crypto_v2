@@ -174,6 +174,7 @@ export class TradingRuntimeManager {
   }
 
   async ensureRuntime(accountId: string): Promise<AccountRuntime> {
+    if (this.baseConfig.nodeEnv === "development" && !this.baseConfig.localTradingRuntimeEnabled) throw new Error("LOCAL_TRADING_RUNTIME_DISABLED");
     if (this.deletingAccounts.has(accountId)) throw new Error("ACCOUNT_REMOVING");
     const existing = this.runtimes.get(accountId);
     if (existing) return existing;

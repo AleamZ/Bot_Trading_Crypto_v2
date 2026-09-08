@@ -190,6 +190,28 @@ describe("ExecutionCoordinator", () => {
     expect(isRecoverableExecutionGateway(new LockedRealExecutionGateway())).toBe(false);
   });
 
+  it("does not create an execution intent or call Binance when CROSS risk is rejected", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const delegate = new RecordingGateway();
+    const coordinator = coordinatorFor("account-a", repository, delegate);
+    const crossRejectedRisk = risk({
+      accepted: false,
+      reason: "Cross-margin liquidation safety is not supported for automated execution because account-wide cross collateral exposure is not fully modeled",
+      rejectCode: "CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED",
+      marginMode: "CROSS",
+      liquidationSafetyStatus: "UNAVAILABLE",
+      maintenanceMarginRate: null,
+      maintenanceMarginAmount: null,
+      maintenanceMarginBracket: null,
+      estimatedLiquidationPrice: null,
+      distanceSlToLiquidation: null
+    });
+
+    await expect(coordinator.submitBracketOrder(plan(), crossRejectedRisk)).rejects.toThrow("Risk is not approved");
+    expect(delegate.calls).toHaveLength(0);
+    expect(await repository.listByAccount("account-a")).toHaveLength(0);
+  });
+
   it("keeps REAL locked before pre-trade validation and creates no intent", async () => {
     const repository = new MemoryExecutionIntentRepository();
     const delegate = new RecordingGateway();
@@ -435,6 +457,26 @@ describe("RealExecutionProposalGateway", () => {
     expect(saved[0]).toMatchObject({ status: "DRY_RUN", normalizedQuantity: 10, normalizedStopLoss: 95, normalizedTakeProfit: 110 });
   });
 
+  it("does not create a REAL DRY_RUN proposal when CROSS liquidation safety rejects risk", async () => {
+    const proposals = new MemoryRealExecutionProposalRepository();
+    const gateway = realProposalGateway(proposals, { realExecutionMode: "DRY_RUN", tradingEnabled: true, marginMode: "CROSS" });
+    const crossRejectedRisk = risk({
+      accepted: false,
+      reason: "Cross-margin liquidation safety is not supported for automated execution because account-wide cross collateral exposure is not fully modeled",
+      rejectCode: "CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED",
+      marginMode: "CROSS",
+      liquidationSafetyStatus: "UNAVAILABLE",
+      maintenanceMarginRate: null,
+      maintenanceMarginAmount: null,
+      maintenanceMarginBracket: null,
+      estimatedLiquidationPrice: null,
+      distanceSlToLiquidation: null
+    });
+
+    await expect(gateway.submitBracketOrder(plan(), crossRejectedRisk)).rejects.toThrow("CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED");
+    expect(await proposals.listByAccount("account-real")).toHaveLength(0);
+  });
+
   it("persists TEST-ONLY controlled DRY_RUN proposal parameters without submitting a Binance order", async () => {
     const proposals = new MemoryRealExecutionProposalRepository();
     const audit = new MemoryExecutionIntentRepository();
@@ -461,6 +503,8 @@ describe("RealExecutionProposalGateway", () => {
       riskPerTradeUsdt: targetRisk,
       maxLeverage: 75,
       maxMarginUsagePercent: 80,
+      marginMode: "ISOLATED",
+      liquidationSafetyBufferPercent: 0.5,
       entry: controlledPlan.entry,
       stopLoss: controlledPlan.stopLoss,
       takeProfit: controlledPlan.takeProfit,
@@ -519,6 +563,70 @@ describe("RealExecutionProposalGateway", () => {
     });
     expect(saved?.strategySnapshot).toMatchObject({ realExecutionMode: "DRY_RUN", takeProfitRule: "HTF_LIQUIDITY", minimumRiskReward: 2 });
     expect(await audit.listByAccount("account-real")).toHaveLength(0);
+    expect((await audit.listAuditEvents("account-real")).map((event) => event.type)).toEqual(["REAL_DRY_RUN_CREATED"]);
+  });
+
+  it("records corrected dynamic leverage and margin in REAL DRY_RUN proposals", async () => {
+    const proposals = new MemoryRealExecutionProposalRepository();
+    const audit = new MemoryExecutionIntentRepository();
+    const linkRules = { ...symbolRules(), symbol: "LINKUSDT", stepSize: 0.01, minQty: 0.01, maxQty: null, maxLeverage: 75 };
+    const linkPlan: EntryPlan = {
+      direction: "bearish",
+      entry: 11.563,
+      stopLoss: 11.572,
+      takeProfit: 11.524,
+      riskReward: 4.333333,
+      reason: "LINKUSDT production regression"
+    };
+    const linkRisk = evaluateRisk({
+      symbol: "LINKUSDT",
+      direction: "bearish",
+      availableBalance: 5893.7684269,
+      symbolRules: linkRules,
+      riskPerTradeUsdt: 5,
+      maxLeverage: 125,
+      maxMarginUsagePercent: 20,
+      marginMode: "ISOLATED",
+      liquidationSafetyBufferPercent: 0.5,
+      entry: linkPlan.entry,
+      stopLoss: linkPlan.stopLoss,
+      takeProfit: linkPlan.takeProfit,
+      minimumRiskReward: 1,
+      openPositions: 0,
+      maxOpenPositions: 1,
+      symbolOpenPositions: 0,
+      maxPositionPerSymbol: 1,
+      availableAt: 1,
+      drawdownPercent: 0,
+      maxDrawdownPercent: 10,
+      tradingEnabled: true,
+      killSwitch: false,
+      createdAt: 1
+    });
+    const gateway = realProposalGateway(
+      proposals,
+      { realExecutionMode: "DRY_RUN", tradingEnabled: true, maxLeverage: 125, maxMarginUsagePercent: 20 },
+      { availableBalance: 5893.7684269, auditRepository: audit, symbolRules: linkRules }
+    );
+
+    expect(linkRisk.accepted).toBe(true);
+    await expect(gateway.submitBracketOrder(linkPlan, linkRisk)).rejects.toThrow("REAL_DRY_RUN_CREATED");
+
+    const saved = (await proposals.listByAccount("account-real"))[0];
+    expect(saved).toMatchObject({
+      status: "DRY_RUN",
+      symbol: "LINKUSDT",
+      normalizedQuantity: 555.55,
+      estimatedNotional: 6423.82465,
+      configuredLeverage: 6
+    });
+    expect(saved?.estimatedMargin).toBeCloseTo(1070.6374417, 7);
+    expect(saved?.riskSnapshot).toMatchObject({
+      selectedLeverage: 6,
+      leverageNeededForMargin: 6,
+      effectiveMaxLeverage: 75
+    });
+    expect(saved?.riskSnapshot.actualRiskUsdt).toBeCloseTo(4.99995, 8);
     expect((await audit.listAuditEvents("account-real")).map((event) => event.type)).toEqual(["REAL_DRY_RUN_CREATED"]);
   });
 
@@ -912,8 +1020,16 @@ function symbolRules(): FuturesSymbolRules {
     maxQty: 100,
     minNotional: 5,
     maxLeverage: 125,
+    maintenanceMarginBrackets: maintenanceBrackets(),
     supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
   };
+}
+
+function maintenanceBrackets() {
+  return [
+    { bracket: 1, notionalFloor: 0, notionalCap: 5_000, maintenanceMarginRatio: 0.004, cumulativeMaintenanceAmount: 0, initialLeverage: 125 },
+    { bracket: 2, notionalFloor: 5_000, notionalCap: 25_000, maintenanceMarginRatio: 0.005, cumulativeMaintenanceAmount: 5, initialLeverage: 75 }
+  ];
 }
 
 function plan(): EntryPlan {
@@ -927,13 +1043,22 @@ function plan(): EntryPlan {
   };
 }
 
-function risk(): RiskDecision {
+function risk(overrides: Partial<RiskDecision> = {}): RiskDecision {
   return {
     accepted: true,
     reason: "Risk accepted",
     symbol: "BTCUSDT",
     margin: 200,
     leverage: 5,
+    requiredLeverage: 5,
+    leverageNeededForMargin: 5,
+    effectiveMaxLeverage: 125,
+    selectedLeverage: 5,
+    requiredMargin: 200,
+    maxLeverage: 125,
+    maxMarginUsagePercent: 100,
+    marginMode: "ISOLATED",
+    liquidationSafetyBufferPercent: 0.5,
     positionSize: 1000,
     quantity: 10,
     notional: 1000,
@@ -942,8 +1067,21 @@ function risk(): RiskDecision {
     takeProfit: 110,
     estimatedLoss: 50,
     estimatedProfit: 100,
+    actualRiskUsdt: 50,
+    targetRiskUsdt: 50,
+    riskPerTradeUsdt: 50,
+    availableBalance: 1000,
+    maxAllowedMargin: 1000,
+    marginUsagePercent: 20,
+    maintenanceMarginRate: 0.004,
+    maintenanceMarginAmount: 4,
+    maintenanceMarginBracket: { bracket: 1, notionalFloor: 0, notionalCap: 5000, cumulativeMaintenanceAmount: 0, initialLeverage: 125 },
+    estimatedLiquidationPrice: 80.32128514056225,
+    distanceSlToLiquidation: 14.67871485943775,
+    liquidationSafetyStatus: "SAFE",
     riskReward: 2,
-    createdAt: 1
+    createdAt: 1,
+    ...overrides
   };
 }
 

@@ -32,7 +32,6 @@ import type { Fvg } from "../../domain/fvg/Fvg.js";
 import { buildLiquidityState } from "../../domain/liquidity/LiquidityDetector.js";
 import { selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
 import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
-import { detectSwings } from "../../domain/market-structure/Swing.js";
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
@@ -1628,11 +1627,14 @@ function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppCon
       maxQty: null,
       minNotional: null,
       maxLeverage: config.maxLeverage,
+      maintenanceMarginBrackets: [],
       supportedOrderTypes: ["MARKET", "LIMIT"]
     },
-    riskPerTradeUsdt: config.riskPerTradeUsdt,
-    maxLeverage: config.maxLeverage,
-    maxMarginUsagePercent: config.maxMarginUsagePercent,
+	    riskPerTradeUsdt: config.riskPerTradeUsdt,
+	    maxLeverage: config.maxLeverage,
+	    maxMarginUsagePercent: config.maxMarginUsagePercent,
+	    marginMode: config.marginMode,
+	    liquidationSafetyBufferPercent: config.liquidationSafetyBufferPercent,
     entry: setup.plan.entry,
     stopLoss: setup.plan.stopLoss,
     takeProfit: setup.plan.takeProfit,
@@ -1676,9 +1678,10 @@ function calculateAnalysisEntryPlan(
   config: AppConfig,
   symbolTickSize: number
 ): { plan: EntryPlan | null; detail: string } {
-  const h1Swings = detectSwings(h1Candles, { left: config.swingLeft, right: config.swingRight });
   const entry = ltfFvg.direction === "bullish" ? ltfFvg.upper : ltfFvg.lower;
-  const externalLiquidity = selectExternalLiquidityTarget(h1Swings, direction, entry);
+  const decisionTimestamp = ltfFvg.firstTouchedAt ?? ltfFvg.activatedAt ?? ltfFvg.createdAt;
+  const liquidityState = buildLiquidityState(ltfFvg.symbol, "H1", h1Candles, { left: config.swingLeft, right: config.swingRight });
+  const externalLiquidity = selectExternalLiquidityTarget(liquidityState, direction, entry, decisionTimestamp);
   const plan = calculateEntryPlan({
     direction,
     triggeringFvg: ltfFvg,

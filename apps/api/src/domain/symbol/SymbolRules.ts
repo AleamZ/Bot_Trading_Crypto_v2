@@ -14,7 +14,17 @@ export interface FuturesSymbolRules {
   maxQty: number | null;
   minNotional: number | null;
   maxLeverage: number | null;
+  maintenanceMarginBrackets: MaintenanceMarginBracket[];
   supportedOrderTypes: string[];
+}
+
+export interface MaintenanceMarginBracket {
+  bracket: number | null;
+  notionalFloor: number;
+  notionalCap: number | null;
+  maintenanceMarginRatio: number;
+  cumulativeMaintenanceAmount: number;
+  initialLeverage: number | null;
 }
 
 export interface NormalizedOrderValues {
@@ -83,7 +93,7 @@ function normalizeDown(value: number, increment: number): number {
   if (!Number.isFinite(increment) || increment <= 0) return Number(value.toFixed(8));
   const precision = decimalPlaces(increment);
   const scale = 10 ** precision;
-  const normalized = Math.floor((value * scale) / (increment * scale)) * increment;
+  const normalized = Math.floor((value * scale + 1e-9) / (increment * scale)) * increment;
   return Number(normalized.toFixed(precision));
 }
 

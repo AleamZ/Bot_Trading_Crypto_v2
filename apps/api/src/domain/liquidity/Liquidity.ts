@@ -9,6 +9,8 @@ export interface LiquidityLevel {
   price: number;
   candleIndex: number;
   createdAt: number;
+  active?: boolean;
+  invalidated?: boolean;
   swept: boolean;
   sweptBy?: number;
   parentId?: string;

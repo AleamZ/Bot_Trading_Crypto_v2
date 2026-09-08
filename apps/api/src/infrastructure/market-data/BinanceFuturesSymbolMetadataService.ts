@@ -19,7 +19,7 @@ export class BinanceFuturesSymbolMetadataService {
     const key = `${environment}:${symbol}`;
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
-      return withMaxLeverage(cached.rules, await readMaxLeverage(symbol, loadLeverageBrackets));
+      return withLeverageBrackets(cached.rules, await readLeverageBrackets(symbol, loadLeverageBrackets));
     }
 
     const baseUrl = environment === "testnet" ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
@@ -32,7 +32,7 @@ export class BinanceFuturesSymbolMetadataService {
     if (!info) throw new Error("SYMBOL_RULES_UNAVAILABLE");
     const rules = parseSymbolRules(info);
     this.cache.set(key, { expiresAt: Date.now() + this.ttlMs, rules });
-    return withMaxLeverage(rules, await readMaxLeverage(symbol, loadLeverageBrackets));
+    return withLeverageBrackets(rules, await readLeverageBrackets(symbol, loadLeverageBrackets));
   }
 }
 
@@ -81,22 +81,27 @@ function parseSymbolRules(info: BinanceSymbolInfo): FuturesSymbolRules {
     maxQty: numberOrNull(lotSize?.maxQty),
     minNotional: numberOrNull(minNotional?.notional),
     maxLeverage: null,
+    maintenanceMarginBrackets: [],
     supportedOrderTypes: info.orderTypes ?? []
   };
 }
 
-async function readMaxLeverage(symbol: string, loadLeverageBrackets: (() => Promise<BinanceFuturesLeverageBracket[]>) | undefined): Promise<number | null> {
+async function readLeverageBrackets(symbol: string, loadLeverageBrackets: (() => Promise<BinanceFuturesLeverageBracket[]>) | undefined): Promise<BinanceFuturesLeverageBracket | null> {
   if (!loadLeverageBrackets) return null;
   try {
     const brackets = await loadLeverageBrackets();
-    return brackets.find((item) => item.symbol === symbol)?.maxInitialLeverage ?? null;
+    return brackets.find((item) => item.symbol === symbol) ?? null;
   } catch {
     return null;
   }
 }
 
-function withMaxLeverage(rules: FuturesSymbolRules, maxLeverage: number | null): FuturesSymbolRules {
-  return { ...rules, maxLeverage };
+function withLeverageBrackets(rules: FuturesSymbolRules, leverageBrackets: BinanceFuturesLeverageBracket | null): FuturesSymbolRules {
+  return {
+    ...rules,
+    maxLeverage: leverageBrackets?.maxInitialLeverage ?? null,
+    maintenanceMarginBrackets: leverageBrackets?.brackets ?? []
+  };
 }
 
 function numberOrNull(value: string | number | undefined): number | null {

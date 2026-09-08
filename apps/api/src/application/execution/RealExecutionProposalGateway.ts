@@ -30,6 +30,7 @@ export class RealExecutionProposalGateway implements ExecutionGateway {
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision): Promise<SubmittedOrder> {
     const config = this.options.config();
     this.assertGate(config);
+    if (!risk.accepted) throw new Error(risk.rejectCode ?? "RISK_REJECTED");
     await this.options.assertAccountProtection();
     const rules = await this.options.loadSymbolRules(risk.symbol);
     const validation = validateAgainstSymbolRules(rules, {

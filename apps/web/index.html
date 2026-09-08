@@ -464,6 +464,12 @@
           </article>
 
           <article class="setting-card">
+            <label for="setting-liquidation-safety-buffer">Liquidation Safety Buffer %</label>
+            <input id="setting-liquidation-safety-buffer" inputmode="decimal" min="0" max="100" step="0.01" type="text" />
+            <small>Minimum price distance between stop loss and liquidation boundary, measured from entry price.</small>
+          </article>
+
+          <article class="setting-card">
             <label>Margin Mode</label>
             <div class="segmented-control" data-setting-group="marginMode">
               <button class="segmented-option" data-setting-value="ISOLATED" type="button">Isolated</button>

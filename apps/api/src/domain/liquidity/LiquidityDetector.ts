@@ -1,5 +1,4 @@
 import type { Candle, Timeframe } from "../market-data/Candle.js";
-import type { SwingPoint } from "../market-structure/Swing.js";
 import type { Direction } from "../trade/Direction.js";
 import type { LiquidityLevel, LiquiditySweep, LiquidityType } from "./Liquidity.js";
 
@@ -29,6 +28,8 @@ export class LiquidityManager {
     const parent = findChainParent(queue.map((id) => this.levels.get(id)).filter(isLiquidityLevel), input);
     const level: LiquidityLevel = {
       ...input,
+      active: input.active ?? true,
+      invalidated: input.invalidated ?? false,
       swept: false,
       isPrimary: false,
       children: []
@@ -146,34 +147,38 @@ export function buildLiquidityState(
 }
 
 export function selectExternalLiquidityTarget(
-  swings: readonly SwingPoint[],
+  state: LiquidityState,
   tradeDirection: Direction,
-  referencePrice?: number
+  referencePrice: number,
+  decisionTimestamp = Number.POSITIVE_INFINITY
 ): LiquidityLevel | null {
   const type: LiquidityType = tradeDirection === "bullish" ? "BSL" : "SSL";
-  const levels = swings
-    .filter((swing) => (type === "BSL" ? swing.kind === "high" : swing.kind === "low"))
-    .map((swing, index): LiquidityLevel => ({
-      id: `${swing.symbol}:${swing.timeframe}:liq:${type}:${swing.candleOpenTime}:${swing.price}`,
-      type,
-      timeframe: swing.timeframe,
-      price: swing.price,
-      candleIndex: index,
-      createdAt: Math.floor(swing.candleOpenTime / 1000),
-      swept: false,
-      isPrimary: index === 0,
-      isInternal: false,
-      children: []
-    }));
-
-  const queue =
-    referencePrice !== undefined
-      ? levels
-          .filter((level) => (tradeDirection === "bullish" ? level.price > referencePrice : level.price < referencePrice))
-          .sort((a, b) => (tradeDirection === "bullish" ? a.price - b.price : b.price - a.price))
-      : levels;
+  const queue = state.levels
+    .filter((level) => isEligibleExternalLiquidityTarget(level, state.sweeps, type, tradeDirection, referencePrice, decisionTimestamp))
+    .sort((a, b) => (tradeDirection === "bullish" ? a.price - b.price : b.price - a.price));
 
   return queue[0] ?? null;
+}
+
+export function isEligibleExternalLiquidityTarget(
+  level: LiquidityLevel,
+  sweeps: readonly LiquiditySweep[],
+  type: LiquidityType,
+  tradeDirection: Direction,
+  referencePrice: number,
+  decisionTimestamp = Number.POSITIVE_INFINITY
+): boolean {
+  if (level.type !== type) return false;
+  if (level.active === false || level.invalidated === true) return false;
+  if (level.isInternal) return false;
+  if (level.createdAt > decisionTimestamp) return false;
+  if (tradeDirection === "bullish" && level.price <= referencePrice) return false;
+  if (tradeDirection === "bearish" && level.price >= referencePrice) return false;
+
+  const levelSweeps = sweeps.filter((sweep) => sweep.levelId === level.id);
+  if (levelSweeps.some((sweep) => sweep.createdAt <= decisionTimestamp)) return false;
+
+  return !(level.swept && levelSweeps.length === 0);
 }
 
 function detectSwingAt(

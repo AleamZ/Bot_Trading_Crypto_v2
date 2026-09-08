@@ -125,6 +125,7 @@ describe("DEMO and REAL settings schema/UI parity", () => {
       "setting-risk-per-trade",
       "setting-max-leverage",
       "setting-max-margin-usage",
+      "setting-liquidation-safety-buffer",
       "setting-max-open-positions",
       "setting-max-position-per-symbol",
       "setting-ema-period",
@@ -155,6 +156,11 @@ describe("DEMO and REAL settings schema/UI parity", () => {
     expect(app).toContain('marginMode: "ISOLATED"');
     expect(app).toContain("marginMode: String(settings.marginMode ?? defaultSettings.marginMode)");
     expect(app).toContain("marginMode: settingsState.marginMode");
+    expect(app).toContain("Actual Risk");
+    expect(app).toContain("Stop Loss");
+    expect(app).toContain("Safety Buffer");
+    expect(app).toContain("CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED");
+    expect(app).toContain("Cross-margin liquidation safety is not supported for automated execution because account-wide cross collateral exposure is not fully modeled");
 
     expect(html).toContain('id="real-execution-safety" hidden');
     expect(html).toContain('id="real-execution-mode-control"');
@@ -1219,6 +1225,10 @@ class FakeSymbolMetadataService {
       maxQty: 100,
       minNotional: 5,
       maxLeverage: brackets?.find((item) => item.symbol === symbol)?.maxInitialLeverage ?? 125,
+      maintenanceMarginBrackets: [
+        { bracket: 1, notionalFloor: 0, notionalCap: 5_000, maintenanceMarginRatio: 0.004, cumulativeMaintenanceAmount: 0, initialLeverage: 125 },
+        { bracket: 2, notionalFloor: 5_000, notionalCap: 25_000, maintenanceMarginRatio: 0.005, cumulativeMaintenanceAmount: 5, initialLeverage: 75 }
+      ],
       supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
     };
   }

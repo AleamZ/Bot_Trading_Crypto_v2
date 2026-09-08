@@ -281,6 +281,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       maxQty: numberOrNull(lotSize?.maxQty),
       minNotional: numberOrNull(minNotional?.notional),
       maxLeverage: null,
+      maintenanceMarginBrackets: [],
       supportedOrderTypes: symbolInfo?.orderTypes ?? []
     };
     this.symbolRules.set(symbol, rules);

@@ -34,6 +34,7 @@ const defaultSettings = {
   riskPerTradeUsdt: "20",
   maxLeverage: "125",
   maxMarginUsagePercent: "20",
+  liquidationSafetyBufferPercent: "0.5",
   marginMode: "ISOLATED",
   entryMode: "market",
   maxOpenPositions: "1",
@@ -1101,6 +1102,13 @@ function renderAnalysis(analysis) {
 
   const risk = analysis.riskManagement ?? {};
   const riskChecks = [...(risk.checks ?? [])];
+  if (risk.decision) {
+    riskChecks.push({
+      label: "Position Sizing",
+      status: risk.decision.accepted ? "PASSED" : "INVALIDATED",
+      detail: formatRiskDecisionDetail(risk.decision)
+    });
+  }
   let protectionBlocked = false;
   if (analysis.dailyRisk) {
     const dailyRisk = analysis.dailyRisk;
@@ -1129,6 +1137,48 @@ function renderAnalysis(analysis) {
   $("analysis-risk-checks").replaceChildren(
     ...riskChecks.map((check) => analysisConditionItem(check, null)),
   );
+}
+
+function formatRiskDecisionDetail(decision) {
+  const rejection = decision.accepted ? "" : ` · RISK REJECTED ${decision.rejectCode ?? decision.reason ?? ""}`;
+  const symbolSuffix = decision.symbol ? ` ${String(decision.symbol).replace(/USDT$/, "")}` : "";
+  const crossBlockedReason =
+    decision.rejectCode === "CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED"
+      ? " · Reason Cross-margin liquidation safety is not supported for automated execution because account-wide cross collateral exposure is not fully modeled"
+      : "";
+  const safetyBufferPrice = Number(decision.entry) * (Number(decision.liquidationSafetyBufferPercent) / 100);
+  return [
+    `Target Risk ${formatUsdt(decision.riskPerTradeUsdt ?? decision.targetRiskUsdt)}`,
+    `Actual Risk ${formatUsdt(decision.actualRiskUsdt ?? decision.estimatedLoss)}`,
+    `Entry ${formatPrice(decision.entry)}`,
+    `Stop Loss ${formatPrice(decision.stopLoss)}`,
+    `Take Profit ${formatPrice(decision.takeProfit)}`,
+    `Quantity ${formatQuantity(decision.quantity)}${symbolSuffix}`,
+    `Notional ${formatUsdt(decision.notional)}`,
+    `Selected Leverage ${formatLeverageValue(decision.selectedLeverage ?? decision.leverage)}`,
+    `Effective Max Leverage ${formatLeverageValue(decision.effectiveMaxLeverage ?? decision.maxLeverage)}`,
+    `Required Margin ${formatUsdt(decision.requiredMargin ?? decision.margin)}`,
+    `Max Allowed Margin ${formatUsdt(decision.maxAllowedMargin)}`,
+    `Margin Usage ${formatRatio(decision.marginUsagePercent)}% / ${formatRatio(decision.maxMarginUsagePercent)}%`,
+    `Maintenance Margin ${formatUsdt(decision.maintenanceMarginAmount)}`,
+    `Maintenance Bracket ${formatMaintenanceBracket(decision.maintenanceMarginBracket)}`,
+    `Maintenance Margin Ratio ${formatRatio((decision.maintenanceMarginRate ?? 0) * 100)}%`,
+    `Liquidation Boundary ${formatPrice(decision.estimatedLiquidationPrice)}`,
+    `SL-Liquidation Distance ${formatPrice(decision.distanceSlToLiquidation)}`,
+    `Safety Buffer ${formatPrice(safetyBufferPrice)} (${formatRatio(decision.liquidationSafetyBufferPercent)}%)`,
+    `Margin Mode ${decision.marginMode ?? "-"}`,
+    `Liquidation Safety ${decision.liquidationSafetyStatus ?? "LIQUIDATION_SAFETY_UNVERIFIED"}${rejection}${crossBlockedReason}`
+  ].join(" · ");
+}
+
+function formatMaintenanceBracket(bracket) {
+  if (!bracket) return "-";
+  return bracket.bracket ?? `${formatPrice(bracket.notionalFloor)}-${formatPrice(bracket.notionalCap)}`;
+}
+
+function formatLeverageValue(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  return `${Math.ceil(Number(value))}x`;
 }
 
 function analysisConditionItem(condition, number) {
@@ -1452,6 +1502,7 @@ function settingsFromApi(settings) {
     riskPerTradeUsdt: String(settings.riskPerTradeUsdt ?? defaultSettings.riskPerTradeUsdt),
     maxLeverage: String(settings.maxLeverage ?? defaultSettings.maxLeverage),
     maxMarginUsagePercent: String(settings.maxMarginUsagePercent ?? defaultSettings.maxMarginUsagePercent),
+    liquidationSafetyBufferPercent: String(settings.liquidationSafetyBufferPercent ?? defaultSettings.liquidationSafetyBufferPercent),
     marginMode: String(settings.marginMode ?? defaultSettings.marginMode),
     entryMode: String(settings.entryMode ?? defaultSettings.entryMode),
     maxOpenPositions: String(settings.maxOpenPositions ?? defaultSettings.maxOpenPositions),
@@ -1486,6 +1537,7 @@ function settingsPayload() {
     riskPerTradeUsdt: settingNumber("riskPerTradeUsdt"),
     maxLeverage: settingNumber("maxLeverage"),
     maxMarginUsagePercent: settingNumber("maxMarginUsagePercent"),
+    liquidationSafetyBufferPercent: settingNumber("liquidationSafetyBufferPercent"),
     marginMode: settingsState.marginMode,
     entryMode: settingsState.entryMode,
     maxOpenPositions: settingNumber("maxOpenPositions"),
@@ -1523,6 +1575,7 @@ const settingFieldByInputId = {
   "setting-risk-per-trade": "riskPerTradeUsdt",
   "setting-max-leverage": "maxLeverage",
   "setting-max-margin-usage": "maxMarginUsagePercent",
+  "setting-liquidation-safety-buffer": "liquidationSafetyBufferPercent",
   "setting-max-open-positions": "maxOpenPositions",
   "setting-max-position-per-symbol": "maxPositionPerSymbol",
   "setting-minimum-rr": "minimumRiskReward",

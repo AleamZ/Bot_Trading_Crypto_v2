@@ -83,6 +83,14 @@ export interface BinanceFuturesSymbolAccountState {
 export interface BinanceFuturesLeverageBracket {
   symbol: string;
   maxInitialLeverage: number | null;
+  brackets: Array<{
+    bracket: number | null;
+    initialLeverage: number | null;
+    notionalFloor: number;
+    notionalCap: number | null;
+    maintenanceMarginRatio: number;
+    cumulativeMaintenanceAmount: number;
+  }>;
 }
 
 type BinanceExitSide = "BUY" | "SELL";
@@ -221,7 +229,15 @@ export class BinanceFuturesAccountClient {
     const brackets = await this.signedGet<LeverageBracketResponse[]>("/fapi/v1/leverageBracket", { symbol });
     return brackets.map((item) => ({
       symbol: item.symbol,
-      maxInitialLeverage: maxInitialLeverage(item.brackets)
+      maxInitialLeverage: maxInitialLeverage(item.brackets),
+      brackets: (item.brackets ?? []).map((bracket) => ({
+        bracket: numberOrNull(bracket.bracket),
+        initialLeverage: numberOrNull(bracket.initialLeverage),
+        notionalFloor: Number(bracket.notionalFloor ?? 0),
+        notionalCap: numberOrNull(bracket.notionalCap),
+        maintenanceMarginRatio: Number(bracket.maintMarginRatio ?? 0),
+        cumulativeMaintenanceAmount: Number(bracket.cum ?? 0)
+      }))
     }));
   }
 
@@ -330,7 +346,14 @@ interface PositionRisk {
 
 interface LeverageBracketResponse {
   symbol: string;
-  brackets?: Array<{ initialLeverage?: number }>;
+  brackets?: Array<{
+    bracket?: number;
+    initialLeverage?: number;
+    notionalCap?: string | number;
+    notionalFloor?: string | number;
+    maintMarginRatio?: string | number;
+    cum?: string | number;
+  }>;
 }
 
 function toOpenOrderStatus(order: OpenOrder): BinanceFuturesOpenOrderStatus {
@@ -401,7 +424,7 @@ function isTrue(value: boolean | string | undefined): boolean {
   return value === true || value === "true";
 }
 
-function numberOrNull(value: string | undefined): number | null {
+function numberOrNull(value: string | number | undefined): number | null {
   const number = Number(value ?? 0);
   return number > 0 ? number : null;
 }

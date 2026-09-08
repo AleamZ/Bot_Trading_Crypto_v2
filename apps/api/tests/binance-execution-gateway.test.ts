@@ -32,6 +32,8 @@ describe("BinanceFuturesExecutionGateway", () => {
     });
 
     const entry = requests.find((request) => request.path === "/fapi/v1/order" && request.method === "POST");
+    const leverage = requests.find((request) => request.path === "/fapi/v1/leverage" && request.method === "POST");
+    expect(leverage?.params).toMatchObject({ symbol: "XRPUSDT", leverage: "1" });
     expect(entry?.params).toMatchObject({
       symbol: "XRPUSDT",
       side: "BUY",
@@ -168,10 +170,14 @@ function risk(symbol: string, quantity: number): RiskDecision {
     margin: 150.88,
     leverage: 1,
     requiredLeverage: 0.03,
+    leverageNeededForMargin: 1,
+    effectiveMaxLeverage: 75,
     selectedLeverage: 1,
     requiredMargin: 150.88,
     maxLeverage: 75,
     maxMarginUsagePercent: 20,
+    marginMode: "ISOLATED",
+    liquidationSafetyBufferPercent: 0.5,
     positionSize: 150.88,
     quantity,
     notional: 150.88,
@@ -186,6 +192,12 @@ function risk(symbol: string, quantity: number): RiskDecision {
     availableBalance: 5000,
     maxAllowedMargin: 1000,
     marginUsagePercent: 3.0176,
+    maintenanceMarginRate: 0.004,
+    maintenanceMarginAmount: 0.60352,
+    maintenanceMarginBracket: { bracket: 1, notionalFloor: 0, notionalCap: null, cumulativeMaintenanceAmount: 0, initialLeverage: 75 },
+    estimatedLiquidationPrice: 0.001,
+    distanceSlToLiquidation: 1.3078,
+    liquidationSafetyStatus: "SAFE",
     riskReward: 2,
     createdAt: "2026-08-23T00:00:00.000Z"
   };

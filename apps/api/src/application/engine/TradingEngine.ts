@@ -10,8 +10,7 @@ import type { Fvg } from "../../domain/fvg/Fvg.js";
 import { detectFvgs, detectLatestLtfFvg, isFvgInvalidated, isFvgTouched, reconstructFvgLifecycle } from "../../domain/fvg/FvgDetector.js";
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import { detectM5StructureSignal } from "../../domain/market-structure/StructureDetector.js";
-import { detectSwings } from "../../domain/market-structure/Swing.js";
-import { selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
+import { buildLiquidityState, selectExternalLiquidityTarget } from "../../domain/liquidity/LiquidityDetector.js";
 import { calculateEntryPlan, calculateFirstTouchEntry, type EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import { evaluateRisk } from "../../domain/risk/RiskManager.js";
@@ -135,9 +134,14 @@ export class TradingEngine {
       margin: 0,
       leverage: 0,
       requiredLeverage: 0,
+      leverageNeededForMargin: 0,
+      effectiveMaxLeverage: this.config.maxLeverage,
       selectedLeverage: 0,
       requiredMargin: 0,
       maxLeverage: this.config.maxLeverage,
+      maxMarginUsagePercent: this.config.maxMarginUsagePercent,
+      marginMode: this.config.marginMode,
+      liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
       positionSize: position.entryPrice * position.quantity,
       quantity: position.quantity,
       notional: position.entryPrice * position.quantity,
@@ -152,6 +156,12 @@ export class TradingEngine {
       availableBalance: this.state.balance,
       maxAllowedMargin: 0,
       marginUsagePercent: 0,
+      maintenanceMarginRate: null,
+      maintenanceMarginAmount: null,
+      maintenanceMarginBracket: null,
+      estimatedLiquidationPrice: null,
+      distanceSlToLiquidation: null,
+      liquidationSafetyStatus: "UNAVAILABLE",
       riskReward: 0,
       createdAt: Date.now()
     };
@@ -414,6 +424,8 @@ export class TradingEngine {
       riskPerTradeUsdt: this.config.riskPerTradeUsdt,
       maxLeverage: this.config.maxLeverage,
       maxMarginUsagePercent: this.config.maxMarginUsagePercent,
+      marginMode: this.config.marginMode,
+      liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
       entry: plan.entry,
       stopLoss: plan.stopLoss,
       takeProfit: plan.takeProfit,
@@ -520,9 +532,10 @@ export class TradingEngine {
   }
 
   private async calculatePlanForLtfFvg(ltfFvg: Fvg, protectiveCluster: readonly Fvg[]): Promise<EntryPlan | null> {
-    const h1Swings = detectSwings(this.state.h1Candles, { left: this.config.swingLeft, right: this.config.swingRight });
     const entry = calculateFirstTouchEntry(ltfFvg);
-    const externalLiquidity = selectExternalLiquidityTarget(h1Swings, ltfFvg.direction, entry);
+    const decisionTimestamp = ltfFvg.firstTouchedAt ?? ltfFvg.activatedAt ?? ltfFvg.createdAt;
+    const liquidityState = buildLiquidityState(this.config.symbol, "H1", this.state.h1Candles, { left: this.config.swingLeft, right: this.config.swingRight });
+    const externalLiquidity = selectExternalLiquidityTarget(liquidityState, ltfFvg.direction, entry, decisionTimestamp);
     const symbolRules = await this.getSymbolRules();
     return calculateEntryPlan({
       direction: ltfFvg.direction,
@@ -559,6 +572,7 @@ export class TradingEngine {
       maxQty: null,
       minNotional: null,
       maxLeverage: this.config.maxLeverage,
+      maintenanceMarginBrackets: [],
       supportedOrderTypes: ["MARKET", "LIMIT"]
     };
   }

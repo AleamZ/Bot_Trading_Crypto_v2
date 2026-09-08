@@ -20,6 +20,8 @@
 //   ]
 // };
 
+const path = require("node:path");
+
 module.exports = {
   apps: [
     {
@@ -37,8 +39,8 @@ module.exports = {
       kill_timeout: 15000,
       time: true,
 
-      out_file: "/var/log/smc-futures-api/out.log",
-      error_file: "/var/log/smc-futures-api/error.log",
+      out_file: path.resolve(__dirname, "logs/smc-futures-api/out.log"),
+      error_file: path.resolve(__dirname, "logs/smc-futures-api/error.log"),
 
       env: {
         NODE_ENV: "production",

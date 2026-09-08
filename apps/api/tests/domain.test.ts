@@ -12,12 +12,17 @@ import { calculateEntryPlan } from "../src/domain/entry/EntryCalculator.js";
 import { detectM5StructureSignal } from "../src/domain/market-structure/StructureDetector.js";
 import { evaluateRisk } from "../src/domain/risk/RiskManager.js";
 import { transitionSetupState } from "../src/domain/setup/SetupStateMachine.js";
+import type { LiquidityLevel, LiquidityType } from "../src/domain/liquidity/Liquidity.js";
 import { LiquidityManager, buildLiquidityState, selectExternalLiquidityTarget } from "../src/domain/liquidity/LiquidityDetector.js";
 import { formatRuleNumber, normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../src/domain/symbol/SymbolRules.js";
 
 describe("Binance symbol rules", () => {
   it("normalizes quantity down to step size", () => {
     expect(normalizeQuantity(0.00129, 0.001)).toBe(0.001);
+  });
+
+  it("keeps quantities already aligned to decimal step size", () => {
+    expect(normalizeQuantity(555.55, 0.01)).toBe(555.55);
   });
 
   it("formats exchange rule numbers without stripping integer zeros", () => {
@@ -339,6 +344,159 @@ describe("risk and state", () => {
     expect(decision.estimatedLoss).toBe(50);
   });
 
+  it("selects the minimum leverage needed to keep LINKUSDT inside max margin usage", () => {
+    const decision = evaluateRisk(
+      riskInput({
+        symbol: "LINKUSDT",
+        direction: "bearish",
+        availableBalance: 5893.7684269,
+        symbolRules: linkSymbolRules(),
+        riskPerTradeUsdt: 5,
+        maxLeverage: 125,
+        maxMarginUsagePercent: 20,
+        entry: 11.563,
+        stopLoss: 11.572,
+        takeProfit: 11.524,
+        minimumRiskReward: 1
+      })
+    );
+
+    expect(decision.accepted).toBe(true);
+    expect(decision.quantity).toBeCloseTo(555.55, 8);
+    expect(decision.notional).toBeCloseTo(6423.82465, 8);
+    expect(decision.actualRiskUsdt).toBeCloseTo(4.99995, 8);
+    expect(decision.maxAllowedMargin).toBeCloseTo(1178.75368538, 8);
+    expect(decision.requiredLeverage).toBeCloseTo(5.449675135, 8);
+    expect(decision.leverageNeededForMargin).toBe(6);
+    expect(decision.effectiveMaxLeverage).toBe(75);
+    expect(decision.selectedLeverage).toBe(6);
+    expect(decision.requiredMargin).toBeCloseTo(1070.6374417, 7);
+    expect(decision.marginUsagePercent).toBeCloseTo(18.16558378, 7);
+    expect(decision.maintenanceMarginBracket?.bracket).toBe(1);
+    expect(decision.maintenanceMarginRate).toBe(0.0065);
+    expect(decision.maintenanceMarginAmount).toBeCloseTo(41.754860225, 9);
+    expect(decision.estimatedLiquidationPrice).toBeCloseTo(13.403046862063256, 12);
+    expect(decision.liquidationSafetyStatus).toBe("SAFE");
+  });
+
+  it("fails CROSS margin liquidation safety closed while preserving LINKUSDT sizing", () => {
+    const isolated = evaluateRisk(
+      riskInput({
+        symbol: "LINKUSDT",
+        direction: "bearish",
+        availableBalance: 5893.7684269,
+        symbolRules: linkSymbolRules(),
+        riskPerTradeUsdt: 5,
+        maxLeverage: 125,
+        maxMarginUsagePercent: 20,
+        marginMode: "ISOLATED",
+        entry: 11.563,
+        stopLoss: 11.572,
+        takeProfit: 11.524,
+        minimumRiskReward: 1
+      })
+    );
+    const cross = evaluateRisk(
+      riskInput({
+        symbol: "LINKUSDT",
+        direction: "bearish",
+        availableBalance: 5893.7684269,
+        symbolRules: linkSymbolRules(),
+        riskPerTradeUsdt: 5,
+        maxLeverage: 125,
+        maxMarginUsagePercent: 20,
+        marginMode: "CROSS",
+        entry: 11.563,
+        stopLoss: 11.572,
+        takeProfit: 11.524,
+        minimumRiskReward: 1
+      })
+    );
+
+    expect(isolated).toMatchObject({ accepted: true, selectedLeverage: 6, liquidationSafetyStatus: "SAFE" });
+    expect(cross).toMatchObject({
+      accepted: false,
+      rejectCode: "CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED",
+      liquidationSafetyStatus: "UNAVAILABLE",
+      selectedLeverage: 6
+    });
+    expect(cross.quantity).toBe(isolated.quantity);
+    expect(cross.actualRiskUsdt).toBeCloseTo(isolated.actualRiskUsdt, 8);
+    expect(cross.entry).toBe(isolated.entry);
+    expect(cross.stopLoss).toBe(isolated.stopLoss);
+    expect(cross.takeProfit).toBe(isolated.takeProfit);
+  });
+
+  it("keeps quantity and 1R risk invariant when margin cap changes only selected leverage", () => {
+    const looseMargin = evaluateRisk(
+      riskInput({
+        riskPerTradeUsdt: 5,
+        availableBalance: 5893.7684269,
+        symbolRules: { ...symbolRules(), stepSize: 0.01, minQty: 0.01, maxQty: null, maxLeverage: 75 },
+        maxLeverage: 125,
+        maxMarginUsagePercent: 100,
+        entry: 11.563,
+        stopLoss: 11.572,
+        takeProfit: 11.524,
+        minimumRiskReward: 1
+      })
+    );
+    const tightMargin = evaluateRisk(
+      riskInput({
+        riskPerTradeUsdt: 5,
+        availableBalance: 5893.7684269,
+        symbolRules: { ...symbolRules(), stepSize: 0.01, minQty: 0.01, maxQty: null, maxLeverage: 75 },
+        maxLeverage: 125,
+        maxMarginUsagePercent: 20,
+        entry: 11.563,
+        stopLoss: 11.572,
+        takeProfit: 11.524,
+        minimumRiskReward: 1
+      })
+    );
+
+    expect(looseMargin.selectedLeverage).toBe(2);
+    expect(tightMargin.selectedLeverage).toBe(6);
+    expect(tightMargin.quantity).toBe(looseMargin.quantity);
+    expect(tightMargin.entry).toBe(looseMargin.entry);
+    expect(tightMargin.stopLoss).toBe(looseMargin.stopLoss);
+    expect(tightMargin.takeProfit).toBe(looseMargin.takeProfit);
+    expect(tightMargin.actualRiskUsdt).toBeCloseTo(looseMargin.actualRiskUsdt, 8);
+  });
+
+  it("passes exactly at the max-margin boundary and selects the next leverage when slightly over", () => {
+    const atBoundary = evaluateRisk(
+      riskInput({
+        riskPerTradeUsdt: 10,
+        availableBalance: 1000,
+        maxMarginUsagePercent: 20,
+        entry: 100,
+        stopLoss: 99,
+        takeProfit: 103,
+        minimumRiskReward: 1
+      })
+    );
+    const slightlyOverBoundary = evaluateRisk(
+      riskInput({
+        riskPerTradeUsdt: 10.001,
+        availableBalance: 1000,
+        maxMarginUsagePercent: 20,
+        entry: 100,
+        stopLoss: 99,
+        takeProfit: 103,
+        minimumRiskReward: 1
+      })
+    );
+
+    expect(atBoundary.accepted).toBe(true);
+    expect(atBoundary.selectedLeverage).toBe(5);
+    expect(atBoundary.requiredMargin).toBe(200);
+    expect(atBoundary.marginUsagePercent).toBe(20);
+    expect(slightlyOverBoundary.accepted).toBe(true);
+    expect(slightlyOverBoundary.selectedLeverage).toBe(6);
+    expect(slightlyOverBoundary.marginUsagePercent).toBeLessThan(20);
+  });
+
   it("rejects risk decisions that require leverage above the symbol effective maximum", () => {
     const bnbRules = { ...symbolRules(), symbol: "BNBUSDT", maxQty: null, maxLeverage: 75 };
 
@@ -348,8 +506,8 @@ describe("risk and state", () => {
         symbolRules: bnbRules,
         riskPerTradeUsdt: 100,
         maxLeverage: 125,
-        maxMarginUsagePercent: 100,
-        availableBalance: 100,
+        maxMarginUsagePercent: 20,
+        availableBalance: 500,
         entry: 100,
         stopLoss: 99,
         takeProfit: 103
@@ -361,16 +519,151 @@ describe("risk and state", () => {
         symbolRules: bnbRules,
         riskPerTradeUsdt: 100,
         maxLeverage: 125,
-        maxMarginUsagePercent: 100,
-        availableBalance: 134,
+        maxMarginUsagePercent: 20,
+        availableBalance: 1333.34,
+        entry: 100,
+        stopLoss: 99.5,
+        takeProfit: 103,
+        minimumRiskReward: 1,
+        liquidationSafetyBufferPercent: 0.1
+      })
+    );
+
+    expect(rejected).toMatchObject({ accepted: false, rejectCode: "REQUIRED_LEVERAGE_EXCEEDS_MAX", selectedLeverage: 100, effectiveMaxLeverage: 75 });
+    expect(accepted).toMatchObject({ accepted: true, selectedLeverage: 75 });
+  });
+
+  it("uses configured max leverage as the effective cap when it is below the symbol cap", () => {
+    const decision = evaluateRisk(
+      riskInput({
+        riskPerTradeUsdt: 100,
+        availableBalance: 500,
+        maxLeverage: 50,
+        maxMarginUsagePercent: 20,
         entry: 100,
         stopLoss: 99,
         takeProfit: 103
       })
     );
 
-    expect(rejected).toMatchObject({ accepted: false, rejectCode: "REQUIRED_LEVERAGE_EXCEEDS_MAX", selectedLeverage: 100 });
-    expect(accepted).toMatchObject({ accepted: true, selectedLeverage: 75 });
+    expect(decision).toMatchObject({
+      accepted: false,
+      rejectCode: "REQUIRED_LEVERAGE_EXCEEDS_MAX",
+      selectedLeverage: 100,
+      effectiveMaxLeverage: 50
+    });
+  });
+
+  it("keeps step-size normalization and min/max/notional filters enforced after leverage selection", () => {
+    expect(evaluateRisk(riskInput({ riskPerTradeUsdt: 0.000001, stopLoss: 99.99 })).rejectCode).toBe("INVALID_QUANTITY");
+    expect(evaluateRisk(riskInput({ symbolRules: { ...symbolRules(), minQty: 11 } })).rejectCode).toBe("MIN_QTY");
+    expect(evaluateRisk(riskInput({ symbolRules: { ...symbolRules(), maxQty: 9 } })).rejectCode).toBe("MAX_QTY");
+    expect(evaluateRisk(riskInput({ riskPerTradeUsdt: 0.01, stopLoss: 99, symbolRules: { ...symbolRules(), minNotional: 5 } })).rejectCode).toBe("MIN_NOTIONAL");
+  });
+
+  it("rejects invalid balance and zero max-margin usage safely", () => {
+    expect(evaluateRisk(riskInput({ availableBalance: 0 }))).toMatchObject({ accepted: false, rejectCode: "INVALID_BALANCE" });
+    expect(evaluateRisk(riskInput({ maxMarginUsagePercent: 0 }))).toMatchObject({ accepted: false, rejectCode: "MAX_MARGIN_USAGE_EXCEEDED" });
+  });
+
+  it("selects the correct maintenance bracket for small and threshold-crossing notionals", () => {
+    const small = evaluateRisk(riskInput({ riskPerTradeUsdt: 10, entry: 100, stopLoss: 99, takeProfit: 103, minimumRiskReward: 1 }));
+    const larger = evaluateRisk(riskInput({ riskPerTradeUsdt: 60, entry: 100, stopLoss: 99, takeProfit: 103, minimumRiskReward: 1 }));
+
+    expect(small.maintenanceMarginBracket?.bracket).toBe(1);
+    expect(larger.maintenanceMarginBracket?.bracket).toBe(2);
+    expect(larger.maintenanceMarginRate).toBe(0.005);
+  });
+
+  it("converges maintenance bracket when liquidation notional crosses from bracket A to B", () => {
+    const decision = evaluateRisk(
+      riskInput({
+        direction: "bearish",
+        availableBalance: 1000,
+        riskPerTradeUsdt: 50,
+        maxMarginUsagePercent: 100,
+        entry: 100,
+        stopLoss: 105,
+        takeProfit: 90,
+        symbolRules: {
+          ...symbolRules(),
+          maintenanceMarginBrackets: [
+            { bracket: 1, notionalFloor: 0, notionalCap: 1500, maintenanceMarginRatio: 0.004, cumulativeMaintenanceAmount: 0, initialLeverage: 125 },
+            { bracket: 2, notionalFloor: 1500, notionalCap: null, maintenanceMarginRatio: 0.02, cumulativeMaintenanceAmount: 10, initialLeverage: 50 }
+          ]
+        }
+      })
+    );
+
+    expect(decision.accepted).toBe(true);
+    expect(decision.notional).toBe(1000);
+    expect(decision.maintenanceMarginBracket?.bracket).toBe(2);
+    expect(decision.maintenanceMarginRate).toBe(0.02);
+    expect(decision.maintenanceMarginBracket?.cumulativeMaintenanceAmount).toBe(10);
+    expect(decision.maintenanceMarginAmount).toBe(10);
+    expect(decision.estimatedLiquidationPrice).toBeCloseTo(197.05882352941177, 8);
+    expect(decision.distanceSlToLiquidation).toBeCloseTo(92.05882352941177, 8);
+  });
+
+  it("fails closed when liquidation bracket iteration cannot converge", () => {
+    const decision = evaluateRisk(
+      riskInput({
+        direction: "bearish",
+        availableBalance: 1000,
+        riskPerTradeUsdt: 50,
+        maxMarginUsagePercent: 100,
+        entry: 100,
+        stopLoss: 105,
+        takeProfit: 90,
+        symbolRules: {
+          ...symbolRules(),
+          maintenanceMarginBrackets: [
+            { bracket: 1, notionalFloor: 0, notionalCap: 1500, maintenanceMarginRatio: 0.004, cumulativeMaintenanceAmount: 0, initialLeverage: 125 },
+            { bracket: 2, notionalFloor: 1500, notionalCap: null, maintenanceMarginRatio: 0.9, cumulativeMaintenanceAmount: 0, initialLeverage: 2 }
+          ]
+        }
+      })
+    );
+
+    expect(decision).toMatchObject({
+      accepted: false,
+      rejectCode: "LIQUIDATION_BRACKET_UNRESOLVED",
+      liquidationSafetyStatus: "UNAVAILABLE"
+    });
+  });
+
+  it("rejects safely when maintenance bracket data is unavailable", () => {
+    expect(evaluateRisk(riskInput({ symbolRules: { ...symbolRules(), maintenanceMarginBrackets: [] } }))).toMatchObject({
+      accepted: false,
+      rejectCode: "MAINTENANCE_MARGIN_DATA_UNAVAILABLE",
+      liquidationSafetyStatus: "UNAVAILABLE"
+    });
+  });
+
+  it("accepts long liquidation safely below SL and rejects when too close", () => {
+    const safe = evaluateRisk(riskInput({ direction: "bullish", entry: 100, stopLoss: 95, takeProfit: 110, maxMarginUsagePercent: 100 }));
+    const blocked = evaluateRisk(riskInput({ direction: "bullish", availableBalance: 100, entry: 100, stopLoss: 82, takeProfit: 140, maxMarginUsagePercent: 20, minimumRiskReward: 0.1 }));
+
+    expect(safe).toMatchObject({ accepted: true, liquidationSafetyStatus: "SAFE" });
+    expect(safe.estimatedLiquidationPrice).toBeLessThan(safe.stopLoss);
+    expect(blocked).toMatchObject({ accepted: false, rejectCode: "LIQUIDATION_TOO_CLOSE_TO_STOP", liquidationSafetyStatus: "BLOCKED" });
+  });
+
+  it("accepts short liquidation safely above SL and rejects when too close", () => {
+    const safe = evaluateRisk(riskInput({ direction: "bearish", entry: 100, stopLoss: 105, takeProfit: 90, maxMarginUsagePercent: 100 }));
+    const blocked = evaluateRisk(riskInput({ direction: "bearish", entry: 100, stopLoss: 199, takeProfit: 50, maxMarginUsagePercent: 100, minimumRiskReward: 0.1 }));
+
+    expect(safe).toMatchObject({ accepted: true, liquidationSafetyStatus: "SAFE" });
+    expect(safe.estimatedLiquidationPrice).toBeGreaterThan(safe.stopLoss);
+    expect(blocked).toMatchObject({ accepted: false, rejectCode: "LIQUIDATION_TOO_CLOSE_TO_STOP", liquidationSafetyStatus: "BLOCKED" });
+  });
+
+  it("enforces liquidation safety buffer boundary", () => {
+    const base = evaluateRisk(riskInput({ direction: "bullish", entry: 100, stopLoss: 95, takeProfit: 110, maxMarginUsagePercent: 100, liquidationSafetyBufferPercent: 0 }));
+    const strict = evaluateRisk(riskInput({ direction: "bullish", entry: 100, stopLoss: 95, takeProfit: 110, maxMarginUsagePercent: 100, liquidationSafetyBufferPercent: 99 }));
+
+    expect(base.accepted).toBe(true);
+    expect(strict).toMatchObject({ accepted: false, rejectCode: "LIQUIDATION_TOO_CLOSE_TO_STOP" });
   });
 
   it("rejects entries below minimum RR but passes at the threshold", () => {
@@ -628,18 +921,84 @@ describe("liquidity state", () => {
     expect(manager.render().sweeps).toHaveLength(1);
   });
 
-  it("selects the nearest external liquidity beyond the entry price", () => {
-    const swings = [
-      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "high" as const, candleOpenTime: 1, price: 100 },
-      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "high" as const, candleOpenTime: 2, price: 130 },
-      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "high" as const, candleOpenTime: 3, price: 120 },
-      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "low" as const, candleOpenTime: 4, price: 90 },
-      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "low" as const, candleOpenTime: 5, price: 70 },
-      { symbol: "BTCUSDT", timeframe: "H1" as const, kind: "low" as const, candleOpenTime: 6, price: 80 }
-    ];
+  it("selects the nearest eligible external liquidity beyond the entry price", () => {
+    const state = liquidityState([
+      liquidityLevel("BSL", 100, 1),
+      liquidityLevel("BSL", 130, 2),
+      liquidityLevel("BSL", 120, 3),
+      liquidityLevel("SSL", 90, 4),
+      liquidityLevel("SSL", 70, 5),
+      liquidityLevel("SSL", 80, 6)
+    ]);
 
-    expect(selectExternalLiquidityTarget(swings, "bullish", 110)?.price).toBe(120);
-    expect(selectExternalLiquidityTarget(swings, "bearish", 85)?.price).toBe(80);
+    expect(selectExternalLiquidityTarget(state, "bullish", 110, 10)?.price).toBe(120);
+    expect(selectExternalLiquidityTarget(state, "bearish", 85, 10)?.price).toBe(80);
+  });
+
+  it("ignores swept SSL/BSL before entry and keeps swept-after-entry liquidity historically eligible", () => {
+    const shortSwept = liquidityLevel("SSL", 0.08841, 1, "short-swept");
+    const shortActive = liquidityLevel("SSL", 0.0874, 2, "short-active");
+    const longSwept = liquidityLevel("BSL", 110, 1, "long-swept");
+    const longActive = liquidityLevel("BSL", 120, 2, "long-active");
+    const state = liquidityState([shortSwept, shortActive, longSwept, longActive], [
+      { id: "sweep-short", type: "SSL", timeframe: "H1", price: 0.08841, candleIndex: 10, createdAt: 9, direction: "up", levelId: shortSwept.id },
+      { id: "sweep-long", type: "BSL", timeframe: "H1", price: 110, candleIndex: 10, createdAt: 9, direction: "down", levelId: longSwept.id },
+      { id: "sweep-after", type: "SSL", timeframe: "H1", price: 0.0874, candleIndex: 20, createdAt: 20, direction: "up", levelId: shortActive.id }
+    ]);
+
+    expect(selectExternalLiquidityTarget(state, "bearish", 0.08859, 10)?.id).toBe(shortActive.id);
+    expect(selectExternalLiquidityTarget(state, "bullish", 100, 10)?.id).toBe(longActive.id);
+    expect(selectExternalLiquidityTarget(state, "bearish", 0.08859, 19)?.id).toBe(shortActive.id);
+    expect(selectExternalLiquidityTarget(state, "bearish", 0.08859, 20)).toBeNull();
+  });
+
+  it("ignores invalidated, inactive, internal, wrong-side, wrong-type and future-created liquidity", () => {
+    const valid = liquidityLevel("SSL", 70, 2, "valid");
+    const state = liquidityState([
+      liquidityLevel("SSL", 80, 1, "invalidated", { invalidated: true }),
+      liquidityLevel("SSL", 81, 1, "inactive", { active: false }),
+      liquidityLevel("SSL", 82, 1, "internal", { isInternal: true }),
+      liquidityLevel("SSL", 120, 1, "wrong-side"),
+      liquidityLevel("BSL", 90, 1, "wrong-type"),
+      liquidityLevel("SSL", 75, 99, "future"),
+      valid
+    ]);
+
+    expect(selectExternalLiquidityTarget(state, "bearish", 100, 10)?.id).toBe(valid.id);
+  });
+
+  it("fails closed when no eligible external liquidity target exists", () => {
+    const state = liquidityState([
+      liquidityLevel("SSL", 80, 1, "swept"),
+      liquidityLevel("SSL", 70, 2, "internal", { isInternal: true })
+    ], [{ id: "sweep", type: "SSL", timeframe: "H1", price: 80, candleIndex: 3, createdAt: 3, direction: "up", levelId: "swept" }]);
+
+    expect(selectExternalLiquidityTarget(state, "bearish", 100, 10)).toBeNull();
+  });
+
+  it("recalculates DOGEUSDT RR from the corrected unswept SSL without moving entry or SL", () => {
+    const sweptSsl = liquidityLevel("SSL", 0.08841, 1, "swept-doge-ssl");
+    const correctedSsl = liquidityLevel("SSL", 0.0874, 2, "corrected-doge-ssl");
+    const state = liquidityState([sweptSsl, correctedSsl], [
+      { id: "doge-sweep", type: "SSL", timeframe: "H1", price: 0.08841, candleIndex: 3, createdAt: 9, direction: "up", levelId: sweptSsl.id }
+    ]);
+    const fvg = testFvg("bearish", 0.08859, 0.08875, "DOGEUSDT:M5:bearish:entry");
+    const target = selectExternalLiquidityTarget(state, "bearish", 0.08859, 10);
+    const plan = calculateEntryPlan({
+      direction: "bearish",
+      triggeringFvg: fvg,
+      protectiveCluster: [fvg],
+      m5Candles: [candle("M5", 1, 0.0887, 0.0888, 0.0885, 0.0886)],
+      externalLiquidityPrice: target?.price ?? null,
+      config: { ...entryConfig(), stopLossBufferTicks: 5, symbolTickSize: 0.00001 }
+    });
+
+    expect(target?.id).toBe(correctedSsl.id);
+    expect(plan?.entry).toBe(0.08859);
+    expect(plan?.stopLoss).toBeCloseTo(0.0888, 12);
+    expect(plan?.takeProfit).toBe(0.0874);
+    expect(plan?.riskReward).toBeCloseTo((0.08859 - 0.0874) / (0.0888 - 0.08859), 12);
+    expect(evaluateRisk(riskInput({ entry: plan?.entry, stopLoss: plan?.stopLoss, takeProfit: plan?.takeProfit, minimumRiskReward: 1 })).rejectCode).not.toBe("RR_BELOW_MINIMUM");
   });
 });
 
@@ -675,6 +1034,34 @@ function testFvg(direction: Direction, lower: number, upper: number, id = `BTCUS
   };
 }
 
+function liquidityLevel(
+  type: LiquidityType,
+  price: number,
+  createdAt: number,
+  id = `${type}:${price}:${createdAt}`,
+  overrides: Partial<LiquidityLevel> = {}
+): LiquidityLevel {
+  return {
+    id,
+    type,
+    timeframe: "H1",
+    price,
+    candleIndex: createdAt,
+    createdAt,
+    active: true,
+    invalidated: false,
+    swept: false,
+    isPrimary: false,
+    isInternal: false,
+    children: [],
+    ...overrides
+  };
+}
+
+function liquidityState(levels: LiquidityLevel[], sweeps: ReturnType<LiquidityManager["render"]>["sweeps"] = []) {
+  return { levels, sweeps };
+}
+
 function entryConfig() {
   return {
     stopLossBufferMode: "ticks" as const,
@@ -695,6 +1082,8 @@ function riskInput(overrides: Partial<RiskInput> = {}): RiskInput {
     riskPerTradeUsdt: 50,
     maxLeverage: 125,
     maxMarginUsagePercent: 100,
+    marginMode: "ISOLATED",
+    liquidationSafetyBufferPercent: 0.5,
     entry: 100,
     stopLoss: 95,
     takeProfit: 110,
@@ -780,6 +1169,39 @@ function symbolRules(): FuturesSymbolRules {
     maxQty: 100,
     minNotional: 5,
     maxLeverage: 125,
+    maintenanceMarginBrackets: maintenanceBrackets(),
     supportedOrderTypes: ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
   };
+}
+
+function linkSymbolRules(): FuturesSymbolRules {
+  return {
+    ...symbolRules(),
+    symbol: "LINKUSDT",
+    pricePrecision: 3,
+    quantityPrecision: 2,
+    tickSize: 0.001,
+    stepSize: 0.01,
+    minQty: 0.01,
+    maxQty: 100000,
+    minNotional: 5,
+    maxLeverage: 75,
+    maintenanceMarginBrackets: [
+      { bracket: 1, initialLeverage: 75, notionalFloor: 0, notionalCap: 10_000, maintenanceMarginRatio: 0.0065, cumulativeMaintenanceAmount: 0 },
+      { bracket: 2, initialLeverage: 50, notionalFloor: 10_000, notionalCap: 50_000, maintenanceMarginRatio: 0.01, cumulativeMaintenanceAmount: 35 },
+      { bracket: 3, initialLeverage: 25, notionalFloor: 50_000, notionalCap: 250_000, maintenanceMarginRatio: 0.02, cumulativeMaintenanceAmount: 535 },
+      { bracket: 4, initialLeverage: 10, notionalFloor: 250_000, notionalCap: 1_000_000, maintenanceMarginRatio: 0.05, cumulativeMaintenanceAmount: 8035 },
+      { bracket: 5, initialLeverage: 5, notionalFloor: 1_000_000, notionalCap: 2_000_000, maintenanceMarginRatio: 0.1, cumulativeMaintenanceAmount: 58035 },
+      { bracket: 6, initialLeverage: 4, notionalFloor: 2_000_000, notionalCap: 5_000_000, maintenanceMarginRatio: 0.125, cumulativeMaintenanceAmount: 108035 },
+      { bracket: 7, initialLeverage: 3, notionalFloor: 5_000_000, notionalCap: 10_000_000, maintenanceMarginRatio: 0.15, cumulativeMaintenanceAmount: 233035 },
+      { bracket: 8, initialLeverage: 2, notionalFloor: 10_000_000, notionalCap: 9223372036854776000, maintenanceMarginRatio: 0.25, cumulativeMaintenanceAmount: 1233035 }
+    ]
+  };
+}
+
+function maintenanceBrackets() {
+  return [
+    { bracket: 1, notionalFloor: 0, notionalCap: 5_000, maintenanceMarginRatio: 0.004, cumulativeMaintenanceAmount: 0, initialLeverage: 125 },
+    { bracket: 2, notionalFloor: 5_000, notionalCap: 25_000, maintenanceMarginRatio: 0.005, cumulativeMaintenanceAmount: 5, initialLeverage: 75 }
+  ];
 }

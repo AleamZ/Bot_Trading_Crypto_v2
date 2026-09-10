@@ -1,5 +1,5 @@
 import type { AppConfig } from "../config/AppConfig.js";
-import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type SetupDiagnostic, type SymbolRulesProvider } from "../engine/TradingEngine.js";
+import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type CurrentUsedMarginProvider, type SetupDiagnostic, type SymbolRulesProvider } from "../engine/TradingEngine.js";
 import type { ExecutionGateway } from "../ports/ExecutionGateway.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { TradingRepository } from "../ports/Repositories.js";
@@ -33,7 +33,8 @@ export class MarketScanner {
     private readonly logger: DecisionLogger,
     private readonly marketData: BinanceFuturesMarketData,
     private readonly availableBalanceProvider: AvailableBalanceProvider | null,
-    private readonly symbolRulesProvider: SymbolRulesProvider | null = null
+    private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
+    private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null
   ) {
     for (const symbol of config.watchlist) {
       this.engines.set(symbol, this.createEngine(symbol));
@@ -162,7 +163,7 @@ export class MarketScanner {
 
   private createEngine(symbol: string): TradingEngine {
     const symbolConfig: AppConfig = { ...this.config, symbol };
-    const engine = new TradingEngine(symbolConfig, this.repository, this.execution, this.logger, this.availableBalanceProvider, this.symbolRulesProvider);
+    const engine = new TradingEngine(symbolConfig, this.repository, this.execution, this.logger, this.availableBalanceProvider, this.symbolRulesProvider, this.currentUsedMarginProvider);
     this.engines.set(symbol, engine);
     return engine;
   }

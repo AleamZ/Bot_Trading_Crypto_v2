@@ -866,7 +866,7 @@ describe("trading account HTTP flow", () => {
     await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "RESTART_KEY", apiSecret: "RESTART_SECRET" }, cookie);
     await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: true, killSwitch: false, watchlist: ["XRPUSDT"], symbol: "XRPUSDT" }, cookie);
     await accountRepository.updateTradingAccountStatus(account.id, "ERROR", new Date().toISOString());
-    FakeAccountClient.positionsByApiKey.set("RESTART_KEY", [fakePosition("XRPUSDT", "long")]);
+    FakeAccountClient.positionsByApiKey.set("RESTART_KEY", [{ ...fakePosition("XRPUSDT", "long"), stopLoss: 590, takeProfit: 620 }]);
     FakeAccountClient.openOrdersByApiKey.set("RESTART_KEY", [
       fakeProtectionOrder("XRPUSDT", "STOP_MARKET", "smc_restart_S", "stop-1"),
       fakeProtectionOrder("XRPUSDT", "TAKE_PROFIT_MARKET", "smc_restart_T", "tp-1")

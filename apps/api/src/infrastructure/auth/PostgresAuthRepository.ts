@@ -1,5 +1,5 @@
 import pg from "pg";
-import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { getPostgresPool, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { AuthRepository } from "../../application/auth/AuthRepository.js";
 import { DuplicateEmailError } from "../../application/auth/AuthRepository.js";
@@ -157,9 +157,7 @@ export async function createAuthRepository(databaseUrl?: string): Promise<AuthRe
   if (!databaseUrl) return new MemoryAuthRepository();
 
   const repository = new PostgresAuthRepository(databaseUrl);
-  await repository.migrate().catch((error: unknown) => {
-    console.warn(`[postgres] auth migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  await withPostgresStartupRetry("auth repository migration", () => repository.migrate());
   return repository;
 }
 

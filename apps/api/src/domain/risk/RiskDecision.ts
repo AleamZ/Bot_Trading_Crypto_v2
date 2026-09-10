@@ -9,6 +9,8 @@ export interface RiskInput {
   riskPerTradeUsdt: number;
   maxLeverage: number;
   maxMarginUsagePercent: number;
+  maxTotalMarginUsagePercent?: number;
+  currentUsedMargin?: number;
   marginMode: "CROSS" | "ISOLATED";
   liquidationSafetyBufferPercent: number;
   entry: number;
@@ -56,6 +58,11 @@ export interface RiskDecision {
   availableBalance: number;
   maxAllowedMargin: number;
   marginUsagePercent: number;
+  currentUsedMargin: number;
+  candidateRequiredMargin: number;
+  projectedTotalMargin: number;
+  totalMarginUsagePercent: number;
+  maxTotalMarginUsagePercent: number;
   maintenanceMarginRate: number | null;
   maintenanceMarginAmount: number | null;
   maintenanceMarginBracket: {
@@ -85,6 +92,7 @@ export type RiskRejectCode =
   | "MAX_QTY"
   | "MARGIN_REQUIREMENT"
   | "MAX_MARGIN_USAGE_EXCEEDED"
+  | "MAX_TOTAL_MARGIN_USAGE_EXCEEDED"
   | "MIN_NOTIONAL"
   | "REQUIRED_LEVERAGE_EXCEEDS_MAX"
   | "RR_BELOW_MINIMUM"

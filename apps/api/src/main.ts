@@ -15,7 +15,7 @@ import { createTradingAccountRepository } from "./infrastructure/trading-account
 import { createTradingRuntimeConfigRepository } from "./infrastructure/trading-account/PostgresTradingRuntimeConfigRepository.js";
 import { createExecutionIntentRepository } from "./infrastructure/execution/PostgresExecutionIntentRepository.js";
 import { createRealExecutionProposalRepository } from "./infrastructure/execution/PostgresRealExecutionProposalRepository.js";
-import { closeAllPostgresPools } from "./infrastructure/persistence/PgPoolFactory.js";
+import { closeAllPostgresPools, verifyPostgresConnection } from "./infrastructure/persistence/PgPoolFactory.js";
 import { startHttpServer } from "./presentation/http/Server.js";
 
 let config = loadConfig();
@@ -95,7 +95,7 @@ const server = startHttpServer({
   buildInfo,
   readinessCheck: async () => {
     if (!config.databaseUrl) return true;
-    await repository.getDashboardSnapshot();
+    await verifyPostgresConnection(config.databaseUrl);
     return true;
   }
 });

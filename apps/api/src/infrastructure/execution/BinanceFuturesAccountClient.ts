@@ -415,7 +415,7 @@ function groupOrdersBySymbol(orders: OpenOrder[]): Map<string, OpenOrder[]> {
 function findTriggerPrice(orders: OpenOrder[], type: "STOP_MARKET" | "TAKE_PROFIT_MARKET", exitSide: BinanceExitSide): number | null {
   const candidates = orders.filter((order) => order.type === type && order.side === exitSide);
   const protectedCandidates = candidates.filter((order) => isTrue(order.reduceOnly) || isTrue(order.closePosition));
-  const order = protectedCandidates[0] ?? candidates[0] ?? orders.find((item) => item.type === type);
+  const order = protectedCandidates[0];
   const price = Number(order?.stopPrice ?? order?.price ?? 0);
   return price > 0 ? price : null;
 }

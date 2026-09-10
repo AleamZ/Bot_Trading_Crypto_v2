@@ -36,6 +36,7 @@ export interface EngineState {
 }
 
 export type AvailableBalanceProvider = () => Promise<number | null>;
+export type CurrentUsedMarginProvider = () => Promise<number | null>;
 export type SymbolRulesProvider = (symbol: string) => Promise<FuturesSymbolRules>;
 
 export interface SetupEvidence {
@@ -75,6 +76,7 @@ export class TradingEngine {
     private readonly logger: DecisionLogger,
     private readonly availableBalanceProvider: AvailableBalanceProvider | null = null,
     private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
+    private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null,
     initialBalance = 10_000
   ) {
     this.events = new EventBus(repository, logger);
@@ -140,6 +142,8 @@ export class TradingEngine {
       requiredMargin: 0,
       maxLeverage: this.config.maxLeverage,
       maxMarginUsagePercent: this.config.maxMarginUsagePercent,
+      maxTotalMarginUsagePercent: this.config.maxTotalMarginUsagePercent,
+      currentUsedMargin: 0,
       marginMode: this.config.marginMode,
       liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
       positionSize: position.entryPrice * position.quantity,
@@ -156,6 +160,9 @@ export class TradingEngine {
       availableBalance: this.state.balance,
       maxAllowedMargin: 0,
       marginUsagePercent: 0,
+      candidateRequiredMargin: 0,
+      projectedTotalMargin: 0,
+      totalMarginUsagePercent: 0,
       maintenanceMarginRate: null,
       maintenanceMarginAmount: null,
       maintenanceMarginBracket: null,
@@ -415,6 +422,7 @@ export class TradingEngine {
     this.state.setupEvidence.entryPlan = plan;
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "ReadyToEnter");
     const availableBalance = await this.getAvailableBalance();
+    const currentUsedMargin = this.currentUsedMarginProvider ? await this.currentUsedMarginProvider() : 0;
     const symbolRules = await this.getSymbolRules();
     const risk = evaluateRisk({
       symbol: this.config.symbol,
@@ -424,6 +432,8 @@ export class TradingEngine {
       riskPerTradeUsdt: this.config.riskPerTradeUsdt,
       maxLeverage: this.config.maxLeverage,
       maxMarginUsagePercent: this.config.maxMarginUsagePercent,
+      maxTotalMarginUsagePercent: this.config.maxTotalMarginUsagePercent,
+      currentUsedMargin: currentUsedMargin ?? 0,
       marginMode: this.config.marginMode,
       liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
       entry: plan.entry,

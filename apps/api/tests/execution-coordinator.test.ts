@@ -742,6 +742,38 @@ describe("TradingReconciliationService", () => {
     expect(saved?.status).toBe("PROTECTED");
   });
 
+  it("treats stale persisted protection IDs as missing and repairs from current Binance state", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-stale");
+    await repository.transitionStatus(intent.id, ["ENTRY_FILLED"], "PROTECTED", {
+      binanceStopOrderId: "stale-stop",
+      binanceTakeProfitOrderId: "stale-tp"
+    });
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    await service.reconcile("account-stale", activityWithPosition(intent, []), gateway);
+
+    expect(gateway.protectionRequests.map((request) => request.clientOrderId)).toEqual([
+      intent.clientStopOrderId,
+      intent.clientTakeProfitOrderId
+    ]);
+    expect((await repository.listByAccount("account-stale"))[0]?.status).toBe("PROTECTED");
+  });
+
+  it("marks repeated failed protection repair as fail-safe close required", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-failsafe");
+    const gateway = new BlockingRecoverableGateway("RUNTIME_NOT_READY");
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await service.reconcile("account-failsafe", activityWithPosition(intent, []), gateway);
+    }
+
+    expect((await repository.listByAccount("account-failsafe"))[0]?.status).toBe("FAIL_SAFE_CLOSE_REQUIRED");
+  });
+
   it("closes intents when Binance position is gone and cancels only bot-owned stale protection", async () => {
     const repository = new MemoryExecutionIntentRepository();
     const intent = await seedFilledIntent(repository, "account-a");

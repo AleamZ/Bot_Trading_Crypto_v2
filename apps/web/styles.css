@@ -761,6 +761,68 @@ input {
   gap: 12px;
 }
 
+#settings-view[data-settings-mode="basic"] .settings-advanced,
+#settings-view[data-settings-mode="basic"] .advanced-setting {
+  display: none;
+}
+
+#settings-view[data-settings-mode="advanced"] .settings-basic {
+  display: none;
+}
+
+#settings-view[data-settings-mode="advanced"] .basic-setting {
+  display: none;
+}
+
+.settings-mode-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.settings-mode-tab {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  padding: 0 12px;
+  font: inherit;
+  font-weight: 800;
+}
+
+.settings-mode-tab.active {
+  background: var(--ink);
+  color: #fff;
+}
+
+.risk-summary {
+  margin-bottom: 16px;
+}
+
+.risk-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.risk-summary-grid span {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.risk-summary-grid small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.risk-summary-grid strong {
+  font-size: 17px;
+}
+
 .setting-card {
   min-height: 130px;
 }

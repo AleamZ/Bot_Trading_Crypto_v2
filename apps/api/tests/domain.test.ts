@@ -317,6 +317,16 @@ describe("risk and state", () => {
     expect(evaluateRisk(riskInput({ openPositions: 3, maxOpenPositions: 3, symbolOpenPositions: 0 }))).toMatchObject({ rejectCode: "MAX_OPEN_POSITIONS" });
   });
 
+  it("enforces the account portfolio margin cap independently from per-trade margin", () => {
+    const under = evaluateRisk(riskInput({ riskPerTradeUsdt: 0.5, maxTotalMarginUsagePercent: 60, currentUsedMargin: 500, maxMarginUsagePercent: 100 }));
+    const atBoundary = evaluateRisk(riskInput({ riskPerTradeUsdt: 0.5, maxTotalMarginUsagePercent: 60, currentUsedMargin: 590, maxMarginUsagePercent: 100 }));
+    const over = evaluateRisk(riskInput({ riskPerTradeUsdt: 0.5, maxTotalMarginUsagePercent: 60, currentUsedMargin: 600, maxMarginUsagePercent: 100 }));
+
+    expect(under).toMatchObject({ accepted: true, currentUsedMargin: 500, candidateRequiredMargin: 10, projectedTotalMargin: 510 });
+    expect(atBoundary).toMatchObject({ accepted: true, totalMarginUsagePercent: 60 });
+    expect(over).toMatchObject({ accepted: false, rejectCode: "MAX_TOTAL_MARGIN_USAGE_EXCEEDED" });
+  });
+
   it("risk per trade changes quantity without moving entry, SL or HTF TP", () => {
     const base = riskInput({ riskPerTradeUsdt: 50 });
     const larger = riskInput({ riskPerTradeUsdt: 100 });
@@ -862,6 +872,13 @@ describe("trading settings", () => {
   it("rejects invalid trading settings", () => {
     expect(() => validateTradingSettings({ ...defaultTradingSettings, maxLeverage: 0 })).toThrow();
     expect(() => validateTradingSettings({ ...defaultTradingSettings, tradingEnabled: true, watchlist: [] })).toThrow();
+  });
+
+  it("defaults and validates total margin usage without changing legacy settings", () => {
+    expect(defaultTradingSettings.maxTotalMarginUsagePercent).toBe(60);
+    expect(validateTradingSettings({ ...defaultTradingSettings }).maxTotalMarginUsagePercent).toBe(60);
+    expect(() => validateTradingSettings({ ...defaultTradingSettings, maxTotalMarginUsagePercent: 0 })).toThrow();
+    expect(() => validateTradingSettings({ ...defaultTradingSettings, maxTotalMarginUsagePercent: 101 })).toThrow();
   });
 });
 

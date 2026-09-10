@@ -34,6 +34,7 @@ const defaultSettings = {
   riskPerTradeUsdt: "20",
   maxLeverage: "125",
   maxMarginUsagePercent: "20",
+  maxTotalMarginUsagePercent: "60",
   liquidationSafetyBufferPercent: "0.5",
   marginMode: "ISOLATED",
   entryMode: "market",
@@ -603,8 +604,11 @@ async function load() {
     ? ` · Mode ${realReadiness.realExecutionMode} · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"} · Master Live Execution ${realReadiness.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER"} · Execution LOCKED · ${realReadiness.executionReason}`
     : "";
   const reconciliationError = runtimeHealth.lastReconciliationError ? ` · Error ${runtimeHealth.lastReconciliationError}` : "";
+  const protectionStatus = runtimeHealth.protectionStatus && runtimeHealth.protectionStatus !== "OK"
+    ? ` · Protection ${runtimeHealth.protectionStatus} · Repair attempts ${runtimeHealth.protectionRepairAttempts ?? 0}${runtimeHealth.protectionLastError ? ` · ${runtimeHealth.protectionLastError}` : ""}`
+    : " · Protection PROTECTED/VERIFIED";
   $("engine-detail").textContent =
-    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${executionLabel}${executionReason}${readinessText}${reconciliationError} · Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`;
+    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${executionLabel}${executionReason}${readinessText}${reconciliationError}${protectionStatus} · Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`;
   $("daily-entry-status").textContent = dailyRisk ? dailyEntryStatusLabel(dailyRisk) : "-";
   $("daily-risk-detail").textContent = dailyRisk
     ? `Today Realized PnL: ${formatSignedNumber(dailyRisk.realizedR)}R (${formatSignedUsdt(dailyRisk.realizedPnlUsdt)}) · Daily Range: -${dailyRisk.dailyLossLimitR}R → +${dailyRisk.dailyProfitLimitR}R`
@@ -907,6 +911,7 @@ $("selected-watchlist").addEventListener("click", (event) => {
 });
 $("setting-max-leverage").addEventListener("input", updateSettingFromInput);
 $("setting-max-margin-usage").addEventListener("input", updateSettingFromInput);
+$("setting-max-total-margin-usage").addEventListener("input", updateSettingFromInput);
 $("setting-max-open-positions").addEventListener("input", updateSettingFromInput);
 $("setting-max-position-per-symbol").addEventListener("input", updateSettingFromInput);
 $("setting-minimum-rr").addEventListener("input", updateSettingFromInput);
@@ -929,6 +934,13 @@ document.querySelectorAll("[data-setting-group]").forEach((group) => {
     settingsState[group.dataset.settingGroup] = button.dataset.settingValue;
     renderSettings();
     saveSettings();
+  });
+});
+document.querySelectorAll("[data-settings-mode]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const mode = button.dataset.settingsMode;
+    $("settings-view").dataset.settingsMode = mode;
+    document.querySelectorAll("[data-settings-mode]").forEach((item) => item.classList.toggle("active", item === button));
   });
 });
 function showView(view) {
@@ -1160,6 +1172,8 @@ function formatRiskDecisionDetail(decision) {
     `Required Margin ${formatUsdt(decision.requiredMargin ?? decision.margin)}`,
     `Max Allowed Margin ${formatUsdt(decision.maxAllowedMargin)}`,
     `Margin Usage ${formatRatio(decision.marginUsagePercent)}% / ${formatRatio(decision.maxMarginUsagePercent)}%`,
+    `Portfolio Margin ${formatUsdt(decision.currentUsedMargin)} + ${formatUsdt(decision.candidateRequiredMargin)} = ${formatUsdt(decision.projectedTotalMargin)}`,
+    `Total Margin Usage ${formatRatio(decision.totalMarginUsagePercent)}% / ${formatRatio(decision.maxTotalMarginUsagePercent)}%`,
     `Maintenance Margin ${formatUsdt(decision.maintenanceMarginAmount)}`,
     `Maintenance Bracket ${formatMaintenanceBracket(decision.maintenanceMarginBracket)}`,
     `Maintenance Margin Ratio ${formatRatio((decision.maintenanceMarginRate ?? 0) * 100)}%`,
@@ -1248,6 +1262,7 @@ function renderSettings() {
   $("setting-risk-per-trade").value = settingsState.riskPerTradeUsdt;
   $("setting-max-leverage").value = settingsState.maxLeverage;
   $("setting-max-margin-usage").value = settingsState.maxMarginUsagePercent;
+  $("setting-max-total-margin-usage").value = settingsState.maxTotalMarginUsagePercent;
   $("setting-max-open-positions").value = settingsState.maxOpenPositions;
   $("setting-max-position-per-symbol").value = settingsState.maxPositionPerSymbol;
   $("setting-minimum-rr").value = settingsState.minimumRiskReward;
@@ -1264,6 +1279,7 @@ function renderSettings() {
   $("setting-displacement-body").value = settingsState.displacementBodyMultiplier;
   $("setting-displacement-lookback").value = settingsState.displacementLookback;
   updateConditionalSettingVisibility();
+  renderRiskSummary();
 
   document.querySelectorAll("[data-setting-group]").forEach((group) => {
     const value = settingsState[group.dataset.settingGroup];
@@ -1271,6 +1287,16 @@ function renderSettings() {
       button.classList.toggle("active", button.dataset.settingValue === value);
     });
   });
+}
+
+function renderRiskSummary() {
+  $("summary-risk").textContent = formatUsdt(settingsState.riskPerTradeUsdt);
+  $("summary-daily-loss").textContent = `-${formatUsdt(Number(settingsState.riskPerTradeUsdt) * Number(settingsState.dailyLossLimitR))}`;
+  $("summary-daily-profit").textContent = `+${formatUsdt(Number(settingsState.riskPerTradeUsdt) * Number(settingsState.dailyProfitLimitR))}`;
+  $("summary-rr").textContent = settingsState.minimumRiskReward;
+  $("summary-positions").textContent = settingsState.maxOpenPositions;
+  $("summary-margin-mode").textContent = settingsState.marginMode;
+  $("settings-risk-summary-note").textContent = "Tighter SL creates a larger position; wider SL creates a smaller position. Approximate loss at SL remains 1R.";
 }
 
 function renderRealSafety() {
@@ -1502,6 +1528,7 @@ function settingsFromApi(settings) {
     riskPerTradeUsdt: String(settings.riskPerTradeUsdt ?? defaultSettings.riskPerTradeUsdt),
     maxLeverage: String(settings.maxLeverage ?? defaultSettings.maxLeverage),
     maxMarginUsagePercent: String(settings.maxMarginUsagePercent ?? defaultSettings.maxMarginUsagePercent),
+    maxTotalMarginUsagePercent: String(settings.maxTotalMarginUsagePercent ?? defaultSettings.maxTotalMarginUsagePercent),
     liquidationSafetyBufferPercent: String(settings.liquidationSafetyBufferPercent ?? defaultSettings.liquidationSafetyBufferPercent),
     marginMode: String(settings.marginMode ?? defaultSettings.marginMode),
     entryMode: String(settings.entryMode ?? defaultSettings.entryMode),
@@ -1537,6 +1564,7 @@ function settingsPayload() {
     riskPerTradeUsdt: settingNumber("riskPerTradeUsdt"),
     maxLeverage: settingNumber("maxLeverage"),
     maxMarginUsagePercent: settingNumber("maxMarginUsagePercent"),
+    maxTotalMarginUsagePercent: settingNumber("maxTotalMarginUsagePercent"),
     liquidationSafetyBufferPercent: settingNumber("liquidationSafetyBufferPercent"),
     marginMode: settingsState.marginMode,
     entryMode: settingsState.entryMode,
@@ -1575,6 +1603,7 @@ const settingFieldByInputId = {
   "setting-risk-per-trade": "riskPerTradeUsdt",
   "setting-max-leverage": "maxLeverage",
   "setting-max-margin-usage": "maxMarginUsagePercent",
+  "setting-max-total-margin-usage": "maxTotalMarginUsagePercent",
   "setting-liquidation-safety-buffer": "liquidationSafetyBufferPercent",
   "setting-max-open-positions": "maxOpenPositions",
   "setting-max-position-per-symbol": "maxPositionPerSymbol",
@@ -1597,6 +1626,7 @@ const numericSettingRules = {
   riskPerTradeUsdt: { id: "setting-risk-per-trade", label: "Risk per Trade", min: 0, exclusiveMin: true },
   maxLeverage: { id: "setting-max-leverage", label: "Max Leverage", min: 1, max: 125, integer: true },
   maxMarginUsagePercent: { id: "setting-max-margin-usage", label: "Max Margin Usage", min: 0, exclusiveMin: true, max: 100 },
+  maxTotalMarginUsagePercent: { id: "setting-max-total-margin-usage", label: "Max Total Margin Usage", min: 0, exclusiveMin: true, max: 100 },
   maxOpenPositions: { id: "setting-max-open-positions", label: "Max Open Positions", min: 1, integer: true },
   maxPositionPerSymbol: { id: "setting-max-position-per-symbol", label: "Max Position Per Symbol", min: 1, max: 1, integer: true },
   minimumRiskReward: { id: "setting-minimum-rr", label: "Minimum R/R", min: 0, exclusiveMin: true },

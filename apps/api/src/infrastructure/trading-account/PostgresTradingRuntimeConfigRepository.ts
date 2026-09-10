@@ -1,6 +1,6 @@
 import pg from "pg";
 import crypto from "node:crypto";
-import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { getPostgresPool, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import { validateTradingSettings, type TradingSettings } from "../../application/config/AppConfig.js";
 import type { AccountProtectionState } from "../../application/risk/AccountProtectionService.js";
@@ -183,8 +183,6 @@ export class PostgresTradingRuntimeConfigRepository implements TradingRuntimeCon
 export async function createTradingRuntimeConfigRepository(databaseUrl?: string): Promise<TradingRuntimeConfigRepository> {
   if (!databaseUrl) return new MemoryTradingRuntimeConfigRepository();
   const repository = new PostgresTradingRuntimeConfigRepository(databaseUrl);
-  await repository.migrate().catch((error: unknown) => {
-    console.warn(`[postgres] runtime config migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  await withPostgresStartupRetry("runtime config repository migration", () => repository.migrate());
   return repository;
 }

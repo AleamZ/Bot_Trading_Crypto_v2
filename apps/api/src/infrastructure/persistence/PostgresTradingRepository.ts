@@ -1,5 +1,5 @@
 import pg from "pg";
-import { getPostgresPool } from "./PgPoolFactory.js";
+import { getPostgresPool, withPostgresStartupRetry } from "./PgPoolFactory.js";
 import { recordSchemaMigration } from "./SchemaMigrations.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
 import type { DomainEvent } from "../../domain/events/DomainEvent.js";
@@ -151,14 +151,10 @@ export async function createRepository(databaseUrl?: string): Promise<TradingRep
 
   try {
     const repository = new PostgresTradingRepository(databaseUrl);
-    await repository.migrate();
+    await withPostgresStartupRetry("trading repository migration", () => repository.migrate());
     return repository;
   } catch (error) {
-    return new MemoryTradingRepository({
-      database: "memory",
-      connected: true,
-      reason: `Postgres unavailable; using memory fallback: ${sanitizeDatabaseError(error)}`
-    });
+    throw new Error(`Postgres trading repository initialization failed: ${sanitizeDatabaseError(error)}`, { cause: error });
   }
 }
 

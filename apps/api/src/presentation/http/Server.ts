@@ -728,9 +728,17 @@ async function handleTradingAccountRoute(params: {
       return;
     }
     const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol) : null;
-    const symbolRules = runtimeManager ? await runtimeManager.getSymbolRules(accountId, symbol).catch(() => null) : null;
+    const riskInputs = runtimeManager ? await runtimeManager.getRiskInputs(accountId, symbol).catch(() => null) : null;
+    const symbolRules = riskInputs?.symbolRules ?? (runtimeManager ? await runtimeManager.getSymbolRules(accountId, symbol).catch(() => null) : null);
     const analysis = await buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, marketDataForAccount(account, marketData), diagnostic, {
-      symbolTickSize: symbolRules?.tickSize ?? 0.1
+      symbolTickSize: symbolRules?.tickSize ?? 0.1,
+      riskInputs: riskInputs ? {
+        availableBalance: riskInputs.availableBalance,
+        currentUsedMargin: riskInputs.currentUsedMargin,
+        openPositions: riskInputs.positions.length,
+        symbolOpenPositions: riskInputs.positions.filter((position) => position.symbol === symbol).length,
+        symbolRules: riskInputs.symbolRules
+      } : null
     });
     const dailyRisk = runtimeManager ? await runtimeManager.getDailyRiskStatus(accountId) : null;
     const accountProtection = runtimeManager ? await runtimeManager.getAccountProtectionStatus(accountId) : null;
@@ -1177,7 +1185,16 @@ export async function buildSymbolAnalysis(
   config: AppConfig,
   marketData: BinanceFuturesMarketData,
   canonicalSetup: SetupDiagnostic | null = null,
-  options: { symbolTickSize?: number } = {}
+  options: {
+    symbolTickSize?: number;
+    riskInputs?: {
+      availableBalance: number;
+      currentUsedMargin: number;
+      openPositions: number;
+      symbolOpenPositions: number;
+      symbolRules: import("../../domain/symbol/SymbolRules.js").FuturesSymbolRules;
+    } | null;
+  } = {}
 ): Promise<{
   symbol: string;
   checkedAt: string;
@@ -1212,7 +1229,7 @@ export async function buildSymbolAnalysis(
       : buildAnalysisLifecycle(symbol, h1Candles, m5Candles, config, options.symbolTickSize ?? 0.1);
   const analysisSource = canonicalSetup?.symbol === symbol && canonicalSetup.setupKey ? "runtime" : "diagnostic-fallback";
   const conditions = buildLifecycleConditions(setup, config);
-  const riskManagement = buildAnalysisRiskManagement(setup, config);
+  const riskManagement = buildAnalysisRiskManagement(setup, config, options.riskInputs ?? null);
 
   return {
     symbol,
@@ -1585,7 +1602,13 @@ function statusFor(setup: AnalysisSetupContext, conditionId: string): AnalysisSt
   return "WAITING";
 }
 
-function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppConfig): {
+function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppConfig, riskInputs: {
+  availableBalance: number;
+  currentUsedMargin: number;
+  openPositions: number;
+  symbolOpenPositions: number;
+  symbolRules: import("../../domain/symbol/SymbolRules.js").FuturesSymbolRules;
+} | null): {
   final: "WAITING_FOR_STRATEGY" | "READY_TO_TRADE" | "BLOCKED";
   reason: string | null;
   checks: AnalysisRiskCheck[];
@@ -1606,42 +1629,34 @@ function buildAnalysisRiskManagement(setup: AnalysisSetupContext, config: AppCon
     };
   }
 
-  const availableBalance = 10_000;
+  if (!riskInputs) {
+    return {
+      final: "BLOCKED",
+      reason: "RISK_DATA_UNAVAILABLE",
+      checks: [riskCheck("account-risk-data", "Account Risk Data", "INVALIDATED", "Live account balance, positions, or maintenance brackets are unavailable")],
+      decision: null
+    };
+  }
+
   const decision = evaluateRisk({
     symbol: setup.id,
     direction: setup.plan.direction,
-    availableBalance,
-    symbolRules: {
-      symbol: setup.id,
-      status: "TRADING",
-      contractType: null,
-      quoteAsset: "USDT",
-      marginAsset: "USDT",
-      pricePrecision: null,
-      quantityPrecision: null,
-      tickSize: 0.1,
-      minPrice: null,
-      maxPrice: null,
-      stepSize: 0.001,
-      minQty: 0,
-      maxQty: null,
-      minNotional: null,
-      maxLeverage: config.maxLeverage,
-      maintenanceMarginBrackets: [],
-      supportedOrderTypes: ["MARKET", "LIMIT"]
-    },
-	    riskPerTradeUsdt: config.riskPerTradeUsdt,
-	    maxLeverage: config.maxLeverage,
-	    maxMarginUsagePercent: config.maxMarginUsagePercent,
-	    marginMode: config.marginMode,
+    availableBalance: riskInputs.availableBalance,
+    currentUsedMargin: riskInputs.currentUsedMargin,
+    symbolRules: riskInputs.symbolRules,
+	riskPerTradeUsdt: config.riskPerTradeUsdt,
+	maxLeverage: config.maxLeverage,
+	maxMarginUsagePercent: config.maxMarginUsagePercent,
+	maxTotalMarginUsagePercent: config.maxTotalMarginUsagePercent,
+	marginMode: config.marginMode,
 	    liquidationSafetyBufferPercent: config.liquidationSafetyBufferPercent,
     entry: setup.plan.entry,
     stopLoss: setup.plan.stopLoss,
     takeProfit: setup.plan.takeProfit,
     minimumRiskReward: config.minimumRiskReward,
-    openPositions: 0,
+    openPositions: riskInputs.openPositions,
     maxOpenPositions: config.maxOpenPositions,
-    symbolOpenPositions: 0,
+    symbolOpenPositions: riskInputs.symbolOpenPositions,
     maxPositionPerSymbol: config.maxPositionPerSymbol,
     availableAt: Date.now(),
     drawdownPercent: 0,

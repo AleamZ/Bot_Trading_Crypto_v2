@@ -45,9 +45,18 @@ export interface ProtectionOrderRequest {
   clientOrderId: string;
 }
 
+export interface EmergencyCloseRequest {
+  symbol: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  clientOrderId: string;
+}
+
 export interface RecoverableExecutionGateway extends ExecutionGateway {
   findOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<ExecutionOrderLookupResult | null>;
+  findProtectionOrder?(symbol: string, type: ProtectionOrderRequest["type"], side: ProtectionOrderRequest["side"], clientOrderId: string): Promise<ExecutionOrderLookupResult | null>;
   submitProtectionOrder(request: ProtectionOrderRequest): Promise<ExecutionOrderLookupResult>;
+  closePosition?(request: EmergencyCloseRequest): Promise<ExecutionOrderLookupResult>;
   cancelOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<void>;
 }
 

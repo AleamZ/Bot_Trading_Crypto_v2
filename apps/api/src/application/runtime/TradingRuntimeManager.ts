@@ -41,6 +41,7 @@ import { fingerprintProposal, type RealExecutionProposal } from "../execution/Re
 import { UnsafeTradingAccountDeletionError } from "../trading-account/TradingAccountService.js";
 import { calculateDailyRiskStatus, type DailyRiskStatus } from "../risk/DailyRiskService.js";
 import { updateAccountProtectionState, type AccountProtectionStatus } from "../risk/AccountProtectionService.js";
+import { withPostgresStartupRetry } from "../../infrastructure/persistence/PgPoolFactory.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -67,6 +68,9 @@ export interface RuntimeHealth {
   executionFailed: number;
   reconciliationSuccess: number;
   reconciliationFailure: number;
+  protectionStatus: "OK" | "PROTECTION_INCOMPLETE";
+  protectionLastError: string | null;
+  protectionRepairAttempts: number;
 }
 
 export interface AccountActivitySnapshot {
@@ -198,11 +202,11 @@ export class TradingRuntimeManager {
 
   private async createRuntime(accountId: string): Promise<AccountRuntime> {
     if (this.deletingAccounts.has(accountId)) throw new Error("ACCOUNT_REMOVING");
-    const account = await this.accountRepository.findTradingAccountById(accountId);
+    const account = await this.retryDatabaseRead("account lookup", () => this.accountRepository.findTradingAccountById(accountId));
     if (!account) throw new Error("ACCOUNT_NOT_FOUND");
     await this.configRepository.ensureDefaults(account.id, this.baseConfig);
-    const settings = (await this.configRepository.getSettings(account.id)) ?? this.baseConfig;
-    const watchlist = await this.configRepository.getWatchlist(account.id);
+    const settings = (await this.retryDatabaseRead("runtime settings lookup", () => this.configRepository.getSettings(account.id))) ?? this.baseConfig;
+    const watchlist = await this.retryDatabaseRead("runtime watchlist lookup", () => this.configRepository.getWatchlist(account.id));
     const config = { ...this.baseConfig, ...settings, watchlist, symbol: watchlist[0] ?? settings.symbol };
     const configRef: RuntimeConfigRef = { current: config };
     const repository = await this.createRuntimeTradingRepository(account.id);
@@ -256,7 +260,16 @@ export class TradingRuntimeManager {
         const status = client?.getWalletStatus ? await client.getWalletStatus() : null;
         return status?.connected ? status.availableBalance : null;
       },
-      (symbol) => this.getSymbolRules(account.id, symbol)
+      (symbol) => this.getSymbolRules(account.id, symbol),
+      async () => {
+        const client = await this.createAccountClient(account.id);
+        if (!client) return null;
+        const positions = await client.getOpenPositions();
+        const margins = positions.map((position) => position.margin);
+        return margins.every((margin) => margin !== null && Number.isFinite(margin))
+          ? margins.reduce<number>((total, margin) => total + (margin === null ? 0 : margin), 0)
+          : null;
+      }
     );
     const reconciliation = new TradingReconciliationService(this.executionIntentRepository, this.logger);
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
@@ -277,21 +290,9 @@ export class TradingRuntimeManager {
 
   private async createRuntimeTradingRepository(accountId: string): Promise<TradingRepository> {
     if (!this.databaseUrl) return new MemoryTradingRepository();
-    try {
-      const repository = new PostgresTradingRepository(this.databaseUrl, accountId);
-      await repository.migrate();
-      return repository;
-    } catch (error) {
-      this.logger.warn("[RUNTIME] trading record repository unavailable; using memory fallback", {
-        tradingAccountId: accountId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return new MemoryTradingRepository({
-        database: "memory",
-        connected: true,
-        reason: "Trading record repository unavailable during runtime recovery"
-      });
-    }
+    const repository = new PostgresTradingRepository(this.databaseUrl, accountId);
+    await withPostgresStartupRetry("runtime trading repository migration", () => repository.migrate());
+    return repository;
   }
 
   private startScannerBootstrap(runtime: AccountRuntime): void {
@@ -331,7 +332,11 @@ export class TradingRuntimeManager {
 
   async disableExecution(accountId: string): Promise<void> {
     const runtime = this.runtimes.get(accountId);
-    if (runtime?.reconciliationTimer) clearInterval(runtime.reconciliationTimer);
+    if (runtime) {
+      runtime.scanner.stop();
+      if (runtime.reconciliationTimer) clearInterval(runtime.reconciliationTimer);
+      await Promise.allSettled([runtime.reconciliationInFlight, runtime.scannerBootstrapInFlight].filter((task): task is Promise<void> | Promise<ReconciliationResult> => task !== null));
+    }
     this.runtimes.delete(accountId);
     this.runtimeLoads.delete(accountId);
   }
@@ -349,6 +354,7 @@ export class TradingRuntimeManager {
         if (runtime.reconciliationTimer) clearInterval(runtime.reconciliationTimer);
         runtime.reconciliationTimer = null;
         runtime.scanner.stop();
+        await Promise.allSettled([runtime.reconciliationInFlight, runtime.scannerBootstrapInFlight].filter((task): task is Promise<void> | Promise<ReconciliationResult> => task !== null));
       }
       this.runtimeLoads.delete(accountId);
     } catch (error) {
@@ -379,7 +385,9 @@ export class TradingRuntimeManager {
       runtime.reconciliationTimer = null;
       runtime.scanner.stop();
     }
-    await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.reconciliationInFlight));
+    await Promise.allSettled(
+      [...this.runtimes.values()].flatMap((runtime) => [runtime.reconciliationInFlight, runtime.scannerBootstrapInFlight].filter((task): task is Promise<void> | Promise<ReconciliationResult> => task !== null))
+    );
     this.runtimes.clear();
     this.runtimeLoads.clear();
   }
@@ -392,7 +400,7 @@ export class TradingRuntimeManager {
     const accountProtection = await this.getAccountProtectionStatus(accountId);
     return {
       engine: runtime.scanner.getPrimaryEngine().getDashboardState(),
-      store: await runtime.repository.getDashboardSnapshot(),
+      store: await this.retryDatabaseRead("runtime dashboard snapshot", () => runtime.repository.getDashboardSnapshot()),
       watchlistStatus: reconcileWatchlistStatus(runtime.scanner.getWatchlistStatus(), runtime.lastPositions, runtime.configRef.current.executionMode),
       runtimeHealth: { ...runtime.health },
       execution,
@@ -463,6 +471,30 @@ export class TradingRuntimeManager {
       await this.auditRealEvent(account.id, symbol, "REAL_SYMBOL_RULES_LOADED", { status: rules.status, maxLeverage: rules.maxLeverage });
     }
     return rules;
+  }
+
+  async getRiskInputs(accountId: string, symbol: string): Promise<{
+    availableBalance: number;
+    currentUsedMargin: number;
+    positions: BinanceFuturesPositionStatus[];
+    symbolRules: FuturesSymbolRules;
+  } | null> {
+    const client = await this.createAccountClient(accountId);
+    if (!client?.getWalletStatus) return null;
+    const [wallet, positions, symbolRules] = await Promise.all([
+      client.getWalletStatus(),
+      client.getOpenPositions(),
+      this.getSymbolRules(accountId, symbol)
+    ]);
+    if (!wallet.connected || wallet.availableBalance === null) return null;
+    const margins = positions.map((position) => position.margin);
+    if (margins.some((margin) => margin === null || !Number.isFinite(margin))) return null;
+    return {
+      availableBalance: wallet.availableBalance,
+      currentUsedMargin: margins.reduce<number>((total, margin) => total + (margin === null ? 0 : margin), 0),
+      positions,
+      symbolRules
+    };
   }
 
   async getRealReadiness(accountId: string, requestedSymbol?: string): Promise<RealTradingReadinessResult> {
@@ -710,7 +742,7 @@ export class TradingRuntimeManager {
 
   private async createExecutionGateway(account: TradingAccount, entryMode: "limit" | "market", leverage: number): Promise<ExecutionGateway> {
     if (account.mode === "REAL") return new LockedRealExecutionGateway();
-    const connection = await this.accountRepository.findBinanceConnection(account.id);
+    const connection = await this.retryDatabaseRead("Binance connection lookup", () => this.accountRepository.findBinanceConnection(account.id));
     if (!connection || connection.status !== "CONNECTED") return new DisabledExecutionGateway("BINANCE_NOT_CONNECTED");
     const apiKey = this.cipher.decrypt(connection.apiKeyEncrypted);
     const apiSecret = this.cipher.decrypt(connection.apiSecretEncrypted);
@@ -718,13 +750,18 @@ export class TradingRuntimeManager {
   }
 
   private async createAccountClient(accountId: string): Promise<AccountRuntimeClient | null> {
-    const account = await this.accountRepository.findTradingAccountById(accountId);
+    const account = await this.retryDatabaseRead("account client lookup", () => this.accountRepository.findTradingAccountById(accountId));
     if (!account) throw new Error("ACCOUNT_NOT_FOUND");
-    const connection = await this.accountRepository.findBinanceConnection(account.id);
+    const connection = await this.retryDatabaseRead("account Binance connection lookup", () => this.accountRepository.findBinanceConnection(account.id));
     if (!connection || connection.status !== "CONNECTED") return null;
     const apiKey = this.cipher.decrypt(connection.apiKeyEncrypted);
     const apiSecret = this.cipher.decrypt(connection.apiSecretEncrypted);
     return this.accountClientFactory(apiKey, apiSecret, account.mode === "DEMO");
+  }
+
+  private async retryDatabaseRead<T>(label: string, operation: () => Promise<T>): Promise<T> {
+    if (!this.databaseUrl) return operation();
+    return withPostgresStartupRetry(label, operation);
   }
 
   private async getLoadedRuntime(accountId: string): Promise<AccountRuntime | null> {
@@ -795,6 +832,9 @@ export class TradingRuntimeManager {
     runtime.health.lastReconciliationAt = result.checkedAt;
     runtime.health.lastReconciliationError = result.error;
     runtime.health.reconciliationStatus = result.status;
+    runtime.health.protectionStatus = result.unprotectedPositions > 0 ? "PROTECTION_INCOMPLETE" : "OK";
+    runtime.health.protectionLastError = result.unprotectedPositions > 0 ? result.error : null;
+    runtime.health.protectionRepairAttempts = result.protectionRepairAttempts;
     if (result.status === "OK") {
       runtime.health.state = "READY";
       runtime.health.reconciliationSuccess += 1;
@@ -994,8 +1034,16 @@ class GatedRecoverableExecutionGateway implements RecoverableExecutionGateway {
   }
 
   async submitProtectionOrder(request: ProtectionOrderRequest): Promise<ExecutionOrderLookupResult> {
-    this.assertEnabled();
     return this.delegate.submitProtectionOrder(request);
+  }
+
+  async findProtectionOrder(symbol: string, type: ProtectionOrderRequest["type"], side: ProtectionOrderRequest["side"], clientOrderId: string): Promise<ExecutionOrderLookupResult | null> {
+    return this.delegate.findProtectionOrder ? this.delegate.findProtectionOrder(symbol, type, side, clientOrderId) : null;
+  }
+
+  async closePosition(request: import("../ports/ExecutionGateway.js").EmergencyCloseRequest): Promise<ExecutionOrderLookupResult> {
+    if (!this.delegate.closePosition) throw new Error("FAIL_SAFE_CLOSE_UNAVAILABLE");
+    return this.delegate.closePosition(request);
   }
 
   async cancelOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<void> {
@@ -1022,6 +1070,9 @@ function createRecoveringHealth(): RuntimeHealth {
     executionSucceeded: 0,
     executionFailed: 0,
     reconciliationSuccess: 0,
-    reconciliationFailure: 0
+    reconciliationFailure: 0,
+    protectionStatus: "OK",
+    protectionLastError: null,
+    protectionRepairAttempts: 0
   };
 }

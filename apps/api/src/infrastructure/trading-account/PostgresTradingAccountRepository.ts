@@ -1,5 +1,5 @@
 import pg from "pg";
-import { getPostgresPool } from "../persistence/PgPoolFactory.js";
+import { getPostgresPool, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { CreateTradingAccountInput, TradingAccountRepository } from "../../application/trading-account/TradingAccountRepository.js";
 import type { BinanceConnection, TradingAccount, TradingAccountStatus } from "../../domain/trading-account/TradingAccount.js";
@@ -193,9 +193,7 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
 export async function createTradingAccountRepository(databaseUrl?: string): Promise<TradingAccountRepository> {
   if (!databaseUrl) return new MemoryTradingAccountRepository();
   const repository = new PostgresTradingAccountRepository(databaseUrl);
-  await repository.migrate().catch((error: unknown) => {
-    console.warn(`[postgres] trading account migration skipped during startup: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  await withPostgresStartupRetry("trading account repository migration", () => repository.migrate());
   return repository;
 }
 

@@ -15,6 +15,11 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
   const leverageNeededForMargin = Number.isFinite(rawRequiredLeverage) ? Math.max(1, Math.ceil(rawRequiredLeverage)) : 0;
   const selectedLeverage = leverageNeededForMargin;
   const requiredMargin = selectedLeverage > 0 ? positionSize / selectedLeverage : 0;
+  const currentUsedMargin = Number.isFinite(input.currentUsedMargin ?? 0) && (input.currentUsedMargin ?? 0) >= 0 ? input.currentUsedMargin ?? 0 : 0;
+  // Legacy/domain callers without account portfolio data retain the prior per-trade-only behavior.
+  // Runtime and Analysis always pass the account-scoped configured cap.
+  const maxTotalMarginUsagePercent = input.maxTotalMarginUsagePercent ?? 100;
+  const projectedTotalMargin = currentUsedMargin + requiredMargin;
   const liquidation = evaluateLiquidationSafety(input, quantity, positionSize, requiredMargin);
   const estimatedLoss = actualRiskUsdt;
   const estimatedProfit = Math.abs(input.takeProfit - input.entry) * quantity;
@@ -46,6 +51,11 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
     availableBalance: input.availableBalance,
     maxAllowedMargin,
     marginUsagePercent: input.availableBalance > 0 ? (requiredMargin / input.availableBalance) * 100 : 0,
+    currentUsedMargin,
+    candidateRequiredMargin: requiredMargin,
+    projectedTotalMargin,
+    totalMarginUsagePercent: input.availableBalance > 0 ? (projectedTotalMargin / input.availableBalance) * 100 : 0,
+    maxTotalMarginUsagePercent,
     maintenanceMarginRate: liquidation.maintenanceMarginRate,
     maintenanceMarginAmount: liquidation.maintenanceMarginAmount,
     maintenanceMarginBracket: liquidation.maintenanceMarginBracket,
@@ -67,6 +77,7 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
   if (selectedLeverage > effectiveMaxLeverage) return reject("REQUIRED_LEVERAGE_EXCEEDS_MAX", "Required leverage exceeds configured or Binance maximum", baseDecision);
   if (requiredMargin > input.availableBalance) return reject("MARGIN_REQUIREMENT", "Required margin exceeds available balance", baseDecision);
   if (requiredMargin > input.availableBalance * (input.maxMarginUsagePercent / 100)) return reject("MAX_MARGIN_USAGE_EXCEEDED", "Required margin exceeds configured maximum margin usage", baseDecision);
+  if (projectedTotalMargin > input.availableBalance * (maxTotalMarginUsagePercent / 100)) return reject("MAX_TOTAL_MARGIN_USAGE_EXCEEDED", "Projected portfolio margin exceeds configured maximum total margin usage", baseDecision);
   if (riskReward < input.minimumRiskReward) return reject("RR_BELOW_MINIMUM", `Risk reward ${formatNumber(riskReward)} is below minimum ${formatNumber(input.minimumRiskReward)}`, baseDecision);
   if (!input.tradingEnabled) return reject("TRADING_DISABLED", "Trading is disabled", baseDecision);
   if (input.openPositions >= input.maxOpenPositions) return reject("MAX_OPEN_POSITIONS", "Maximum open positions reached", baseDecision);

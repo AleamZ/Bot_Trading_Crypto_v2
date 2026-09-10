@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type {
   ExecutionOrderContext,
   ExecutionOrderLookupResult,
+  EmergencyCloseRequest,
   ProtectionOrderRequest,
   RecoverableExecutionGateway,
   SubmittedOrder
@@ -112,8 +113,8 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       leverage: 1
     });
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
-    const existing = await this.findAlgoOrderByClientAlgoId(request.clientOrderId);
-    if (existing) return toExecutionOrderLookupResult(existing, request.symbol, request.clientOrderId);
+    const existing = await this.findProtectionOrder(request.symbol, request.type, request.side, request.clientOrderId);
+    if (existing) return existing;
 
     const order = await this.submitAlgoTriggerOrder(
       request.symbol,
@@ -123,6 +124,40 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       formatRuleNumber(validation.normalized.stopPrice ?? normalizePrice(request.stopPrice, rules.tickSize)),
       request.clientOrderId
     );
+    return toExecutionOrderLookupResult(order, request.symbol, request.clientOrderId);
+  }
+
+  async findProtectionOrder(symbol: string, type: ProtectionOrderRequest["type"], side: ProtectionOrderRequest["side"], clientOrderId: string): Promise<ExecutionOrderLookupResult | null> {
+    const order = await this.findAlgoOrderByClientAlgoId(clientOrderId);
+    if (!order) return null;
+    const status = String(order.algoStatus ?? "NEW").toUpperCase();
+    if (["CANCELED", "CANCELLED", "EXPIRED", "TRIGGERED", "REJECTED"].includes(status) || String(order.symbol ?? symbol) !== symbol || String(order.orderType ?? order.type ?? "") !== type) return null;
+    if (String(order.side ?? "") !== side || !(order.reduceOnly === true || order.reduceOnly === "true" || order.closePosition === true || order.closePosition === "true")) return null;
+    return toExecutionOrderLookupResult(order, symbol, clientOrderId);
+  }
+
+  async closePosition(request: EmergencyCloseRequest): Promise<ExecutionOrderLookupResult> {
+    const existing = await this.findOrderByClientOrderId(request.symbol, request.clientOrderId);
+    if (existing) return existing;
+    const rules = await this.getSymbolRules(request.symbol);
+    const validation = validateAgainstSymbolRules(rules, {
+      symbol: request.symbol,
+      orderType: "MARKET",
+      quantity: request.quantity,
+      notional: request.quantity * (await this.getCurrentPrice(request.symbol)),
+      leverage: 1
+    });
+    if (!validation.ok) throw new Error(validation.reason ?? "EMERGENCY_CLOSE_VALIDATION_FAILED");
+    const params = new URLSearchParams({
+      symbol: request.symbol,
+      side: request.side,
+      type: "MARKET",
+      quantity: formatRuleNumber(validation.normalized.quantity),
+      reduceOnly: "true",
+      newClientOrderId: request.clientOrderId,
+      timestamp: String(Date.now())
+    });
+    const order = await this.signedPost<BinanceOrderResponse>("/fapi/v1/order", params, "Binance emergency close failed");
     return toExecutionOrderLookupResult(order, request.symbol, request.clientOrderId);
   }
 

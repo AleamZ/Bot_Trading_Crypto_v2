@@ -9,6 +9,33 @@ describe("BinanceFuturesExecutionGateway", () => {
     vi.restoreAllMocks();
   });
 
+  it("blocks every Binance mutation in read-only soak mode after allowing account reads", async () => {
+    const requests: CapturedRequest[] = [];
+    vi.stubGlobal("fetch", preparationFetch({ marginType: "ISOLATED", leverage: 1, positionAmt: "0" }, requests));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 1, "ISOLATED", true);
+
+    await expect(gateway.submitBracketOrder(plan("bullish"), risk("XRPUSDT", 100))).rejects.toThrow("READ_ONLY_SOAK_EXECUTION_BLOCKED");
+    expect(requests.some((request) => request.method === "POST" || request.method === "DELETE")).toBe(false);
+  });
+
+  it("blocks DELETE mutations before network access", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 1, "ISOLATED", true);
+
+    await expect(gateway.cancelOrderByClientOrderId("XRPUSDT", "client-order")).rejects.toThrow("READ_ONLY_SOAK_EXECUTION_BLOCKED");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows signed GET reads in read-only soak mode", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ orderId: 1, symbol: "XRPUSDT", clientOrderId: "client-order", status: "NEW" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 1, "ISOLATED", true);
+
+    await expect(gateway.findOrderByClientOrderId("XRPUSDT", "client-order")).resolves.toMatchObject({ orderId: "1" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps MARKET entries on the regular order endpoint and sends the approved quantity unchanged", async () => {
     const requests: CapturedRequest[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
@@ -16,6 +43,7 @@ describe("BinanceFuturesExecutionGateway", () => {
       const url = String(input);
       if (url.includes("/fapi/v1/exchangeInfo")) return jsonResponse(exchangeInfo("XRPUSDT"));
       if (url.includes("/fapi/v1/ticker/price")) return jsonResponse({ symbol: "XRPUSDT", price: "1.5088" });
+      if (url.includes("/fapi/v2/positionRisk")) return jsonResponse([{ symbol: "XRPUSDT", positionAmt: "0", marginType: "ISOLATED", leverage: "1" }]);
       if (url.includes("/fapi/v1/leverage")) return jsonResponse({ symbol: "XRPUSDT", leverage: 1 });
       if (url.includes("/fapi/v1/order")) return jsonResponse({ orderId: 11, clientOrderId: bodyParam(init, "newClientOrderId"), symbol: "XRPUSDT", side: "BUY", type: "MARKET", status: "FILLED", origQty: bodyParam(init, "quantity"), executedQty: bodyParam(init, "quantity"), avgPrice: "1.5088" });
       if (url.includes("/fapi/v1/algoOrder")) return jsonResponse({ algoId: bodyParam(init, "type") === "STOP_MARKET" ? 21 : 22, clientAlgoId: bodyParam(init, "clientAlgoId"), symbol: "XRPUSDT", side: "SELL", orderType: bodyParam(init, "type"), algoStatus: "NEW", quantity: bodyParam(init, "quantity"), triggerPrice: bodyParam(init, "triggerPrice"), reduceOnly: true });
@@ -33,7 +61,7 @@ describe("BinanceFuturesExecutionGateway", () => {
 
     const entry = requests.find((request) => request.path === "/fapi/v1/order" && request.method === "POST");
     const leverage = requests.find((request) => request.path === "/fapi/v1/leverage" && request.method === "POST");
-    expect(leverage?.params).toMatchObject({ symbol: "XRPUSDT", leverage: "1" });
+    expect(leverage).toBeUndefined();
     expect(entry?.params).toMatchObject({
       symbol: "XRPUSDT",
       side: "BUY",
@@ -54,6 +82,7 @@ describe("BinanceFuturesExecutionGateway", () => {
       const url = String(input);
       if (url.includes("/fapi/v1/exchangeInfo")) return jsonResponse(exchangeInfo("XRPUSDT"));
       if (url.includes("/fapi/v1/ticker/price")) return jsonResponse({ symbol: "XRPUSDT", price: "1.5088" });
+      if (url.includes("/fapi/v2/positionRisk")) return jsonResponse([{ symbol: "XRPUSDT", positionAmt: "0", marginType: "ISOLATED", leverage: "1" }]);
       if (url.includes("/fapi/v1/leverage")) return jsonResponse({ symbol: "XRPUSDT", leverage: 1 });
       if (url.includes("/fapi/v1/order")) return jsonResponse({ orderId: 11, clientOrderId: "smc_intent_E", symbol: "XRPUSDT", side: "SELL", type: "MARKET", status: "FILLED", origQty: "100", executedQty: "100", avgPrice: "1.5088" });
       if (url.includes("/fapi/v1/algoOrder")) return jsonResponse({ algoId: bodyParam(init, "type") === "STOP_MARKET" ? 21 : 22, clientAlgoId: bodyParam(init, "clientAlgoId"), symbol: "XRPUSDT", side: "BUY", orderType: bodyParam(init, "type"), algoStatus: "NEW", quantity: bodyParam(init, "quantity"), triggerPrice: bodyParam(init, "triggerPrice"), reduceOnly: true });
@@ -154,6 +183,78 @@ describe("BinanceFuturesExecutionGateway", () => {
       }
     ]);
   });
+
+  it("prepares an isolated symbol and synchronizes selected leverage", async () => {
+    const requests: CapturedRequest[] = [];
+    const state = { marginType: "CROSS", leverage: 5, positionAmt: "0" };
+    vi.stubGlobal("fetch", preparationFetch(state, requests));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 125, "ISOLATED");
+
+    await gateway.prepareSymbolForExecution("XRPUSDT", 2);
+
+    expect(requests.filter((request) => request.path === "/fapi/v1/marginType" && request.method === "POST")).toHaveLength(1);
+    expect(requests.filter((request) => request.path === "/fapi/v1/leverage" && request.method === "POST")).toHaveLength(1);
+    expect(state).toMatchObject({ marginType: "ISOLATED", leverage: 2 });
+  });
+
+  it.each([
+    ["position", { marginType: "CROSS", leverage: 5, positionAmt: "1" }, "SYMBOL_PREPARATION_POSITION_CONFLICT"],
+    ["regular order", { marginType: "CROSS", leverage: 5, positionAmt: "0" }, "SYMBOL_PREPARATION_OPEN_ORDERS_CONFLICT"],
+    ["algo order", { marginType: "CROSS", leverage: 5, positionAmt: "0" }, "SYMBOL_PREPARATION_ALGO_ORDERS_CONFLICT"]
+  ])("blocks margin preparation when %s exists", async (kind, state, expected) => {
+    const requests: CapturedRequest[] = [];
+    vi.stubGlobal("fetch", preparationFetch(state, requests, {
+      regularOrders: kind === "regular order" ? [{ symbol: "XRPUSDT", orderId: 1 }] : [],
+      algoOrders: kind === "algo order" ? [{ symbol: "XRPUSDT", algoId: 2 }] : []
+    }));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 125, "ISOLATED");
+
+    await expect(gateway.prepareSymbolForExecution("XRPUSDT", 2)).rejects.toThrow(expected);
+    expect(requests.some((request) => request.path === "/fapi/v1/marginType" && request.method === "POST")).toBe(false);
+  });
+
+  it("fails closed when mutation succeeds but authoritative re-read disagrees", async () => {
+    const requests: CapturedRequest[] = [];
+    const state = { marginType: "CROSS", leverage: 5, positionAmt: "0" };
+    vi.stubGlobal("fetch", preparationFetch(state, requests, { ignoreMarginMutation: true }));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 125, "ISOLATED");
+
+    await expect(gateway.prepareSymbolForExecution("XRPUSDT", 2)).rejects.toThrow("SYMBOL_PREPARATION_MARGIN_MODE_MISMATCH");
+  });
+
+  it("fails closed when Binance refuses a leverage mutation", async () => {
+    const requests: CapturedRequest[] = [];
+    const state = { marginType: "ISOLATED", leverage: 5, positionAmt: "0" };
+    vi.stubGlobal("fetch", preparationFetch(state, requests, { leverageMutationError: true }));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 125, "ISOLATED");
+
+    await expect(gateway.prepareSymbolForExecution("XRPUSDT", 2)).rejects.toThrow("Binance leverage update failed");
+  });
+
+  it("performs a final state verification immediately before entry", async () => {
+    const requests: CapturedRequest[] = [];
+    const state = { marginType: "ISOLATED", leverage: 2, positionAmt: "0" };
+    vi.stubGlobal("fetch", preparationFetch(state, requests, { mutateBeforeFinalVerification: "leverage" }));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "testnet", "market", 125, "ISOLATED");
+
+    await expect(gateway.submitBracketOrder(plan("bullish"), { ...risk("XRPUSDT", 100), leverage: 2, selectedLeverage: 2 }, {
+      executionIntentId: "intent",
+      setupKey: "setup",
+      clientEntryOrderId: "smc_intent_E",
+      clientStopOrderId: "smc_intent_SL",
+      clientTakeProfitOrderId: "smc_intent_TP"
+    })).rejects.toThrow("SYMBOL_PREPARATION_LEVERAGE_MISMATCH");
+    expect(requests.some((request) => request.path === "/fapi/v1/order" && request.method === "POST")).toBe(false);
+  });
+
+  it("does not mutate Mainnet and keeps REAL execution locked", async () => {
+    const requests: CapturedRequest[] = [];
+    vi.stubGlobal("fetch", preparationFetch({ marginType: "CROSS", leverage: 5, positionAmt: "0" }, requests));
+    const gateway = new BinanceFuturesExecutionGateway("key", "secret", "live", "market", 125, "ISOLATED");
+
+    await expect(gateway.submitBracketOrder(plan("bullish"), { ...risk("XRPUSDT", 100), leverage: 2, selectedLeverage: 2 })).rejects.toThrow("REAL_EXECUTION_LOCKED");
+    expect(requests).toHaveLength(0);
+  });
 });
 
 function plan(direction: "bullish" | "bearish"): EntryPlan {
@@ -249,4 +350,45 @@ function bodyParam(init: RequestInit | undefined, key: string): string {
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+function preparationFetch(
+  state: { marginType: string; leverage: number; positionAmt: string },
+  requests: CapturedRequest[],
+  options: {
+    regularOrders?: unknown[];
+    algoOrders?: unknown[];
+    ignoreMarginMutation?: boolean;
+    leverageMutationError?: boolean;
+    mutateBeforeFinalVerification?: "margin" | "leverage";
+  } = {}
+) {
+  let positionRiskReads = 0;
+  return vi.fn(async (input: string | URL, init?: RequestInit) => {
+    const request = capture(input, init);
+    requests.push(request);
+    const url = String(input);
+    if (url.includes("/fapi/v1/exchangeInfo")) return jsonResponse(exchangeInfo("XRPUSDT"));
+    if (url.includes("/fapi/v1/ticker/price")) return jsonResponse({ symbol: "XRPUSDT", price: "1.5088" });
+    if (url.includes("/fapi/v2/positionRisk")) {
+      positionRiskReads += 1;
+      if (options.mutateBeforeFinalVerification === "margin" && positionRiskReads >= 3) state.marginType = "CROSS";
+      if (options.mutateBeforeFinalVerification === "leverage" && positionRiskReads >= 3) state.leverage = 5;
+      return jsonResponse([{ symbol: "XRPUSDT", positionAmt: state.positionAmt, marginType: state.marginType, leverage: String(state.leverage) }]);
+    }
+    if (url.includes("/fapi/v1/openOrders")) return jsonResponse(options.regularOrders ?? []);
+    if (url.includes("/fapi/v1/openAlgoOrders")) return jsonResponse(options.algoOrders ?? []);
+    if (url.includes("/fapi/v1/marginType") && init?.method === "POST") {
+      if (!options.ignoreMarginMutation) state.marginType = "ISOLATED";
+      return jsonResponse({ code: 200, msg: "success" });
+    }
+    if (url.includes("/fapi/v1/leverage") && init?.method === "POST") {
+      if (options.leverageMutationError) return jsonResponse({ code: -4000, msg: "rejected" }, 400);
+      state.leverage = Number(request.params.leverage);
+      return jsonResponse({ symbol: "XRPUSDT", leverage: state.leverage });
+    }
+    if (url.includes("/fapi/v1/order") && init?.method === "POST") return jsonResponse({ orderId: 11, status: "FILLED", type: "MARKET", symbol: "XRPUSDT" });
+    if (url.includes("/fapi/v1/algoOrder") && init?.method === "POST") return jsonResponse({ algoId: 21, algoStatus: "NEW", orderType: request.params.type, symbol: "XRPUSDT" });
+    return jsonResponse({}, 404);
+  });
 }

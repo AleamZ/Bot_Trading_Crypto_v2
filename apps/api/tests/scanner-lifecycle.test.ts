@@ -10,6 +10,86 @@ import { MemoryTradingRepository } from "../src/infrastructure/persistence/Memor
 import { buildSymbolAnalysis } from "../src/presentation/http/Server.js";
 
 describe("scanner setup lifecycle", () => {
+  it("separates live funnel telemetry from bootstrap replay", async () => {
+    const scanner = new MarketScanner(
+      config("account-a", "SOLUSDT"),
+      new MemoryTradingRepository(),
+      new NoopExecutionGateway(),
+      fakeLogger(),
+      new StaticMarketData(solLifecycleCandles("SOLUSDT", false)) as never,
+      null,
+      null,
+      { accountId: "account-a", runtimeId: "runtime-a" }
+    );
+
+    await scanner.scan();
+    const metrics = scanner.getFunnelMetrics("SOLUSDT").SOLUSDT;
+    expect(metrics?.countersBySource.LIVE_SCAN?.SCAN_EVALUATED).toBe(1);
+    expect(metrics?.countersBySource.BOOTSTRAP_REPLAY).toBeUndefined();
+    expect(metrics?.countersBySource.LIVE_SCAN?.HTF_FVG_RAW_DETECTED).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ["bullish", [100, 100, 120]],
+    ["bearish", [120, 100, 80]]
+  ] as const)("reports stable %s HTF state on every scan without new H1 candles", async (_label, closes) => {
+    const symbol = "BTCUSDT";
+    const scanner = new MarketScanner(
+      config("account-a", symbol),
+      new MemoryTradingRepository(),
+      new NoopExecutionGateway(),
+      fakeLogger(),
+      new StaticMarketData(closes.map((close, index) => candle(symbol, "H1", index + 1, close, close + 1, close - 1, close))) as never,
+      null
+    );
+
+    await scanner.scan();
+    const before = scanner.getFunnelMetrics(symbol).BTCUSDT?.countersBySource.LIVE_SCAN ?? {};
+    for (let index = 0; index < 10; index += 1) await scanner.scan();
+    const after = scanner.getFunnelMetrics(symbol).BTCUSDT?.countersBySource.LIVE_SCAN ?? {};
+
+    expect((after.SCAN_EVALUATED ?? 0) - (before.SCAN_EVALUATED ?? 0)).toBe(10);
+    expect((after.HTF_TREND_STATE_VALID ?? 0) - (before.HTF_TREND_STATE_VALID ?? 0)).toBe(10);
+    expect((after.HTF_TREND_STATE_BULLISH ?? 0) - (before.HTF_TREND_STATE_BULLISH ?? 0) + ((after.HTF_TREND_STATE_BEARISH ?? 0) - (before.HTF_TREND_STATE_BEARISH ?? 0))).toBe(10);
+    expect((after.HTF_NEW_CANDLE_TREND_VALID ?? 0) - (before.HTF_NEW_CANDLE_TREND_VALID ?? 0)).toBe(0);
+  });
+
+  it("keeps scan-level HTF state invariant for neutral and unknown trends", async () => {
+    const neutral = new MarketScanner(
+      config("account-a", "BTCUSDT"),
+      new MemoryTradingRepository(),
+      new NoopExecutionGateway(),
+      fakeLogger(),
+      new StaticMarketData([1, 2, 3].map((index) => candle("BTCUSDT", "H1", index, 100, 101, 99, 100))) as never,
+      null
+    );
+    const unknown = new MarketScanner(config("account-a", "ETHUSDT"), new MemoryTradingRepository(), new NoopExecutionGateway(), fakeLogger(), new StaticMarketData([]) as never, null);
+
+    for (let index = 0; index < 3; index += 1) {
+      await neutral.scan();
+      await unknown.scan();
+    }
+
+    const neutralCounters = neutral.getFunnelMetrics("BTCUSDT").BTCUSDT?.countersBySource.LIVE_SCAN ?? {};
+    const unknownCounters = unknown.getFunnelMetrics("ETHUSDT").ETHUSDT?.countersBySource.LIVE_SCAN ?? {};
+    expect(neutralCounters.HTF_TREND_STATE_NEUTRAL).toBe(2);
+    expect(unknownCounters.HTF_TREND_STATE_UNKNOWN).toBe(3);
+    expect((neutralCounters.HTF_TREND_STATE_VALID ?? 0) + (neutralCounters.HTF_TREND_STATE_NEUTRAL ?? 0) + (neutralCounters.HTF_TREND_STATE_UNKNOWN ?? 0)).toBe(neutralCounters.SCAN_EVALUATED);
+    expect((unknownCounters.HTF_TREND_STATE_VALID ?? 0) + (unknownCounters.HTF_TREND_STATE_NEUTRAL ?? 0) + (unknownCounters.HTF_TREND_STATE_UNKNOWN ?? 0)).toBe(unknownCounters.SCAN_EVALUATED);
+  });
+
+  it("keeps account-scoped funnel counters separate for the same symbol", async () => {
+    const a = new MarketScanner(config("account-a", "SOLUSDT"), new MemoryTradingRepository(), new NoopExecutionGateway(), fakeLogger(), new StaticMarketData(solLifecycleCandles("SOLUSDT", false)) as never, null, null, null, { accountId: "account-a" });
+    const b = new MarketScanner(config("account-b", "SOLUSDT"), new MemoryTradingRepository(), new NoopExecutionGateway(), fakeLogger(), new StaticMarketData([]) as never, null, null, null, { accountId: "account-b" });
+
+    await a.scan();
+    await b.scan();
+    expect(a.getFunnelMetrics("SOLUSDT").SOLUSDT?.counters.SCAN_EVALUATED).toBe(1);
+    expect(b.getFunnelMetrics("SOLUSDT").SOLUSDT?.counters.SCAN_EVALUATED).toBe(1);
+    expect(a.getFunnelMetrics("SOLUSDT").SOLUSDT?.counters.HTF_FVG_RAW_DETECTED).toBeGreaterThan(0);
+    expect(b.getFunnelMetrics("SOLUSDT").SOLUSDT?.counters.HTF_FVG_RAW_DETECTED ?? 0).toBe(0);
+  });
+
   it("keeps SOLUSDT Home and Analysis on the same canonical M5 FVG before and after pullback", async () => {
     const beforePullbackData = new StaticMarketData(solLifecycleCandles("SOLUSDT", false));
     const beforeRepository = new MemoryTradingRepository();

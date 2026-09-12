@@ -66,7 +66,8 @@ const schema = z.object({
   reconciliationIntervalMs: z.coerce.number().int().positive().default(30_000),
   binanceRetryMaxAttempts: z.coerce.number().int().positive().default(3),
   binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500),
-  postgresPoolMax: z.coerce.number().int().positive().max(10).default(2),
+  postgresPoolMax: z.coerce.number().int().positive().max(10).default(8),
+  readOnlySoak: z.coerce.boolean().default(false),
   realLiveExecutionEnabled: z.coerce.boolean().default(false),
   localTradingRuntimeEnabled: z.coerce.boolean().default(false)
 });
@@ -123,6 +124,7 @@ export const defaultTradingSettings: TradingSettings = {
   maxDrawdownPercent: 10,
   tradingEnabled: false,
   killSwitch: false,
+  readOnlySoak: false,
   realExecutionMode: "LOCKED",
   emaPeriod: 50,
   swingLeft: 2,
@@ -228,10 +230,12 @@ export function loadConfig(): AppConfig {
     binanceRetryMaxAttempts: process.env.BINANCE_RETRY_MAX_ATTEMPTS,
     binanceRetryBaseDelayMs: process.env.BINANCE_RETRY_BASE_DELAY_MS,
     postgresPoolMax: process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX,
+    readOnlySoak: process.env.READ_ONLY_SOAK,
     realLiveExecutionEnabled: process.env.REAL_LIVE_EXECUTION_ENABLED,
     localTradingRuntimeEnabled: process.env.LOCAL_TRADING_RUNTIME_ENABLED
   });
   validateProductionConfig(parsed);
+  if (parsed.readOnlySoak && !parsed.binanceTestnet) throw new Error("READ_ONLY_SOAK_REQUIRES_TESTNET");
   return parsed;
 }
 

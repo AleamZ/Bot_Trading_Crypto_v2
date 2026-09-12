@@ -39,6 +39,92 @@ export type AvailableBalanceProvider = () => Promise<number | null>;
 export type CurrentUsedMarginProvider = () => Promise<number | null>;
 export type SymbolRulesProvider = (symbol: string) => Promise<FuturesSymbolRules>;
 
+export type FunnelSource = "LIVE_SCAN" | "BOOTSTRAP_REPLAY" | "RECONCILIATION" | "HISTORICAL";
+export type FunnelStage =
+  | "SCAN_EVALUATED"
+  | "HTF_TREND_STATE_VALID"
+  | "HTF_TREND_STATE_NEUTRAL"
+  | "HTF_TREND_STATE_UNKNOWN"
+  | "HTF_TREND_STATE_BULLISH"
+  | "HTF_TREND_STATE_BEARISH"
+  | "HTF_NEW_CANDLE_TREND_VALID"
+  | "HTF_NEW_CANDLE_TREND_NEUTRAL"
+  | "HTF_FVG_RAW_DETECTED"
+  | "HTF_FVG_DIRECTION_MATCH"
+  | "HTF_FVG_UNMITIGATED_ELIGIBLE"
+  | "HTF_FVG_SELECTED"
+  | "WAITING_HTF_FIRST_TOUCH"
+  | "HTF_FIRST_TOUCH_CONFIRMED"
+  | "MONITORING_LTF"
+  | "BOS_CONFIRMED"
+  | "CHOCH_CONFIRMED"
+  | "LTF_FVG_RAW_DETECTED"
+  | "LTF_FVG_POST_STRUCTURE"
+  | "LTF_FVG_DIRECTION_MATCH"
+  | "LTF_FVG_FRESH"
+  | "LTF_FVG_ALREADY_TOUCHED"
+  | "LTF_FVG_INVALIDATED"
+  | "LTF_FVG_SELECTED"
+  | "WAITING_LTF_FIRST_TOUCH"
+  | "LTF_FIRST_TOUCH_CONFIRMED"
+  | "ENTRY_PLAN_CREATED"
+  | "ENTRY_PLAN_REJECTED"
+  | "RR_GATE_REACHED"
+  | "RR_GATE_PASSED"
+  | "RR_GATE_REJECTED"
+  | "RISK_MANAGER_REACHED"
+  | "RISK_PASSED"
+  | "RISK_REJECTED";
+
+export interface FunnelTelemetryEvent {
+  stage: FunnelStage;
+  accountId: string;
+  runtimeId?: string;
+  symbol: string;
+  timeframe: "H1" | "M5" | "ACCOUNT";
+  setupId?: string | null;
+  timestamp: number;
+  source: FunnelSource;
+  reason?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface FunnelTelemetryContext {
+  accountId: string;
+  runtimeId?: string;
+  sink?: (event: FunnelTelemetryEvent) => void;
+}
+
+export type FunnelMetrics = {
+  counters: Partial<Record<FunnelStage, number>>;
+  countersBySource: Partial<Record<FunnelSource, Partial<Record<FunnelStage, number>>>>;
+  stateEnteredAt: Partial<Record<SetupState, number>>;
+  stateAgeMs: Partial<Record<SetupState, number>>;
+  candidateEnteredAt: number | null;
+  candidateAgeMs: number | null;
+  lastEventAt: number | null;
+};
+
+export type PlanNullReason =
+  | "NO_ELIGIBLE_TP_LIQUIDITY"
+  | "INVALID_RR_INPUTS"
+  | "INVALID_SL_GEOMETRY"
+  | "INVALID_PRICE_ORDERING"
+  | "MISSING_SYMBOL_METADATA"
+  | "STALE_FVG"
+  | "ALREADY_TOUCHED_FVG"
+  | "INVALIDATED_STRUCTURE";
+
+const terminalRiskRejectCodes = new Set<NonNullable<RiskDecision["rejectCode"]>>([
+  "INVALID_PRICE",
+  "INVALID_QUANTITY",
+  "MIN_QTY",
+  "MAX_QTY",
+  "MIN_NOTIONAL",
+  "RR_BELOW_MINIMUM",
+  "REQUIRED_LEVERAGE_EXCEEDS_MAX"
+]);
+
 export interface SetupEvidence {
   htfFvg: Fvg | null;
   htfFirstTouchedAt: number | null;
@@ -77,7 +163,8 @@ export class TradingEngine {
     private readonly availableBalanceProvider: AvailableBalanceProvider | null = null,
     private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
     private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null,
-    initialBalance = 10_000
+    initialBalance = 10_000,
+    private readonly funnelContext: FunnelTelemetryContext = { accountId: "unknown" }
   ) {
     this.events = new EventBus(repository, logger);
     this.state = {
@@ -97,6 +184,36 @@ export class TradingEngine {
       activeRisk: null,
       setupEvidence: emptySetupEvidence()
     };
+  }
+
+  private readonly funnelCounters: Partial<Record<FunnelStage, number>> = {};
+  private readonly funnelCountersBySource: Partial<Record<FunnelSource, Partial<Record<FunnelStage, number>>>> = {};
+  private readonly stateEnteredAt: Partial<Record<SetupState, number>> = { WaitingTrend: Date.now() };
+  private candidateEnteredAt: number | null = null;
+  private lastFunnelEventAt: number | null = null;
+  private htfTrendEstablished = false;
+
+  getFunnelMetrics(): FunnelMetrics {
+    const now = Date.now();
+    return {
+      counters: { ...this.funnelCounters },
+      countersBySource: Object.fromEntries(Object.entries(this.funnelCountersBySource).map(([source, counters]) => [source, { ...counters }])),
+      stateEnteredAt: { ...this.stateEnteredAt },
+      stateAgeMs: Object.fromEntries(Object.entries(this.stateEnteredAt).map(([state, enteredAt]) => [state, now - (enteredAt ?? now)])),
+      candidateEnteredAt: this.candidateEnteredAt,
+      candidateAgeMs: this.candidateEnteredAt === null ? null : now - this.candidateEnteredAt,
+      lastEventAt: this.lastFunnelEventAt
+    };
+  }
+
+  recordScan(source: FunnelSource = "LIVE_SCAN"): void {
+    this.emitFunnel("SCAN_EVALUATED", "ACCOUNT", source);
+    if (this.state.trend === "bullish" || this.state.trend === "bearish") {
+      this.emitFunnel("HTF_TREND_STATE_VALID", "ACCOUNT", source, undefined, undefined, { direction: this.state.trend });
+      this.emitFunnel(this.state.trend === "bullish" ? "HTF_TREND_STATE_BULLISH" : "HTF_TREND_STATE_BEARISH", "ACCOUNT", source);
+    } else {
+      this.emitFunnel(this.htfTrendEstablished ? "HTF_TREND_STATE_NEUTRAL" : "HTF_TREND_STATE_UNKNOWN", "ACCOUNT", source);
+    }
   }
 
   getState(): Readonly<EngineState> {
@@ -231,20 +348,25 @@ export class TradingEngine {
     if (!candle.isClosed) return;
     if (candle.symbol !== this.config.symbol) return;
 
+    const source: FunnelSource = options.historical === true ? "BOOTSTRAP_REPLAY" : "LIVE_SCAN";
     if (candle.timeframe === "H1") {
       this.state.h1Candles.push(candle);
-      await this.processH1(candle, options.historical === true);
+      await this.processH1(candle, options.historical === true, source);
+      this.markState(this.state.setupState);
       return;
     }
 
     this.state.m5Candles.push(candle);
-    await this.processM5(candle, options.historical === true);
+    await this.processM5(candle, options.historical === true, source);
+    this.markState(this.state.setupState);
   }
 
-  private async processH1(candle: Candle, historical: boolean): Promise<void> {
+  private async processH1(candle: Candle, historical: boolean, source: FunnelSource): Promise<void> {
     const trend = detectH1Trend(this.state.h1Candles, this.config.emaPeriod);
+    this.htfTrendEstablished = Number.isFinite(trend.ema) && Number.isFinite(trend.close);
 
     if (trend.direction !== "neutral") {
+      this.emitFunnel("HTF_NEW_CANDLE_TREND_VALID", "H1", source, undefined, trend.direction, { direction: trend.direction });
       const trendChanged = trend.direction !== this.state.trend;
       this.state.trend = trend.direction;
       if (this.state.setupState === "WaitingTrend") {
@@ -260,12 +382,13 @@ export class TradingEngine {
         });
       }
     } else {
+      this.emitFunnel("HTF_NEW_CANDLE_TREND_NEUTRAL", "H1", source, undefined, trend.reason);
       this.state.trend = "neutral";
     }
 
     if (this.state.trend === "neutral") return;
 
-    const htfFvgs = await this.syncHtfFvgCandidates(candle, historical);
+    const htfFvgs = await this.syncHtfFvgCandidates(candle, historical, source);
     const currentEvidence = this.state.setupEvidence.htfFvg ? htfFvgs.find((fvg) => fvg.id === this.state.setupEvidence.htfFvg?.id) ?? null : null;
     if (currentEvidence?.status === "invalidated") {
       this.state.setupEvidence.htfFvg = currentEvidence;
@@ -291,6 +414,8 @@ export class TradingEngine {
         fvg: activated,
         reason: "H1 FVG first touch reached the nearest boundary"
       });
+      this.emitFunnel("HTF_FIRST_TOUCH_CONFIRMED", "H1", source, activated.id);
+      this.markState("MonitoringLTF");
       return;
     }
 
@@ -328,6 +453,9 @@ export class TradingEngine {
         fvg: selected,
         reason: "Selected nearest fresh same-direction H1 FVG by first reachable boundary"
       });
+      this.emitFunnel("HTF_FVG_SELECTED", "H1", source, selected.id);
+      this.emitFunnel("WAITING_HTF_FIRST_TOUCH", "H1", source, selected.id);
+      this.markState("WaitingMitigation");
       return;
     }
 
@@ -335,7 +463,7 @@ export class TradingEngine {
     this.syncSetupStateWithHtfFvg(selected);
   }
 
-  private async processM5(candle: Candle, historical: boolean): Promise<void> {
+  private async processM5(candle: Candle, historical: boolean, source: FunnelSource): Promise<void> {
     if (historical) return;
     if (this.state.setupState === "ReadyToEnter") {
       await this.processReadyToEnterM5Invalidation(candle);
@@ -374,10 +502,30 @@ export class TradingEngine {
         signal,
         reason: `${signal.type} confirmed by M5 candle body close beyond swing ${signal.brokenSwing.price}`
       });
+      this.emitFunnel(signal.type === "BOS" ? "BOS_CONFIRMED" : "CHOCH_CONFIRMED", "M5", source, signal.id);
       return;
     }
 
+    const allLtfFvgs = detectFvgs(this.state.m5Candles, "M5", this.state.pendingSignal.direction).filter(
+      (fvg) => fvg.thirdCandleOpenTime > this.state.pendingSignal!.candleOpenTime
+    );
+    for (const fvg of allLtfFvgs.filter((candidate) => candidate.thirdCandleOpenTime === candle.openTime)) {
+      this.emitFunnel("LTF_FVG_RAW_DETECTED", "M5", source, fvg.id);
+      const lifecycle = reconstructFvgLifecycle(fvg, this.state.m5Candles);
+      if (lifecycle.status === "touched") this.emitFunnel("LTF_FVG_ALREADY_TOUCHED", "M5", source, fvg.id);
+      if (lifecycle.status === "invalidated") this.emitFunnel("LTF_FVG_INVALIDATED", "M5", source, fvg.id);
+    }
     const ltfFvg = detectLatestLtfFvg(this.state.m5Candles, this.state.pendingSignal.direction, this.state.pendingSignal.candleOpenTime);
+    if (ltfFvg) {
+      this.emitFunnel("LTF_FVG_POST_STRUCTURE", "M5", source, ltfFvg.id);
+      this.emitFunnel("LTF_FVG_DIRECTION_MATCH", "M5", source, ltfFvg.id);
+      this.emitFunnel("LTF_FVG_FRESH", "M5", source, ltfFvg.id);
+      this.emitFunnel("LTF_FVG_SELECTED", "M5", source, ltfFvg.id, undefined, {
+        eligibleCount: allLtfFvgs.length,
+        olderEligibleFvgIds: allLtfFvgs.slice(0, -1).map((fvg) => fvg.id),
+        selectionReason: "latest-compatible-LTF-FVG"
+      });
+    }
     if (ltfFvg && !this.state.activeLtfFvgCluster.some((fvg) => fvg.id === ltfFvg.id)) {
       await this.repository.saveFvg(ltfFvg);
       this.state.activeLtfFvgCluster = [...this.state.activeLtfFvgCluster, ltfFvg];
@@ -409,18 +557,27 @@ export class TradingEngine {
       fvg: touchedLtfFvg,
       reason: "M5 FVG first touch triggered entry and froze the active protective cluster"
     });
+    this.emitFunnel("LTF_FIRST_TOUCH_CONFIRMED", "M5", source, touchedLtfFvg.id);
+    this.markState("WaitingLtfMitigation");
 
-    const plan = await this.calculatePlanForLtfFvg(touchedLtfFvg, frozenCluster);
+    const planResult = await this.calculatePlanForLtfFvg(touchedLtfFvg, frozenCluster);
 
-    if (!plan) {
+    if (!planResult.plan) {
+      this.emitFunnel("ENTRY_PLAN_REJECTED", "M5", source, touchedLtfFvg.id, planResult.reason);
       this.logger.warn("Entry plan rejected before risk manager", {
-        reason: "Missing valid SL/TP or non-positive reward/risk"
+        reason: planResult.reason,
+        classification: planResult.terminal ? "PERMANENT_CANDIDATE_INVALID" : "TEMPORARY_RETRYABLE"
       });
+      if (planResult.terminal) this.archiveCandidate(planResult.reason);
       return;
     }
+    const plan = planResult.plan;
 
     this.state.setupEvidence.entryPlan = plan;
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "ReadyToEnter");
+    this.emitFunnel("ENTRY_PLAN_CREATED", "M5", source, touchedLtfFvg.id);
+    this.emitFunnel("RR_GATE_REACHED", "M5", source, touchedLtfFvg.id);
+    this.emitFunnel(plan.riskReward >= this.config.minimumRiskReward ? "RR_GATE_PASSED" : "RR_GATE_REJECTED", "M5", source, touchedLtfFvg.id);
     const availableBalance = await this.getAvailableBalance();
     const currentUsedMargin = this.currentUsedMarginProvider ? await this.currentUsedMarginProvider() : 0;
     const symbolRules = await this.getSymbolRules();
@@ -451,6 +608,7 @@ export class TradingEngine {
       killSwitch: this.config.killSwitch,
       createdAt: candle.closeTime
     });
+    this.emitFunnel("RISK_MANAGER_REACHED", "ACCOUNT", source, touchedLtfFvg.id);
     await this.repository.saveRiskDecision(risk);
     await this.events.publish({
       type: risk.accepted ? "RiskPassed" : "RiskRejected",
@@ -460,6 +618,7 @@ export class TradingEngine {
     });
 
     if (!risk.accepted) {
+      this.emitFunnel("RISK_REJECTED", "ACCOUNT", source, touchedLtfFvg.id, risk.rejectCode ?? risk.reason);
       this.logger.warn("[ENTRY REJECTED]", {
         symbol: this.config.symbol,
         reason: risk.rejectCode ?? risk.reason,
@@ -472,8 +631,10 @@ export class TradingEngine {
         symbolOpenPositions: this.state.openPositions,
         maxOpenPositions: this.config.maxOpenPositions,
       });
+      if (risk.rejectCode && terminalRiskRejectCodes.has(risk.rejectCode)) this.archiveCandidate(risk.rejectCode);
       return;
     }
+    this.emitFunnel("RISK_PASSED", "ACCOUNT", source, touchedLtfFvg.id);
 
     let order;
     try {
@@ -507,8 +668,12 @@ export class TradingEngine {
     });
   }
 
-  private async syncHtfFvgCandidates(candle: Candle, historical: boolean): Promise<Fvg[]> {
+  private async syncHtfFvgCandidates(candle: Candle, historical: boolean, source: FunnelSource): Promise<Fvg[]> {
     const detected = detectFvgs(this.state.h1Candles, "H1", this.state.trend as Direction);
+    for (const fvg of detected.filter((candidate) => candidate.thirdCandleOpenTime === candle.openTime)) {
+      this.emitFunnel("HTF_FVG_RAW_DETECTED", "H1", source, fvg.id);
+      this.emitFunnel("HTF_FVG_DIRECTION_MATCH", "H1", source, fvg.id);
+    }
     const lifecycles = detected.map((fvg) => {
       const lifecycle = reconstructFvgLifecycle(fvg, this.state.h1Candles);
       if (!historical && lifecycle.status === "touched" && lifecycle.firstTouchedAt === candle.closeTime) {
@@ -518,6 +683,7 @@ export class TradingEngine {
     });
 
     for (const fvg of lifecycles) {
+      if (fvg.status === "untouched") this.emitFunnel("HTF_FVG_UNMITIGATED_ELIGIBLE", "H1", source, fvg.id);
       await this.repository.saveFvg(fvg);
     }
     return lifecycles;
@@ -541,18 +707,37 @@ export class TradingEngine {
     return 0;
   }
 
-  private async calculatePlanForLtfFvg(ltfFvg: Fvg, protectiveCluster: readonly Fvg[]): Promise<EntryPlan | null> {
+  private async calculatePlanForLtfFvg(
+    ltfFvg: Fvg,
+    protectiveCluster: readonly Fvg[]
+  ): Promise<{ plan: EntryPlan | null; reason: PlanNullReason | "NONE"; terminal: boolean }> {
+    if (ltfFvg.status !== "untouched" && ltfFvg.status !== "touched") {
+      return { plan: null, reason: ltfFvg.status === "invalidated" ? "INVALIDATED_STRUCTURE" : "STALE_FVG", terminal: true };
+    }
+    if (ltfFvg.status !== "touched" || !ltfFvg.firstTouchedAt) {
+      return { plan: null, reason: "ALREADY_TOUCHED_FVG", terminal: true };
+    }
     const entry = calculateFirstTouchEntry(ltfFvg);
     const decisionTimestamp = ltfFvg.firstTouchedAt ?? ltfFvg.activatedAt ?? ltfFvg.createdAt;
     const liquidityState = buildLiquidityState(this.config.symbol, "H1", this.state.h1Candles, { left: this.config.swingLeft, right: this.config.swingRight });
     const externalLiquidity = selectExternalLiquidityTarget(liquidityState, ltfFvg.direction, entry, decisionTimestamp);
+    if (!externalLiquidity) return { plan: null, reason: "NO_ELIGIBLE_TP_LIQUIDITY", terminal: false };
     const symbolRules = await this.getSymbolRules();
-    return calculateEntryPlan({
+    if (!Number.isFinite(symbolRules.tickSize) || symbolRules.tickSize <= 0) {
+      return { plan: null, reason: "MISSING_SYMBOL_METADATA", terminal: false };
+    }
+    if (![entry, externalLiquidity.price].every((value) => Number.isFinite(value) && value > 0)) {
+      return { plan: null, reason: "INVALID_RR_INPUTS", terminal: true };
+    }
+    if ((ltfFvg.direction === "bullish" && externalLiquidity.price <= entry) || (ltfFvg.direction === "bearish" && externalLiquidity.price >= entry)) {
+      return { plan: null, reason: "INVALID_PRICE_ORDERING", terminal: true };
+    }
+    const plan = calculateEntryPlan({
       direction: ltfFvg.direction,
       triggeringFvg: ltfFvg,
       protectiveCluster,
       m5Candles: this.state.m5Candles,
-      externalLiquidityPrice: externalLiquidity?.price ?? null,
+      externalLiquidityPrice: externalLiquidity.price,
       config: {
         stopLossBufferMode: this.config.stopLossBufferMode,
         stopLossBufferTicks: this.config.stopLossBufferTicks,
@@ -562,6 +747,67 @@ export class TradingEngine {
         symbolTickSize: symbolRules.tickSize
       }
     });
+    if (!plan) return { plan: null, reason: "INVALID_SL_GEOMETRY", terminal: true };
+    return { plan, reason: "NONE", terminal: false };
+  }
+
+  private emitFunnel(
+    stage: FunnelStage,
+    timeframe: FunnelTelemetryEvent["timeframe"],
+    source: FunnelSource,
+    setupId?: string | null,
+    reason?: string,
+    metadata?: Record<string, unknown>
+  ): void {
+    const timestamp = Date.now();
+    this.funnelCounters[stage] = (this.funnelCounters[stage] ?? 0) + 1;
+    const sourceCounters = this.funnelCountersBySource[source] ?? {};
+    sourceCounters[stage] = (sourceCounters[stage] ?? 0) + 1;
+    this.funnelCountersBySource[source] = sourceCounters;
+    this.lastFunnelEventAt = timestamp;
+    const event: FunnelTelemetryEvent = {
+      stage,
+      accountId: this.funnelContext.accountId,
+      symbol: this.config.symbol,
+      timeframe,
+      timestamp,
+      source
+    };
+    if (this.funnelContext.runtimeId !== undefined) event.runtimeId = this.funnelContext.runtimeId;
+    if (setupId !== undefined) event.setupId = setupId;
+    if (reason !== undefined) event.reason = reason;
+    if (metadata !== undefined) event.metadata = metadata;
+    this.funnelContext.sink?.(event);
+    this.logger.info(`[FUNNEL] ${this.funnelContext.accountId}/${this.config.symbol} ${source} ${stage}`, {
+      accountId: this.funnelContext.accountId,
+      runtimeId: this.funnelContext.runtimeId,
+      symbol: this.config.symbol,
+      timeframe,
+      stage,
+      setupId,
+      source,
+      reason,
+      metadata
+    });
+  }
+
+  private markState(next: SetupState): void {
+    if (this.stateEnteredAt[next] === undefined || this.state.setupState !== next) this.stateEnteredAt[next] = Date.now();
+    if (["WaitingMitigation", "MonitoringLTF", "WaitingLtfMitigation", "ReadyToEnter"].includes(next)) {
+      this.candidateEnteredAt ??= Date.now();
+    }
+    if (next === "WaitingTrend" || next === "Archived") this.candidateEnteredAt = null;
+  }
+
+  private archiveCandidate(reason: string): void {
+    this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
+    this.state.pendingSignal = null;
+    this.state.pendingLtfFvg = null;
+    this.state.activeLtfFvgCluster = [];
+    this.state.frozenProtectiveCluster = [];
+    this.state.pendingEntryPlan = null;
+    this.candidateEnteredAt = null;
+    this.logger.info("[FUNNEL] candidate archived", { accountId: this.funnelContext.accountId, symbol: this.config.symbol, reason });
   }
 
   private async getSymbolRules(): Promise<FuturesSymbolRules> {

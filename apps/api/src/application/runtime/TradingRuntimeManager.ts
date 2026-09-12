@@ -41,7 +41,8 @@ import { fingerprintProposal, type RealExecutionProposal } from "../execution/Re
 import { UnsafeTradingAccountDeletionError } from "../trading-account/TradingAccountService.js";
 import { calculateDailyRiskStatus, type DailyRiskStatus } from "../risk/DailyRiskService.js";
 import { updateAccountProtectionState, type AccountProtectionStatus } from "../risk/AccountProtectionService.js";
-import { withPostgresStartupRetry } from "../../infrastructure/persistence/PgPoolFactory.js";
+import { withPostgresMigrationLock, withPostgresStartupRetry } from "../../infrastructure/persistence/PgPoolFactory.js";
+import { resolveEffectiveExecutionPolicy, type EffectiveExecutionPolicy } from "./ExecutionPolicy.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -52,6 +53,7 @@ export interface AccountSnapshot {
   realReadiness: RealTradingReadinessResult | null;
   dailyRisk: DailyRiskStatus;
   accountProtection: AccountProtectionStatus | null;
+  funnelMetrics: Record<string, import("../engine/TradingEngine.js").FunnelMetrics>;
 }
 
 export interface RuntimeHealth {
@@ -71,10 +73,16 @@ export interface RuntimeHealth {
   protectionStatus: "OK" | "PROTECTION_INCOMPLETE";
   protectionLastError: string | null;
   protectionRepairAttempts: number;
+  processReadOnlySoak: boolean;
+  accountReadOnlySoak: boolean;
+  effectiveReadOnlySoak: boolean;
+  executionPolicy: EffectiveExecutionPolicy["executionPolicy"];
+  executionCapability: EffectiveExecutionPolicy["executionCapability"];
 }
 
 export interface AccountActivitySnapshot {
   connected: boolean;
+  authoritative?: boolean;
   source: "BINANCE_SIGNED_ACCOUNT";
   sourceEnvironment: "TESTNET" | "MAINNET";
   tradingAccountId: string;
@@ -148,10 +156,12 @@ export interface ExecutionGateInput {
   tradingEnabled: boolean;
   killSwitch: boolean;
   binanceConnected: boolean;
+  readOnlySoak: boolean;
 }
 
 interface RuntimeConfigRef {
   current: AppConfig;
+  accountReadOnlySoak: boolean;
 }
 
 export class TradingRuntimeManager {
@@ -160,6 +170,7 @@ export class TradingRuntimeManager {
   private readonly realAuditThrottle = new Map<string, number>();
   private readonly deletingAccounts = new Set<string>();
   private shuttingDown = false;
+  private readonly processReadOnlySoak: boolean;
 
   constructor(
     private readonly baseConfig: AppConfig,
@@ -174,7 +185,9 @@ export class TradingRuntimeManager {
     private readonly symbolMetadata: BinanceFuturesSymbolMetadataService = new BinanceFuturesSymbolMetadataService(),
     private readonly realProposalRepository: RealExecutionProposalRepository = new MemoryRealExecutionProposalRepository(),
     private readonly runtimeMarketDataFactory: RuntimeMarketDataFactory = (testnet) => new BinanceFuturesMarketData(testnet)
-  ) {}
+  ) {
+    this.processReadOnlySoak = baseConfig.readOnlySoak;
+  }
 
   async start(): Promise<void> {
     if (this.shuttingDown) return;
@@ -204,15 +217,17 @@ export class TradingRuntimeManager {
     if (this.deletingAccounts.has(accountId)) throw new Error("ACCOUNT_REMOVING");
     const account = await this.retryDatabaseRead("account lookup", () => this.accountRepository.findTradingAccountById(accountId));
     if (!account) throw new Error("ACCOUNT_NOT_FOUND");
-    await this.configRepository.ensureDefaults(account.id, this.baseConfig);
-    const settings = (await this.retryDatabaseRead("runtime settings lookup", () => this.configRepository.getSettings(account.id))) ?? this.baseConfig;
+    await this.configRepository.ensureDefaults(account.id, { ...this.baseConfig, readOnlySoak: false });
+    const storedSettings = await this.retryDatabaseRead("runtime settings lookup", () => this.configRepository.getSettings(account.id));
+    const settings = storedSettings ?? this.baseConfig;
     const watchlist = await this.retryDatabaseRead("runtime watchlist lookup", () => this.configRepository.getWatchlist(account.id));
-    const config = { ...this.baseConfig, ...settings, watchlist, symbol: watchlist[0] ?? settings.symbol };
-    const configRef: RuntimeConfigRef = { current: config };
+    const policy = resolveEffectiveExecutionPolicy(this.processReadOnlySoak, Boolean(storedSettings?.readOnlySoak));
+    const config = { ...this.baseConfig, ...settings, readOnlySoak: policy.effectiveReadOnlySoak, watchlist, symbol: watchlist[0] ?? settings.symbol };
+    const configRef: RuntimeConfigRef = { current: config, accountReadOnlySoak: policy.accountReadOnlySoak };
     const repository = await this.createRuntimeTradingRepository(account.id);
     await repository.saveTradingSettings(config);
     const health = createRecoveringHealth();
-    const rawExecution = await this.createExecutionGateway(account, config.entryMode, config.maxLeverage);
+    const rawExecution = await this.createExecutionGateway(account, config.entryMode, config.maxLeverage, () => configRef.current.marginMode, config.readOnlySoak);
     const executionGate = () => this.resolveRuntimeExecutionGate(account, health, configRef.current, rawExecution);
     const execution =
       account.mode === "DEMO"
@@ -269,7 +284,8 @@ export class TradingRuntimeManager {
         return margins.every((margin) => margin !== null && Number.isFinite(margin))
           ? margins.reduce<number>((total, margin) => total + (margin === null ? 0 : margin), 0)
           : null;
-      }
+      },
+      { accountId: account.id, runtimeId: account.id }
     );
     const reconciliation = new TradingReconciliationService(this.executionIntentRepository, this.logger);
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
@@ -291,21 +307,28 @@ export class TradingRuntimeManager {
   private async createRuntimeTradingRepository(accountId: string): Promise<TradingRepository> {
     if (!this.databaseUrl) return new MemoryTradingRepository();
     const repository = new PostgresTradingRepository(this.databaseUrl, accountId);
-    await withPostgresStartupRetry("runtime trading repository migration", () => repository.migrate());
+    await withPostgresMigrationLock(this.databaseUrl, () => withPostgresStartupRetry("runtime trading repository migration", () => repository.migrate()));
     return repository;
   }
 
   private startScannerBootstrap(runtime: AccountRuntime): void {
     if (runtime.scannerBootstrapStarted) return;
     runtime.scannerBootstrapStarted = true;
+    let bootstrapSucceeded = false;
     runtime.scannerBootstrapInFlight = runtime.scanner
       .bootstrap()
+      .then(() => {
+        bootstrapSucceeded = true;
+      })
       .catch((error: unknown) => {
+        runtime.health.state = "DEGRADED";
+        runtime.health.reconciliationStatus = "DEGRADED";
+        runtime.health.lastReconciliationError = error instanceof Error ? error.message : String(error);
         this.logger.warn("[RUNTIME] bootstrap failed", { tradingAccountId: runtime.account.id, error: error instanceof Error ? error.message : String(error) });
       })
       .finally(() => {
         runtime.health.lastScanAt = new Date().toISOString();
-        if (!this.shuttingDown && runtime.reconciliationTimer !== null) {
+        if (bootstrapSucceeded && !this.shuttingDown && runtime.reconciliationTimer !== null) {
           runtime.scanner.start();
         }
         runtime.scannerBootstrapInFlight = null;
@@ -321,9 +344,12 @@ export class TradingRuntimeManager {
 
     const account = await this.accountRepository.findTradingAccountById(accountId);
     if (!account) return;
-    const settings = (await this.configRepository.getSettings(accountId)) ?? this.baseConfig;
+    const storedSettings = await this.configRepository.getSettings(accountId);
+    const settings = storedSettings ?? this.baseConfig;
     const watchlist = await this.configRepository.getWatchlist(accountId);
-    const config = { ...this.baseConfig, ...settings, watchlist, symbol: watchlist[0] ?? settings.symbol };
+    const policy = resolveEffectiveExecutionPolicy(this.processReadOnlySoak, Boolean(storedSettings?.readOnlySoak));
+    const config = { ...this.baseConfig, ...settings, readOnlySoak: policy.effectiveReadOnlySoak, watchlist, symbol: watchlist[0] ?? settings.symbol };
+    runtime.configRef.accountReadOnlySoak = policy.accountReadOnlySoak;
     runtime.configRef.current = config;
     await runtime.repository.saveTradingSettings(config);
     runtime.scanner.updateConfig(config);
@@ -406,7 +432,8 @@ export class TradingRuntimeManager {
       execution,
       realReadiness,
       dailyRisk,
-      accountProtection
+      accountProtection,
+      funnelMetrics: runtime.scanner.getFunnelMetrics()
     };
   }
 
@@ -714,20 +741,29 @@ export class TradingRuntimeManager {
       return { connected: false, ...metadata, positions: [], openOrders: [], orderHistory: [], tradeHistory: [] };
     }
 
-    const [positions, openOrders, orderHistory, tradeHistory] = await Promise.all([
+    const [positions, openOrders] = await Promise.all([
       readAccountRuntimeData("positions", () => client.getOpenPositions(symbol), this.logger),
-      readAccountRuntimeData("open orders", () => client.getOpenOrders(symbol), this.logger),
-      symbol ? readAccountRuntimeData("order history", () => client.getOrderHistory(symbol, limit), this.logger) : Promise.resolve([]),
-      symbol ? readAccountRuntimeData("trade history", () => client.getTradeHistory(symbol, limit), this.logger) : Promise.resolve([])
+      readAccountRuntimeData("open orders", () => client.getOpenOrders(symbol), this.logger)
     ]);
+    const historySymbols = symbol ? [symbol] : [...new Set(positions.map((position) => position.symbol))];
+    const histories = await Promise.all(
+      historySymbols.map(async (historySymbol) => {
+        const [orderHistory, tradeHistory] = await Promise.all([
+          readAccountRuntimeData(`order history ${historySymbol}`, () => client.getOrderHistory(historySymbol, limit), this.logger),
+          readAccountRuntimeData(`trade history ${historySymbol}`, () => client.getTradeHistory(historySymbol, limit), this.logger)
+        ]);
+        return { orderHistory, tradeHistory };
+      })
+    );
 
     return {
       connected: true,
+      authoritative: true,
       ...metadata,
       positions: withActivitySource(positions, account),
       openOrders: withActivitySource(openOrders, account),
-      orderHistory: withActivitySource(orderHistory, account),
-      tradeHistory: withActivitySource(tradeHistory, account)
+      orderHistory: withActivitySource(histories.flatMap((history) => history.orderHistory), account),
+      tradeHistory: withActivitySource(histories.flatMap((history) => history.tradeHistory), account)
     };
   }
 
@@ -740,13 +776,19 @@ export class TradingRuntimeManager {
     return runtime.scanner.getSetupDiagnostic(symbol);
   }
 
-  private async createExecutionGateway(account: TradingAccount, entryMode: "limit" | "market", leverage: number): Promise<ExecutionGateway> {
+  private async createExecutionGateway(
+    account: TradingAccount,
+    entryMode: "limit" | "market",
+    leverage: number,
+    marginMode: "CROSS" | "ISOLATED" | (() => "CROSS" | "ISOLATED"),
+    readOnlySoak: boolean
+  ): Promise<ExecutionGateway> {
     if (account.mode === "REAL") return new LockedRealExecutionGateway();
     const connection = await this.retryDatabaseRead("Binance connection lookup", () => this.accountRepository.findBinanceConnection(account.id));
     if (!connection || connection.status !== "CONNECTED") return new DisabledExecutionGateway("BINANCE_NOT_CONNECTED");
     const apiKey = this.cipher.decrypt(connection.apiKeyEncrypted);
     const apiSecret = this.cipher.decrypt(connection.apiSecretEncrypted);
-    return new BinanceFuturesExecutionGateway(apiKey, apiSecret, "testnet", entryMode, leverage);
+    return new BinanceFuturesExecutionGateway(apiKey, apiSecret, "testnet", entryMode, leverage, marginMode, readOnlySoak && account.mode === "DEMO");
   }
 
   private async createAccountClient(accountId: string): Promise<AccountRuntimeClient | null> {
@@ -858,6 +900,7 @@ export class TradingRuntimeManager {
   }
 
   private resolveRuntimeExecutionGate(account: TradingAccount, health: RuntimeHealth, config: AppConfig, rawExecution: ExecutionGateway): ExecutionGateState {
+    const policy = resolveEffectiveExecutionPolicy(this.processReadOnlySoak, config.readOnlySoak || false);
     return resolveExecutionGate({
       shuttingDown: this.shuttingDown,
       mode: account.mode,
@@ -865,11 +908,18 @@ export class TradingRuntimeManager {
       reconciliationStatus: health.reconciliationStatus,
       tradingEnabled: config.tradingEnabled,
       killSwitch: config.killSwitch,
-      binanceConnected: !(rawExecution instanceof DisabledExecutionGateway)
+      binanceConnected: !(rawExecution instanceof DisabledExecutionGateway),
+      readOnlySoak: policy.effectiveReadOnlySoak && account.mode === "DEMO"
     });
   }
 
   private updateExecutionHealth(runtime: AccountRuntime): ExecutionGateState {
+    const policy = resolveEffectiveExecutionPolicy(this.processReadOnlySoak, runtime.configRef.accountReadOnlySoak);
+    runtime.health.processReadOnlySoak = policy.processReadOnlySoak;
+    runtime.health.accountReadOnlySoak = policy.accountReadOnlySoak;
+    runtime.health.effectiveReadOnlySoak = policy.effectiveReadOnlySoak;
+    runtime.health.executionPolicy = policy.executionPolicy;
+    runtime.health.executionCapability = policy.executionCapability;
     const execution = this.resolveRuntimeExecutionGate(runtime.account, runtime.health, runtime.configRef.current, runtime.rawExecution);
     runtime.health.execution = execution;
     runtime.health.executionEnabled = execution.enabled;
@@ -896,6 +946,7 @@ export class TradingRuntimeManager {
 
 export function resolveExecutionGate(input: ExecutionGateInput): ExecutionGateState {
   if (input.shuttingDown || input.runtimeState === "SHUTTING_DOWN") return disabled("SHUTTING_DOWN");
+  if (input.readOnlySoak && input.mode === "DEMO") return disabled("READ_ONLY_SOAK_EXECUTION_BLOCKED");
   if (input.killSwitch) return disabled("KILL_SWITCH");
   if (!input.tradingEnabled) return disabled("TRADING_DISABLED");
   if (input.runtimeState === "RECOVERING") return disabled("RUNTIME_NOT_READY");
@@ -963,7 +1014,7 @@ async function readAccountRuntimeData<T>(label: string, read: () => Promise<T[]>
     return await read();
   } catch (error) {
     logger.warn(`Account runtime ${label} sync failed`, { error: error instanceof Error ? error.message : String(error) });
-    return [];
+    throw error;
   }
 }
 
@@ -1034,6 +1085,7 @@ class GatedRecoverableExecutionGateway implements RecoverableExecutionGateway {
   }
 
   async submitProtectionOrder(request: ProtectionOrderRequest): Promise<ExecutionOrderLookupResult> {
+    this.assertEnabled();
     return this.delegate.submitProtectionOrder(request);
   }
 
@@ -1042,11 +1094,13 @@ class GatedRecoverableExecutionGateway implements RecoverableExecutionGateway {
   }
 
   async closePosition(request: import("../ports/ExecutionGateway.js").EmergencyCloseRequest): Promise<ExecutionOrderLookupResult> {
+    this.assertEnabled();
     if (!this.delegate.closePosition) throw new Error("FAIL_SAFE_CLOSE_UNAVAILABLE");
     return this.delegate.closePosition(request);
   }
 
   async cancelOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<void> {
+    this.assertEnabled();
     return this.delegate.cancelOrderByClientOrderId(symbol, clientOrderId);
   }
 
@@ -1073,6 +1127,11 @@ function createRecoveringHealth(): RuntimeHealth {
     reconciliationFailure: 0,
     protectionStatus: "OK",
     protectionLastError: null,
-    protectionRepairAttempts: 0
+    protectionRepairAttempts: 0,
+    processReadOnlySoak: false,
+    accountReadOnlySoak: false,
+    effectiveReadOnlySoak: false,
+    executionPolicy: "NORMAL",
+    executionCapability: "CONFIGURED"
   };
 }

@@ -4,7 +4,7 @@ import type { ExecutionIntentRepository } from "./ExecutionIntentRepository.js";
 import type { AccountActivitySnapshot } from "../runtime/TradingRuntimeManager.js";
 import type { ExecutionIntent, ExecutionIntentStatus } from "./ExecutionIntent.js";
 import type { ExecutionOrderLookupResult, RecoverableExecutionGateway } from "../ports/ExecutionGateway.js";
-import type { BinanceFuturesOpenOrderStatus, BinanceFuturesPositionStatus } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
+import type { BinanceFuturesOpenOrderStatus, BinanceFuturesOrderHistoryStatus, BinanceFuturesPositionStatus } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
 
 export interface ReconciliationResult {
   status: "OK" | "DEGRADED" | "CONNECTION_LOST";
@@ -18,6 +18,7 @@ export interface ReconciliationResult {
 export class TradingReconciliationService {
   private readonly recentExternalAudits = new Map<string, number>();
   private readonly repairFailures = new Map<string, { attempts: number; firstAt: number }>();
+  private readonly symbolsWithObservedPositions = new Set<string>();
 
   private readonly repairMaxAttempts = 3;
   private readonly repairTimeoutMs = 5 * 60 * 1000;
@@ -39,24 +40,54 @@ export class TradingReconciliationService {
         await this.audit(tradingAccountId, null, null, "RECONCILIATION_CONNECTION_LOST", {});
         return { status: "CONNECTION_LOST", externalPositions: 0, unprotectedPositions: 0, protectionRepairAttempts: 0, checkedAt, error: null };
       }
+      if (activity.authoritative === false) {
+        await this.audit(tradingAccountId, null, null, "RECONCILIATION_STATE_UNKNOWN", { reason: "BINANCE_SIGNED_READ_NOT_AUTHORITATIVE" });
+        return { status: "DEGRADED", externalPositions: 0, unprotectedPositions: 0, protectionRepairAttempts: 0, checkedAt, error: "BINANCE_STATE_UNKNOWN" };
+      }
 
-      let intents = await this.repository.listOpenByAccount(tradingAccountId);
-      const knownSymbols = new Set(intents.map((intent) => intent.symbol));
+      for (const position of activity.positions) {
+        if (position.quantity > 0) this.symbolsWithObservedPositions.add(position.symbol);
+      }
+
+      // Terminal intents are still needed for authoritative position correlation. A
+      // terminal DB row must not hide a live bot-owned Binance position.
+      let intents = await this.repository.listByAccount(tradingAccountId, 500);
+      const activeIntents = intents.filter((intent) => !isTerminalIntent(intent));
+      const knownSymbols = new Set(activeIntents.map((intent) => intent.symbol));
       const botClientOrderIds = new Set(
         intents.flatMap((intent) => [intent.clientEntryOrderId, intent.clientStopOrderId, intent.clientTakeProfitOrderId]).filter((value): value is string => Boolean(value))
       );
       let externalPositions = 0;
+      let terminalStateMismatches = 0;
+      let ownershipAmbiguous = 0;
+      const ownership = resolvePositionOwnership(intents, activity.positions, activity);
       for (const position of activity.positions) {
         const relatedOpenOrders = activity.openOrders.filter((order) => order.symbol === position.symbol);
         const hasKnownOrder = relatedOpenOrders.some((order) => Boolean(order.clientOrderId && botClientOrderIds.has(order.clientOrderId)));
-        if (!knownSymbols.has(position.symbol) && !hasKnownOrder) {
+        const owner = ownership.get(position.id);
+        const hasKnownIntent = owner?.kind === "owned" || owner?.kind === "ambiguous";
+        if (owner?.kind === "ambiguous") {
+          ownershipAmbiguous += 1;
+          await this.audit(tradingAccountId, null, position.symbol, "BOT_POSITION_OWNERSHIP_AMBIGUOUS", {
+            positionQuantity: position.quantity,
+            positionEntryPrice: position.entryPrice,
+            candidateIntentIds: owner.candidates.map((candidate) => candidate.id)
+          });
+        }
+        if (!knownSymbols.has(position.symbol) && !hasKnownOrder && !hasKnownIntent) {
           externalPositions += 1;
           await this.auditExternalPosition(tradingAccountId, position);
         }
       }
 
       for (const intent of intents) {
-        const latest = await this.reconcileIntent(intent, activity, gateway);
+        const owner = [...ownership.values()].find((candidate) => candidate.kind === "owned" && candidate.intent.id === intent.id);
+        const ambiguous = [...ownership.values()].some(
+          (candidate) => candidate.kind === "ambiguous" && candidate.candidates.some((candidateIntent) => candidateIntent.id === intent.id)
+        );
+        const reconciled = await this.reconcileIntent(intent, activity, gateway, owner?.position, ambiguous);
+        const latest = reconciled.intent;
+        if (reconciled.terminalStateMismatch) terminalStateMismatches += 1;
         if (latest) {
           intents = intents.map((item) => (item.id === latest.id ? latest : item));
         }
@@ -67,14 +98,28 @@ export class TradingReconciliationService {
       const unprotectedPositions = activity.positions.filter((position) => position.quantity > 0 && (position.stopLoss === null || position.takeProfit === null)).length;
       const protectionRepairAttempts = intents.reduce((total, intent) => total + (this.repairFailures.get(intent.id)?.attempts ?? 0), 0);
 
-      await this.audit(tradingAccountId, null, null, unprotectedPositions > 0 ? "RECONCILIATION_PROTECTION_INCOMPLETE" : "RECONCILIATION_SUCCEEDED", { openIntents: intents.length, externalPositions, unprotectedPositions });
+      const reconciliationError =
+        terminalStateMismatches > 0
+          ? "BOT_POSITION_TERMINAL_STATE_MISMATCH"
+          : ownershipAmbiguous > 0
+            ? "BOT_POSITION_OWNERSHIP_AMBIGUOUS"
+            : unprotectedPositions > 0
+              ? "PROTECTION_INCOMPLETE"
+              : null;
+      await this.audit(tradingAccountId, null, null, reconciliationError ? "RECONCILIATION_PROTECTION_INCOMPLETE" : "RECONCILIATION_SUCCEEDED", {
+        openIntents: intents.filter((intent) => !isTerminalIntent(intent)).length,
+        externalPositions,
+        unprotectedPositions,
+        terminalStateMismatches,
+        ownershipAmbiguous
+      });
       return {
-        status: unprotectedPositions > 0 ? "DEGRADED" : "OK",
+        status: terminalStateMismatches > 0 || ownershipAmbiguous > 0 || unprotectedPositions > 0 ? "DEGRADED" : "OK",
         externalPositions,
         unprotectedPositions,
         protectionRepairAttempts,
         checkedAt,
-        error: unprotectedPositions > 0 ? "PROTECTION_INCOMPLETE" : null
+        error: reconciliationError
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -87,11 +132,27 @@ export class TradingReconciliationService {
   private async reconcileIntent(
     intent: ExecutionIntent,
     activity: AccountActivitySnapshot,
-    gateway: RecoverableExecutionGateway | undefined
-  ): Promise<ExecutionIntent | null> {
+    gateway: RecoverableExecutionGateway | undefined,
+    ownedPosition?: BinanceFuturesPositionStatus,
+    ownershipAmbiguous = false
+  ): Promise<{ intent: ExecutionIntent | null; terminalStateMismatch: boolean }> {
     let current = intent;
-    const position = activity.positions.find((item) => item.symbol === current.symbol && item.side === current.side);
+    if (ownershipAmbiguous) return { intent: current, terminalStateMismatch: false };
+    const position = ownedPosition;
+    let terminalStateMismatch = false;
     const entry = await this.findKnownOrder(activity, current.symbol, current.clientEntryOrderId, gateway);
+
+    if (position && isTerminalIntent(current)) {
+      const recovered = await this.repository.transitionStatus(current.id, ["CLOSED", "CANCELLED", "FAILED"], "RECOVERY_REQUIRED", {
+        lastError: "BOT_POSITION_TERMINAL_STATE_MISMATCH"
+      });
+      if (recovered) current = recovered;
+      terminalStateMismatch = true;
+      await this.audit(current.tradingAccountId, current.id, current.symbol, "BOT_POSITION_TERMINAL_STATE_MISMATCH", {
+        positionQuantity: position.quantity,
+        previousStatus: intent.status
+      });
+    }
 
     if (entry && !current.binanceEntryOrderId && ["ENTRY_SUBMITTING", "RECONCILIATION_REQUIRED", "ENTRY_SUBMITTED"].includes(current.status)) {
       const entryStatus = isFilled(entry.status) || entry.executedQuantity > 0 ? "ENTRY_FILLED" : "ENTRY_SUBMITTED";
@@ -120,10 +181,10 @@ export class TradingReconciliationService {
       await this.cancelBotOwnedProtectionOrders(current, activity.openOrders, gateway);
       current = (await this.transition(current, "CLOSED", { lastError: null })) ?? current;
       await this.audit(current.tradingAccountId, current.id, current.symbol, "POSITION_CLOSED", { source: "BINANCE_POSITION_ZERO" });
-      return current;
+      return { intent: current, terminalStateMismatch };
     }
 
-    if (!position) return current;
+    if (!position) return { intent: current, terminalStateMismatch };
     if (current.status === "CLOSING") {
       if (gateway?.closePosition) {
         try {
@@ -134,18 +195,21 @@ export class TradingReconciliationService {
           await this.audit(current.tradingAccountId, current.id, current.symbol, "FAIL_SAFE_CLOSE_FAILED", { error: error instanceof Error ? error.message : String(error) });
         }
       }
-      return current;
+      return { intent: current, terminalStateMismatch };
     }
-    if (!["ENTRY_FILLED", "PROTECTION_INCOMPLETE", "RECONCILIATION_REQUIRED", "ENTRY_SUBMITTED", "PROTECTED", "FAIL_SAFE_CLOSE_REQUIRED"].includes(current.status)) return current;
+    if (!["ENTRY_FILLED", "PROTECTION_INCOMPLETE", "RECONCILIATION_REQUIRED", "ENTRY_SUBMITTED", "PROTECTED", "RECOVERY_REQUIRED", "FAIL_SAFE_CLOSE_REQUIRED"].includes(current.status)) {
+      return { intent: current, terminalStateMismatch };
+    }
 
-    return this.repairProtection(current, position, activity.openOrders, gateway);
+    return { intent: await this.repairProtection(current, position, activity.openOrders, gateway, !terminalStateMismatch), terminalStateMismatch };
   }
 
   private async repairProtection(
     intent: ExecutionIntent,
     position: BinanceFuturesPositionStatus,
     openOrders: BinanceFuturesOpenOrderStatus[],
-    gateway: RecoverableExecutionGateway | undefined
+    gateway: RecoverableExecutionGateway | undefined,
+    allowFailSafeClose = true
   ): Promise<ExecutionIntent | null> {
     let current = intent;
     const exitSide = current.side === "long" ? "SELL" : "BUY";
@@ -169,8 +233,14 @@ export class TradingReconciliationService {
       return current;
     }
 
+    if (current.status === "RECOVERY_REQUIRED" && (current.quantity === null || current.requestedStopLoss === null || current.requestedTakeProfit === null)) {
+      current = (await this.transition(current, "RECOVERY_REQUIRED", { lastError: "MANUAL_RECOVERY_REQUIRED" })) ?? current;
+      await this.audit(current.tradingAccountId, current.id, current.symbol, "MANUAL_RECOVERY_REQUIRED", {});
+      return current;
+    }
+
     if (!gateway || current.quantity === null || current.requestedStopLoss === null || current.requestedTakeProfit === null) {
-      return this.handleRepairFailure(current, position, gateway, "PROTECTION_REPAIR_REQUIRES_MANUAL_RECONCILIATION");
+      return this.handleRepairFailure(current, position, gateway, "PROTECTION_REPAIR_REQUIRES_MANUAL_RECONCILIATION", allowFailSafeClose);
     }
 
     const quantity = position.quantity || current.quantity;
@@ -215,11 +285,17 @@ export class TradingReconciliationService {
       return current;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return this.handleRepairFailure(current, position, gateway, message);
+      return this.handleRepairFailure(current, position, gateway, message, allowFailSafeClose);
     }
   }
 
-  private async handleRepairFailure(intent: ExecutionIntent, position: BinanceFuturesPositionStatus, gateway: RecoverableExecutionGateway | undefined, error: string): Promise<ExecutionIntent | null> {
+  private async handleRepairFailure(
+    intent: ExecutionIntent,
+    position: BinanceFuturesPositionStatus,
+    gateway: RecoverableExecutionGateway | undefined,
+    error: string,
+    allowFailSafeClose = true
+  ): Promise<ExecutionIntent | null> {
     const now = Date.now();
     const persistedFailures = await this.repository.listAuditEvents(intent.tradingAccountId, intent.id, 100);
     const priorPersisted = persistedFailures.filter((event) => ["PROTECTION_REPAIR_FAILED", "PROTECTION_REPAIR_BLOCKED", "FAIL_SAFE_CLOSE_FAILED"].includes(event.type));
@@ -230,9 +306,10 @@ export class TradingReconciliationService {
     const failures = { attempts: prior.attempts + 1, firstAt: prior.firstAt };
     this.repairFailures.set(intent.id, failures);
     const thresholdReached = failures.attempts >= this.repairMaxAttempts || now - failures.firstAt >= this.repairTimeoutMs;
-    const next = (await this.transition(intent, thresholdReached ? "FAIL_SAFE_CLOSE_REQUIRED" : "RECONCILIATION_REQUIRED", { lastError: error })) ?? intent;
-    await this.audit(intent.tradingAccountId, intent.id, intent.symbol, thresholdReached ? "FAIL_SAFE_CLOSE_REQUIRED" : "PROTECTION_REPAIR_FAILED", { error, attempts: failures.attempts });
-    if (!thresholdReached || !gateway?.closePosition) return next;
+    const nextStatus = allowFailSafeClose ? thresholdReached ? "FAIL_SAFE_CLOSE_REQUIRED" : "RECONCILIATION_REQUIRED" : "RECOVERY_REQUIRED";
+    const next = (await this.transition(intent, nextStatus, { lastError: error })) ?? intent;
+    await this.audit(intent.tradingAccountId, intent.id, intent.symbol, thresholdReached && allowFailSafeClose ? "FAIL_SAFE_CLOSE_REQUIRED" : "PROTECTION_REPAIR_FAILED", { error, attempts: failures.attempts });
+    if (!allowFailSafeClose || !thresholdReached || !gateway?.closePosition) return next;
     try {
       const exitSide = intent.side === "long" ? "SELL" : "BUY";
       const closed = await gateway.closePosition({ symbol: intent.symbol, side: exitSide, quantity: position.quantity, clientOrderId: `smc_${intent.id.replace(/-/g, "").slice(0, 24)}_C` });
@@ -285,11 +362,11 @@ export class TradingReconciliationService {
 
   private async cancelOrphanProtectionOrders(tradingAccountId: string, activity: AccountActivitySnapshot, intents: ExecutionIntent[], gateway: RecoverableExecutionGateway | undefined): Promise<void> {
     if (!gateway) return;
-    const openSymbols = new Set(activity.positions.filter((position) => position.quantity > 0).map((position) => position.symbol));
+      const openSymbols = new Set(activity.positions.filter((position) => position.quantity > 0).map((position) => position.symbol));
     const requiredIds = new Set(intents.flatMap((intent) => [intent.clientStopOrderId, intent.clientTakeProfitOrderId]).filter((id): id is string => Boolean(id)));
     for (const order of activity.openOrders) {
       if (!order.clientOrderId?.startsWith("smc_") || !["STOP_MARKET", "TAKE_PROFIT_MARKET"].includes(order.type)) continue;
-      if (openSymbols.has(order.symbol) || requiredIds.has(order.clientOrderId)) continue;
+      if (openSymbols.has(order.symbol) || this.symbolsWithObservedPositions.has(order.symbol) || requiredIds.has(order.clientOrderId)) continue;
       await gateway.cancelOrderByClientOrderId(order.symbol, order.clientOrderId);
       await this.audit(tradingAccountId, null, order.symbol, "ORPHAN_PROTECTION_CANCELLED", { orderId: order.orderId, clientOrderId: order.clientOrderId });
     }
@@ -337,9 +414,111 @@ const OPEN_STATUSES: ExecutionIntentStatus[] = [
   "PROTECTION_INCOMPLETE",
   "CLOSING",
   "RECONCILIATION_REQUIRED",
+  "RECOVERY_REQUIRED",
   "FAIL_SAFE_CLOSE_REQUIRED",
   "BINANCE_CONNECTION_LOST"
 ];
+
+function isTerminalIntent(intent: ExecutionIntent): boolean {
+  return intent.status === "CLOSED" || intent.status === "CANCELLED" || intent.status === "FAILED";
+}
+
+type PositionOwnership =
+  | { kind: "owned"; intent: ExecutionIntent; position: BinanceFuturesPositionStatus }
+  | { kind: "ambiguous"; candidates: ExecutionIntent[]; position: BinanceFuturesPositionStatus };
+
+function resolvePositionOwnership(
+  intents: ExecutionIntent[],
+  positions: BinanceFuturesPositionStatus[],
+  activity: AccountActivitySnapshot
+): Map<string, PositionOwnership> {
+  const ownership = new Map<string, PositionOwnership>();
+  for (const position of positions) {
+    const candidates = intents.filter((intent) => matchesBotOwnedPosition(intent, position, activity));
+    if (candidates.length === 1) {
+      ownership.set(position.id, { kind: "owned", intent: candidates[0]!, position });
+    } else if (candidates.length > 1) {
+      ownership.set(position.id, { kind: "ambiguous", candidates, position });
+    } else {
+      const possible = intents.filter((intent) => !isTerminalIntent(intent) && intent.symbol === position.symbol && intent.side === position.side);
+      if (possible.length > 0) ownership.set(position.id, { kind: "ambiguous", candidates: possible, position });
+    }
+  }
+  return ownership;
+}
+
+function matchesBotOwnedPosition(intent: ExecutionIntent, position: BinanceFuturesPositionStatus, activity: AccountActivitySnapshot): boolean {
+  if (intent.source !== "BOT" || intent.symbol !== position.symbol || intent.side !== position.side) return false;
+  const entryOrders = [...activity.openOrders, ...activity.orderHistory];
+  const matchingOrder = entryOrders.find(
+    (order) =>
+      order.symbol === position.symbol &&
+      isEntryOrder(order.type) &&
+      ((intent.binanceEntryOrderId !== null && order.orderId === intent.binanceEntryOrderId) ||
+        (intent.clientEntryOrderId !== null && order.clientOrderId === intent.clientEntryOrderId))
+  );
+  const matchingTrade = activity.tradeHistory.find(
+    (trade) =>
+      trade.symbol === position.symbol &&
+      ((intent.binanceEntryOrderId !== null && trade.orderId === intent.binanceEntryOrderId) ||
+        (intent.clientEntryOrderId !== null && trade.orderId === intent.clientEntryOrderId))
+  );
+
+  // Historical order/client IDs are not sufficient by themselves: Binance keeps
+  // them forever, so an old filled entry can otherwise claim a later position.
+  if (matchingTrade && isCompatibleEntryEvidence(intent, position, matchingTrade.price, matchingTrade.quantity, matchingTrade.createdAt)) return true;
+  if (
+    matchingOrder &&
+    isCompatibleEntryEvidence(
+      intent,
+      position,
+      (matchingOrder as BinanceFuturesOrderHistoryStatus).averagePrice ?? matchingOrder.price,
+      matchingOrder.executedQuantity || matchingOrder.quantity,
+      matchingOrder.updatedAt ?? matchingOrder.createdAt
+    )
+  ) {
+    return true;
+  }
+
+  // A live non-terminal intent may be recovered when Binance history is
+  // temporarily unavailable, but terminal intents require direct evidence.
+  if (isTerminalIntent(intent)) return false;
+  return (
+    intent.status === "ENTRY_SUBMITTED" ||
+    intent.status === "ENTRY_FILLED" ||
+    intent.status === "PROTECTED" ||
+    intent.status === "PROTECTION_INCOMPLETE" ||
+    intent.status === "RECONCILIATION_REQUIRED" ||
+    intent.status === "RECOVERY_REQUIRED" ||
+    intent.status === "CLOSING" ||
+    intent.status === "FAIL_SAFE_CLOSE_REQUIRED"
+  ) && approximatelyEqual(position.entryPrice, intent.requestedEntry) && approximatelyEqual(position.quantity, intent.quantity);
+}
+
+function isEntryOrder(type: string): boolean {
+  return type === "MARKET" || type === "LIMIT" || type === "STOP" || type === "TAKE_PROFIT";
+}
+
+function isCompatibleEntryEvidence(
+  intent: ExecutionIntent,
+  position: BinanceFuturesPositionStatus,
+  entryPrice: number | null,
+  quantity: number,
+  evidenceTime: number | null
+): boolean {
+  if (!approximatelyEqual(position.entryPrice, entryPrice) || !approximatelyEqual(position.quantity, quantity)) return false;
+  if (position.entryTime !== null && evidenceTime !== null && Math.abs(position.entryTime - evidenceTime) > 5 * 60) return false;
+  if (intent.createdAt && position.entryTime !== null) {
+    const intentTime = Date.parse(intent.createdAt) / 1000;
+    if (Number.isFinite(intentTime) && position.entryTime + 5 * 60 < intentTime) return false;
+  }
+  return true;
+}
+
+function approximatelyEqual(left: number | null, right: number | null, relativeTolerance = 0.005): boolean {
+  if (left === null || right === null || !Number.isFinite(left) || !Number.isFinite(right) || left <= 0 || right <= 0) return false;
+  return Math.abs(left - right) <= Math.max(Math.abs(left), Math.abs(right)) * relativeTolerance;
+}
 
 function findBotOrder(openOrders: BinanceFuturesOpenOrderStatus[], clientOrderId: string | null, type: "STOP_MARKET" | "TAKE_PROFIT_MARKET", exitSide: "BUY" | "SELL"): BinanceFuturesOpenOrderStatus | null {
   if (!clientOrderId) return null;

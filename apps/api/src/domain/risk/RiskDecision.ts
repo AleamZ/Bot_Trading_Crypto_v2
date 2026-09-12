@@ -36,6 +36,8 @@ export interface RiskDecision {
   margin: number;
   leverage: number;
   requiredLeverage: number;
+  leverageRequiredForPerTrade?: number;
+  leverageRequiredForTotal?: number;
   leverageNeededForMargin: number;
   effectiveMaxLeverage: number;
   maxLeverage: number;
@@ -57,6 +59,7 @@ export interface RiskDecision {
   riskPerTradeUsdt: number;
   availableBalance: number;
   maxAllowedMargin: number;
+  remainingTotalMarginBudget?: number;
   marginUsagePercent: number;
   currentUsedMargin: number;
   candidateRequiredMargin: number;

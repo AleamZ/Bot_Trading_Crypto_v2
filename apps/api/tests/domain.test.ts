@@ -327,6 +327,95 @@ describe("risk and state", () => {
     expect(over).toMatchObject({ accepted: false, rejectCode: "MAX_TOTAL_MARGIN_USAGE_EXCEEDED" });
   });
 
+  it("selects leverage for the stricter of the per-trade and total margin caps", () => {
+    const perTradeOneTotalTwo = evaluateRisk(
+      riskInput({ maxMarginUsagePercent: 100, maxTotalMarginUsagePercent: 60 })
+    );
+    const perTradeThreeTotalTwo = evaluateRisk(
+      riskInput({ maxMarginUsagePercent: 40, maxTotalMarginUsagePercent: 60 })
+    );
+    const perTradeTwoTotalFive = evaluateRisk(
+      riskInput({ maxMarginUsagePercent: 60, maxTotalMarginUsagePercent: 20 })
+    );
+
+    expect(perTradeOneTotalTwo).toMatchObject({ accepted: true, selectedLeverage: 2, requiredMargin: 500 });
+    expect(perTradeThreeTotalTwo).toMatchObject({ accepted: true, selectedLeverage: 3, requiredMargin: 1000 / 3 });
+    expect(perTradeTwoTotalFive).toMatchObject({ accepted: true, selectedLeverage: 5, requiredMargin: 200 });
+    expect(perTradeOneTotalTwo.leverageRequiredForPerTrade).toBe(1);
+    expect(perTradeOneTotalTwo.leverageRequiredForTotal).toBeCloseTo(5 / 3, 8);
+  });
+
+  it("uses the remaining total margin budget after existing margin", () => {
+    const decision = evaluateRisk(
+      riskInput({ maxMarginUsagePercent: 100, maxTotalMarginUsagePercent: 60, currentUsedMargin: 300 })
+    );
+
+    expect(decision).toMatchObject({
+      accepted: true,
+      selectedLeverage: 4,
+      remainingTotalMarginBudget: 300,
+      requiredMargin: 250,
+      projectedTotalMargin: 550
+    });
+  });
+
+  it("rejects when no total margin budget remains", () => {
+    const decision = evaluateRisk(
+      riskInput({ maxTotalMarginUsagePercent: 60, currentUsedMargin: 600 })
+    );
+
+    expect(decision).toMatchObject({ accepted: false, rejectCode: "MAX_TOTAL_MARGIN_USAGE_EXCEEDED", remainingTotalMarginBudget: 0 });
+  });
+
+  it("rejects combined-cap leverage above the effective maximum", () => {
+    const decision = evaluateRisk(
+      riskInput({ maxMarginUsagePercent: 100, maxTotalMarginUsagePercent: 20, maxLeverage: 3 })
+    );
+
+    expect(decision).toMatchObject({ accepted: false, rejectCode: "REQUIRED_LEVERAGE_EXCEEDS_MAX", selectedLeverage: 5, effectiveMaxLeverage: 3 });
+  });
+
+  it("selects 2x for the audited XRPUSDT candidate without changing risk sizing", () => {
+    const decision = evaluateRisk(
+      riskInput({
+        symbol: "XRPUSDT",
+        direction: "bearish",
+        availableBalance: 6098.66497676,
+        symbolRules: {
+          ...symbolRules(),
+          symbol: "XRPUSDT",
+          stepSize: 0.1,
+          minQty: 0.1,
+          maxQty: null,
+          maxLeverage: 75
+        },
+        riskPerTradeUsdt: 5,
+        maxMarginUsagePercent: 80,
+        maxTotalMarginUsagePercent: 60,
+        marginMode: "ISOLATED",
+        entry: 1.3412,
+        stopLoss: 1.3426,
+        takeProfit: 1.3309,
+        minimumRiskReward: 1
+      })
+    );
+
+    expect(decision).toMatchObject({
+      accepted: true,
+      selectedLeverage: 2,
+      requiredMargin: 2394.98084,
+      liquidationSafetyStatus: "SAFE"
+    });
+    expect(decision.notional).toBeCloseTo(4789.96168, 8);
+    expect(decision.marginUsagePercent).toBeCloseTo(39.2705756, 7);
+    expect(decision.totalMarginUsagePercent).toBeCloseTo(39.2705756, 7);
+    expect(decision.quantity).toBe(3571.4);
+    expect(decision.actualRiskUsdt).toBeCloseTo(5, 4);
+    expect(decision.entry).toBe(1.3412);
+    expect(decision.stopLoss).toBe(1.3426);
+    expect(decision.takeProfit).toBe(1.3309);
+  });
+
   it("risk per trade changes quantity without moving entry, SL or HTF TP", () => {
     const base = riskInput({ riskPerTradeUsdt: 50 });
     const larger = riskInput({ riskPerTradeUsdt: 100 });

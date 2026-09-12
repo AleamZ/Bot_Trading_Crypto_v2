@@ -1,5 +1,5 @@
 import pg from "pg";
-import { getPostgresPool, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
+import { getPostgresPool, withPostgresMigrationLock, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { CreateTradingAccountInput, TradingAccountRepository } from "../../application/trading-account/TradingAccountRepository.js";
 import type { BinanceConnection, TradingAccount, TradingAccountStatus } from "../../domain/trading-account/TradingAccount.js";
@@ -193,7 +193,7 @@ export class PostgresTradingAccountRepository implements TradingAccountRepositor
 export async function createTradingAccountRepository(databaseUrl?: string): Promise<TradingAccountRepository> {
   if (!databaseUrl) return new MemoryTradingAccountRepository();
   const repository = new PostgresTradingAccountRepository(databaseUrl);
-  await withPostgresStartupRetry("trading account repository migration", () => repository.migrate());
+  await withPostgresMigrationLock(databaseUrl, () => withPostgresStartupRetry("trading account repository migration", () => repository.migrate()));
   return repository;
 }
 

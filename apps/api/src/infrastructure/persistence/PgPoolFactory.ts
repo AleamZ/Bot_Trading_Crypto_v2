@@ -1,6 +1,24 @@
 import pg from "pg";
 
 const pools = new Map<string, pg.Pool>();
+const migrationLocks = new Map<string, Promise<void>>();
+const poolMetrics = new Map<string, PostgresPoolObservability>();
+
+export interface PostgresPoolObservability {
+  max: number;
+  total: number;
+  idle: number;
+  waiting: number;
+  totalPeak: number;
+  idleMin: number;
+  waitingPeak: number;
+  maxSqlDurationMs: number;
+  maxDbOperationMs: number;
+  maxPoolAcquireWaitMs: number | null;
+  slowQueryCount: number;
+  queryReadTimeoutCount: number;
+  connectionResetCount: number;
+}
 
 export function getPostgresPool(connectionString: string): pg.Pool {
   const cached = pools.get(connectionString);
@@ -10,6 +28,7 @@ export function getPostgresPool(connectionString: string): pg.Pool {
   const max = readPoolMax();
   const options = {
     connectionString,
+    application_name: process.env.POSTGRES_APPLICATION_NAME ?? "bot-api-testnet",
     max,
     min: 0,
     maxLifetimeSeconds: readSeconds("POSTGRES_MAX_LIFETIME_SECONDS", 300),
@@ -20,6 +39,40 @@ export function getPostgresPool(connectionString: string): pg.Pool {
     keepAliveInitialDelayMillis: readMillis("POSTGRES_KEEPALIVE_INITIAL_DELAY_MS", 10_000)
   };
   const pool = new pg.Pool(ssl ? { ...options, ssl } : options);
+  const metrics: PostgresPoolObservability = {
+    max,
+    total: 0,
+    idle: 0,
+    waiting: 0,
+    totalPeak: 0,
+    idleMin: Number.POSITIVE_INFINITY,
+    waitingPeak: 0,
+    maxSqlDurationMs: 0,
+    maxDbOperationMs: 0,
+    maxPoolAcquireWaitMs: null,
+    slowQueryCount: 0,
+    queryReadTimeoutCount: 0,
+    connectionResetCount: 0
+  };
+  poolMetrics.set(connectionString, metrics);
+  const query = pool.query.bind(pool);
+  (pool as pg.Pool & { query: (...args: unknown[]) => Promise<unknown> }).query = (async (...args: unknown[]) => {
+    const startedAt = Date.now();
+    try {
+      return await query(...(args as Parameters<pg.Pool["query"]>));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === "Query read timeout") metrics.queryReadTimeoutCount += 1;
+      if (["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE"].includes(errorCode(error))) metrics.connectionResetCount += 1;
+      throw error;
+    } finally {
+      const duration = Date.now() - startedAt;
+      metrics.maxSqlDurationMs = Math.max(metrics.maxSqlDurationMs, duration);
+      metrics.maxDbOperationMs = Math.max(metrics.maxDbOperationMs, duration);
+      if (duration >= readMillis("POSTGRES_SLOW_QUERY_MS", 1_000)) metrics.slowQueryCount += 1;
+      updatePoolMetrics(pool, metrics);
+    }
+  }) as pg.Pool["query"];
   pool.on("error", (error) => {
     console.error(
       JSON.stringify({
@@ -65,6 +118,24 @@ export async function withPostgresStartupRetry<T>(label: string, operation: () =
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+export async function withPostgresMigrationLock<T>(connectionString: string, operation: () => Promise<T>): Promise<T> {
+  const previous = migrationLocks.get(connectionString) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.catch(() => undefined).then(() => gate);
+  migrationLocks.set(connectionString, queued);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (migrationLocks.get(connectionString) === queued) migrationLocks.delete(connectionString);
+  }
+}
+
 export async function verifyPostgresConnection(connectionString: string): Promise<void> {
   const pool = getPostgresPool(connectionString);
   await withPostgresStartupRetry("initial connection", () => pool.query("select 1"));
@@ -77,6 +148,7 @@ export async function closeAllPostgresPools(): Promise<void> {
 }
 
 export function getPostgresPoolStats(): Array<{ total: number; idle: number; waiting: number }> {
+  for (const [connectionString, pool] of pools) updatePoolMetrics(pool, poolMetrics.get(connectionString));
   return [...pools.values()].map((pool) => ({
     total: pool.totalCount,
     idle: pool.idleCount,
@@ -84,9 +156,16 @@ export function getPostgresPoolStats(): Array<{ total: number; idle: number; wai
   }));
 }
 
+export function getPostgresPoolObservability(): PostgresPoolObservability[] {
+  for (const [connectionString, pool] of pools) updatePoolMetrics(pool, poolMetrics.get(connectionString));
+  return [...poolMetrics.values()].map((metrics) => ({ ...metrics, idleMin: Number.isFinite(metrics.idleMin) ? metrics.idleMin : 0 }));
+}
+
 function readPoolMax(): number {
-  const value = Number(process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX ?? 2);
-  if (!Number.isFinite(value)) return 2;
+  // Runtime scanners and authenticated API reads share one pool. Keep enough
+  // headroom for concurrent account-scoped work when no explicit limit is set.
+  const value = Number(process.env.POSTGRES_POOL_MAX ?? process.env.PG_POOL_MAX ?? 8);
+  if (!Number.isFinite(value)) return 8;
   return Math.max(1, Math.min(10, Math.trunc(value)));
 }
 
@@ -116,4 +195,18 @@ function isTransientPostgresError(error: unknown): boolean {
 
 function shouldUseSsl(connectionString: string): boolean {
   return !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
+}
+
+function updatePoolMetrics(pool: pg.Pool, metrics: PostgresPoolObservability | undefined): void {
+  if (!metrics) return;
+  metrics.total = pool.totalCount;
+  metrics.idle = pool.idleCount;
+  metrics.waiting = pool.waitingCount;
+  metrics.totalPeak = Math.max(metrics.totalPeak, pool.totalCount);
+  metrics.idleMin = Math.min(metrics.idleMin, pool.idleCount);
+  metrics.waitingPeak = Math.max(metrics.waitingPeak, pool.waitingCount);
+}
+
+function errorCode(error: unknown): string {
+  return typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 }

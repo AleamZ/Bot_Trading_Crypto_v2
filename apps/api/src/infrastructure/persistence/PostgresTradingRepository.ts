@@ -1,5 +1,5 @@
 import pg from "pg";
-import { getPostgresPool, withPostgresStartupRetry } from "./PgPoolFactory.js";
+import { getPostgresPool, withPostgresMigrationLock, withPostgresStartupRetry } from "./PgPoolFactory.js";
 import { recordSchemaMigration } from "./SchemaMigrations.js";
 import type { TradingRepository } from "../../application/ports/Repositories.js";
 import type { DomainEvent } from "../../domain/events/DomainEvent.js";
@@ -28,7 +28,8 @@ export class PostgresTradingRepository implements TradingRepository {
   }
 
   async migrate(): Promise<void> {
-    await recordSchemaMigration(this.pool, "005_trading_records", "account scoped trading records");
+    const migrationApplied = await recordSchemaMigration(this.pool, "005_trading_records", "account scoped trading records");
+    if (!migrationApplied) return;
     await this.pool.query(`
       create table if not exists trading_records (
         id text primary key,
@@ -106,7 +107,8 @@ export class PostgresTradingRepository implements TradingRepository {
     const result = await this.pool.query(
       `select kind, payload from trading_records
        where trading_account_id = $1
-       order by created_at asc`,
+       order by created_at asc
+       limit 5000`,
       [this.tradingAccountId]
     );
     const fvgs = result.rows.filter((row: { kind: string }) => row.kind === "fvg").map((row: { payload: Fvg }) => row.payload);
@@ -151,7 +153,7 @@ export async function createRepository(databaseUrl?: string): Promise<TradingRep
 
   try {
     const repository = new PostgresTradingRepository(databaseUrl);
-    await withPostgresStartupRetry("trading repository migration", () => repository.migrate());
+    await withPostgresMigrationLock(databaseUrl, () => withPostgresStartupRetry("trading repository migration", () => repository.migrate()));
     return repository;
   } catch (error) {
     throw new Error(`Postgres trading repository initialization failed: ${sanitizeDatabaseError(error)}`, { cause: error });

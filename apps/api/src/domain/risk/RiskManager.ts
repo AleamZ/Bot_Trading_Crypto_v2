@@ -9,16 +9,19 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
   const quantity = normalizeQuantity(rawQuantity, input.symbolRules.stepSize);
   const positionSize = quantity * input.entry;
   const actualRiskUsdt = quantity * stopDistance;
-  const maxAllowedMargin = input.availableBalance * (input.maxMarginUsagePercent / 100);
-  const effectiveMaxLeverage = Math.min(input.maxLeverage, input.symbolRules.maxLeverage ?? input.maxLeverage);
-  const rawRequiredLeverage = positionSize > 0 && maxAllowedMargin > 0 ? positionSize / maxAllowedMargin : 0;
-  const leverageNeededForMargin = Number.isFinite(rawRequiredLeverage) ? Math.max(1, Math.ceil(rawRequiredLeverage)) : 0;
-  const selectedLeverage = leverageNeededForMargin;
-  const requiredMargin = selectedLeverage > 0 ? positionSize / selectedLeverage : 0;
   const currentUsedMargin = Number.isFinite(input.currentUsedMargin ?? 0) && (input.currentUsedMargin ?? 0) >= 0 ? input.currentUsedMargin ?? 0 : 0;
-  // Legacy/domain callers without account portfolio data retain the prior per-trade-only behavior.
-  // Runtime and Analysis always pass the account-scoped configured cap.
+  // Leverage must satisfy both the individual trade cap and the remaining portfolio cap.
   const maxTotalMarginUsagePercent = input.maxTotalMarginUsagePercent ?? 100;
+  const maxAllowedMargin = input.availableBalance * (input.maxMarginUsagePercent / 100);
+  const maxTotalMargin = input.availableBalance * (maxTotalMarginUsagePercent / 100);
+  const remainingTotalMarginBudget = maxTotalMargin - currentUsedMargin;
+  const effectiveMaxLeverage = Math.min(input.maxLeverage, input.symbolRules.maxLeverage ?? input.maxLeverage);
+  const leverageRequiredForPerTrade = positionSize > 0 && maxAllowedMargin > 0 ? positionSize / maxAllowedMargin : 0;
+  const leverageRequiredForTotal = positionSize > 0 && remainingTotalMarginBudget > 0 ? positionSize / remainingTotalMarginBudget : Number.POSITIVE_INFINITY;
+  const rawRequiredLeverage = Math.max(1, leverageRequiredForPerTrade, leverageRequiredForTotal);
+  const leverageNeededForMargin = Number.isFinite(rawRequiredLeverage) ? Math.ceil(rawRequiredLeverage) : Number.POSITIVE_INFINITY;
+  const selectedLeverage = leverageNeededForMargin;
+  const requiredMargin = Number.isFinite(selectedLeverage) && selectedLeverage > 0 ? positionSize / selectedLeverage : 0;
   const projectedTotalMargin = currentUsedMargin + requiredMargin;
   const liquidation = evaluateLiquidationSafety(input, quantity, positionSize, requiredMargin);
   const estimatedLoss = actualRiskUsdt;
@@ -29,6 +32,8 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
     margin: requiredMargin,
     leverage: selectedLeverage,
     requiredLeverage: rawRequiredLeverage,
+    leverageRequiredForPerTrade,
+    leverageRequiredForTotal,
     leverageNeededForMargin,
     effectiveMaxLeverage,
     selectedLeverage,
@@ -50,6 +55,7 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
     riskPerTradeUsdt: input.riskPerTradeUsdt,
     availableBalance: input.availableBalance,
     maxAllowedMargin,
+    remainingTotalMarginBudget,
     marginUsagePercent: input.availableBalance > 0 ? (requiredMargin / input.availableBalance) * 100 : 0,
     currentUsedMargin,
     candidateRequiredMargin: requiredMargin,
@@ -74,6 +80,7 @@ export function evaluateRisk(input: RiskInput): RiskDecision {
   if (quantity < input.symbolRules.minQty) return reject("MIN_QTY", "Quantity is below Binance minimum quantity", baseDecision);
   if (input.symbolRules.maxQty !== null && quantity > input.symbolRules.maxQty) return reject("MAX_QTY", "Quantity exceeds Binance maximum quantity", baseDecision);
   if (input.symbolRules.minNotional !== null && positionSize < input.symbolRules.minNotional) return reject("MIN_NOTIONAL", "Position size is below Binance minimum notional", baseDecision);
+  if (remainingTotalMarginBudget <= 0) return reject("MAX_TOTAL_MARGIN_USAGE_EXCEEDED", "No remaining portfolio margin budget is available", baseDecision);
   if (selectedLeverage > effectiveMaxLeverage) return reject("REQUIRED_LEVERAGE_EXCEEDS_MAX", "Required leverage exceeds configured or Binance maximum", baseDecision);
   if (requiredMargin > input.availableBalance) return reject("MARGIN_REQUIREMENT", "Required margin exceeds available balance", baseDecision);
   if (requiredMargin > input.availableBalance * (input.maxMarginUsagePercent / 100)) return reject("MAX_MARGIN_USAGE_EXCEEDED", "Required margin exceeds configured maximum margin usage", baseDecision);

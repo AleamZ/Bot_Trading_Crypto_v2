@@ -69,6 +69,16 @@ describe("Binance signed account source routing", () => {
     expect(urls.some((url) => url.includes("https://fapi.binance.com/fapi/v1/openOrders"))).toBe(true);
     expect(urls.some((url) => url.includes("https://fapi.binance.com/fapi/v1/openAlgoOrders"))).toBe(true);
   });
+
+  it("fails closed when open algo orders cannot be read", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/fapi/v1/openAlgoOrders")) return new Response('{"code":-1021,"msg":"Timestamp outside recvWindow"}', { status: 400 });
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    await expect(new BinanceFuturesAccountClient("DEMO_KEY", "DEMO_SECRET", true).getOpenOrders("LTCUSDT")).rejects.toThrow("-1021");
+  });
 });
 
 describe("DEMO and REAL settings schema/UI parity", () => {

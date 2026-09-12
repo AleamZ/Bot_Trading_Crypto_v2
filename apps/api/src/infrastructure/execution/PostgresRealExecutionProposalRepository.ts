@@ -1,7 +1,7 @@
 import pg from "pg";
 import type { CreateRealExecutionProposalInput, RealExecutionProposal, RealExecutionProposalStatus } from "../../application/execution/RealExecutionProposal.js";
 import type { RealExecutionProposalRepository } from "../../application/execution/RealExecutionProposalRepository.js";
-import { getPostgresPool, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
+import { getPostgresPool, withPostgresMigrationLock, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import { MemoryRealExecutionProposalRepository } from "./MemoryRealExecutionProposalRepository.js";
 
@@ -168,7 +168,7 @@ export class PostgresRealExecutionProposalRepository implements RealExecutionPro
 export async function createRealExecutionProposalRepository(databaseUrl?: string): Promise<RealExecutionProposalRepository> {
   if (!databaseUrl) return new MemoryRealExecutionProposalRepository();
   const repository = new PostgresRealExecutionProposalRepository(databaseUrl);
-  await withPostgresStartupRetry("real execution proposal repository migration", () => repository.migrate());
+  await withPostgresMigrationLock(databaseUrl, () => withPostgresStartupRetry("real execution proposal repository migration", () => repository.migrate()));
   return repository;
 }
 

@@ -156,7 +156,7 @@ export class BinanceFuturesAccountClient {
     const [account, openOrders, openAlgoOrders] = await Promise.all([
       this.signedGet<AccountResponse>("/fapi/v2/account"),
       this.signedGet<OpenOrder[]>("/fapi/v1/openOrders", symbol ? { symbol } : {}),
-      this.signedGet<OpenAlgoOrder[]>("/fapi/v1/openAlgoOrders", symbol ? { symbol } : {}).catch(() => [])
+      this.signedGet<OpenAlgoOrder[]>("/fapi/v1/openAlgoOrders", symbol ? { symbol } : {})
     ]);
     const ordersBySymbol = groupOrdersBySymbol([...openOrders, ...openAlgoOrders.map(toOpenOrder)]);
     const tradesBySymbol = await this.getTradesBySymbol(symbol, account.positions ?? []);
@@ -193,7 +193,7 @@ export class BinanceFuturesAccountClient {
   async getOpenOrders(symbol?: string): Promise<BinanceFuturesOpenOrderStatus[]> {
     const [orders, algoOrders] = await Promise.all([
       this.signedGet<OpenOrder[]>("/fapi/v1/openOrders", symbol ? { symbol } : {}),
-      this.signedGet<OpenAlgoOrder[]>("/fapi/v1/openAlgoOrders", symbol ? { symbol } : {}).catch(() => [])
+      this.signedGet<OpenAlgoOrder[]>("/fapi/v1/openAlgoOrders", symbol ? { symbol } : {})
     ]);
     return [...orders, ...algoOrders.map(toOpenOrder)].map(toOpenOrderStatus);
   }
@@ -266,7 +266,7 @@ export class BinanceFuturesAccountClient {
         : [...new Set((positions ?? []).filter((position) => Number(position.positionAmt ?? 0) !== 0).map((position) => position.symbol))];
     const entries = await Promise.all(
       symbols.map(async (item) => {
-        const trades = await this.signedGet<UserTrade[]>("/fapi/v1/userTrades", { symbol: item, limit: "1000" }).catch(() => []);
+        const trades = await this.signedGet<UserTrade[]>("/fapi/v1/userTrades", { symbol: item, limit: "1000" });
         return [item, trades] as const;
       })
     );

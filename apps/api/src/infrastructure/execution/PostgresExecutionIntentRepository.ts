@@ -1,5 +1,5 @@
 import pg from "pg";
-import { getPostgresPool, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
+import { getPostgresPool, withPostgresMigrationLock, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
 import type { CreateExecutionIntentInput, ExecutionAuditEvent, ExecutionIntent, ExecutionIntentStatus } from "../../application/execution/ExecutionIntent.js";
 import type { ExecutionIntentRepository } from "../../application/execution/ExecutionIntentRepository.js";
@@ -179,7 +179,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
 export async function createExecutionIntentRepository(databaseUrl?: string): Promise<ExecutionIntentRepository> {
   if (!databaseUrl) return new MemoryExecutionIntentRepository();
   const repository = new PostgresExecutionIntentRepository(databaseUrl);
-  await withPostgresStartupRetry("execution intent repository migration", () => repository.migrate());
+  await withPostgresMigrationLock(databaseUrl, () => withPostgresStartupRetry("execution intent repository migration", () => repository.migrate()));
   return repository;
 }
 

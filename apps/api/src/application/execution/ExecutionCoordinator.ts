@@ -31,6 +31,7 @@ export type ExecutionGateReason =
   | "RUNTIME_NOT_READY"
   | "RECONCILIATION_REQUIRED"
   | "REAL_EXECUTION_LOCKED"
+  | "READ_ONLY_SOAK_EXECUTION_BLOCKED"
   | "SHUTTING_DOWN";
 
 export interface ExecutionGateState {

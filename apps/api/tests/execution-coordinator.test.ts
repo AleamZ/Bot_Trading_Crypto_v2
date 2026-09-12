@@ -366,9 +366,25 @@ describe("Execution gate", () => {
         reconciliationStatus: "OK",
         tradingEnabled: true,
         killSwitch: true,
-        binanceConnected: true
+        binanceConnected: true,
+        readOnlySoak: false
       })
     ).toEqual({ enabled: false, reason: "KILL_SWITCH" });
+  });
+
+  it("hard-blocks DEMO execution in read-only soak mode", () => {
+    expect(
+      resolveExecutionGate({
+        shuttingDown: false,
+        mode: "DEMO",
+        runtimeState: "READY",
+        reconciliationStatus: "OK",
+        tradingEnabled: true,
+        killSwitch: false,
+        binanceConnected: true,
+        readOnlySoak: true
+      })
+    ).toEqual({ enabled: false, reason: "READ_ONLY_SOAK_EXECUTION_BLOCKED" });
   });
 
   it("keeps account-scoped disabled settings isolated from another account", async () => {
@@ -660,6 +676,263 @@ describe("RealExecutionProposalGateway", () => {
 });
 
 describe("TradingReconciliationService", () => {
+  it("keeps a terminal intent terminal when Binance has no position", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-terminal");
+    await repository.transitionStatus(intent.id, ["ENTRY_FILLED"], "CLOSED");
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const result = await service.reconcile("account-terminal", async () => ({
+      connected: true,
+      positions: [],
+      openOrders: [],
+      orderHistory: [],
+      tradeHistory: []
+    }));
+
+    expect(result.status).toBe("OK");
+    expect((await repository.listByAccount("account-terminal"))[0]?.status).toBe("CLOSED");
+  });
+
+  it("detects a live bot position behind a CLOSED intent and blocks recovery fail-safe close", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-terminal-mismatch");
+    await repository.transitionStatus(intent.id, ["ENTRY_FILLED"], "CLOSED");
+    const gateway = new BlockingRecoverableGateway("RUNTIME_NOT_READY");
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const result = await service.reconcile("account-terminal-mismatch", terminalPositionActivity(intent, []), gateway);
+
+    expect(result.status).toBe("DEGRADED");
+    expect(result.error).toBe("BOT_POSITION_TERMINAL_STATE_MISMATCH");
+    expect((await repository.listByAccount("account-terminal-mismatch"))[0]?.status).toBe("RECOVERY_REQUIRED");
+    expect(gateway.cancelled).toHaveLength(0);
+    expect(gateway.protectionRequests).toHaveLength(0);
+  });
+
+  it("selects the newer active intent instead of a historical same-side CLOSED intent", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const oldIntent = await seedCustomIntent(repository, {
+      id: "ltc-old-closed",
+      symbol: "LTCUSDT",
+      side: "long",
+      entry: 53.17,
+      quantity: 20,
+      entryOrderId: "ltc-old-entry",
+      status: "CLOSED"
+    });
+    const activeIntent = await seedCustomIntent(repository, {
+      id: "ltc-new-active",
+      symbol: "LTCUSDT",
+      side: "long",
+      entry: 53.49,
+      quantity: 9.433,
+      entryOrderId: "ltc-new-entry",
+      status: "ENTRY_FILLED"
+    });
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const result = await service.reconcile(
+      "account-ltc",
+      positionActivity(
+        activeIntent,
+        [
+          openOrder(activeIntent, "STOP_MARKET", activeIntent.clientStopOrderId, "new-stop"),
+          openOrder(activeIntent, "TAKE_PROFIT_MARKET", activeIntent.clientTakeProfitOrderId, "new-tp")
+        ],
+        [entryHistory(oldIntent, 53.17, 20), entryHistory(activeIntent, 53.6183, 9.433)],
+        53.6183
+      ),
+      gateway
+    );
+
+    expect(result.status).toBe("OK");
+    expect(result.error).toBeNull();
+    expect(gateway.protectionRequests).toHaveLength(0);
+    expect((await repository.listByAccount("account-ltc")).find((intent) => intent.id === oldIntent.id)?.status).toBe("CLOSED");
+    expect((await repository.listByAccount("account-ltc")).find((intent) => intent.id === activeIntent.id)?.status).toBe("PROTECTED");
+  });
+
+  it("still detects a terminal mismatch when the original entry evidence matches", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedCustomIntent(repository, {
+      id: "ltc-original-closed",
+      symbol: "LTCUSDT",
+      side: "long",
+      entry: 101,
+      quantity: 10,
+      entryOrderId: "ltc-original-entry",
+      status: "CLOSED",
+      accountId: "account-ltc-original"
+    });
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const result = await service.reconcile(
+      "account-ltc-original",
+      positionActivity(intent, [], [entryHistory(intent, 101, 10)]),
+      gateway
+    );
+
+    expect(result.status).toBe("DEGRADED");
+    expect(result.error).toBe("BOT_POSITION_TERMINAL_STATE_MISMATCH");
+    expect((await repository.listByAccount("account-ltc-original"))[0]?.status).toBe("PROTECTED");
+    expect(gateway.protectionRequests).toHaveLength(2);
+  });
+
+  it("fails closed on ambiguous live ownership without repairing either intent", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const first = await seedCustomIntent(repository, {
+      id: "ltc-ambiguous-1",
+      symbol: "LTCUSDT",
+      side: "long",
+      entry: 101,
+      quantity: 10,
+      entryOrderId: "ltc-ambiguous-entry-1",
+      status: "ENTRY_FILLED",
+      accountId: "account-ltc-ambiguous"
+    });
+    const second = await seedCustomIntent(repository, {
+      id: "ltc-ambiguous-2",
+      symbol: "LTCUSDT",
+      side: "long",
+      entry: 101,
+      quantity: 10,
+      entryOrderId: "ltc-ambiguous-entry-2",
+      status: "ENTRY_FILLED",
+      accountId: "account-ltc-ambiguous"
+    });
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const result = await service.reconcile(
+      "account-ltc-ambiguous",
+      positionActivity(first, []),
+      gateway
+    );
+
+    expect(result.status).toBe("DEGRADED");
+    expect(result.error).toBe("BOT_POSITION_OWNERSHIP_AMBIGUOUS");
+    expect(gateway.protectionRequests).toHaveLength(0);
+    expect((await repository.listAuditEvents("account-ltc-ambiguous")).some((event) => event.type === "BOT_POSITION_OWNERSHIP_AMBIGUOUS")).toBe(true);
+    expect((await repository.listByAccount("account-ltc-ambiguous")).map((intent) => intent.status)).toEqual(["ENTRY_FILLED", "ENTRY_FILLED"]);
+    void second;
+  });
+
+  it("does not remove LTC protection across a transient non-authoritative position absence", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedCustomIntent(repository, {
+      id: "ltc-transient-position",
+      symbol: "LTCUSDT",
+      side: "long",
+      entry: 53.42,
+      quantity: 18.518,
+      entryOrderId: "ltc-entry-1582356910",
+      status: "ENTRY_FILLED",
+      accountId: "account-ltc-transient"
+    });
+    const stop = openOrder(intent, "STOP_MARKET", intent.clientStopOrderId, "ltc-stop");
+    const takeProfit = openOrder(intent, "TAKE_PROFIT_MARKET", intent.clientTakeProfitOrderId, "ltc-tp");
+    const protectedOrders = [stop, takeProfit];
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const transientActivity = async () => ({
+      connected: true,
+      authoritative: false,
+      positions: [],
+      openOrders: protectedOrders,
+      orderHistory: [],
+      tradeHistory: []
+    });
+    const restoredActivity = positionActivity(intent, protectedOrders, [], 53.42);
+
+    const transient = await service.reconcile("account-ltc-transient", transientActivity, gateway);
+    expect(transient.status).toBe("DEGRADED");
+    expect(transient.error).toBe("BINANCE_STATE_UNKNOWN");
+    expect(gateway.cancelled).toEqual([]);
+    expect(gateway.protectionRequests).toEqual([]);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const restored = await service.reconcile("account-ltc-transient", restoredActivity, gateway);
+      expect(restored.status).toBe("OK");
+      expect(restored.error).toBeNull();
+    }
+
+    const saved = (await repository.listByAccount("account-ltc-transient"))[0];
+    expect(saved?.status).toBe("PROTECTED");
+    expect(saved?.binanceStopOrderId).toBe("ltc-stop");
+    expect(saved?.binanceTakeProfitOrderId).toBe("ltc-tp");
+    expect(gateway.cancelled).toEqual([]);
+    expect(gateway.protectionRequests).toEqual([]);
+  });
+
+  it("repairs a CLOSED intent with a live bot position without cancelling valid protection", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-terminal-protected");
+    await repository.transitionStatus(intent.id, ["ENTRY_FILLED"], "CLOSED");
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    const result = await service.reconcile(
+      "account-terminal-protected",
+      terminalPositionActivity(intent, [
+        openOrder(intent, "STOP_MARKET", intent.clientStopOrderId, "stop-existing"),
+        openOrder(intent, "TAKE_PROFIT_MARKET", intent.clientTakeProfitOrderId, "tp-existing")
+      ]),
+      gateway
+    );
+
+    expect(result.status).toBe("DEGRADED");
+    expect(result.error).toBe("BOT_POSITION_TERMINAL_STATE_MISMATCH");
+    expect(gateway.cancelled).toHaveLength(0);
+    expect(gateway.protectionRequests).toHaveLength(0);
+    expect((await repository.listByAccount("account-terminal-protected"))[0]?.status).toBe("PROTECTED");
+  });
+
+  it("marks terminal live exposure manual recovery when the original protection plan is incomplete", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-manual-recovery");
+    await repository.transitionStatus(intent.id, ["ENTRY_FILLED"], "CLOSED", {
+      requestedStopLoss: null,
+      requestedTakeProfit: null
+    });
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+
+    await service.reconcile("account-manual-recovery", terminalPositionActivity(intent, []), gateway);
+
+    const saved = (await repository.listByAccount("account-manual-recovery"))[0];
+    expect(saved?.status).toBe("RECOVERY_REQUIRED");
+    expect(saved?.lastError).toBe("MANUAL_RECOVERY_REQUIRED");
+    expect(gateway.protectionRequests).toHaveLength(0);
+    expect(gateway.cancelled).toHaveLength(0);
+  });
+
+  it("rediscovers terminal live exposure on a repeated reconciliation without duplicate protection", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-restart");
+    await repository.transitionStatus(intent.id, ["ENTRY_FILLED"], "CLOSED");
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+    const activity = terminalPositionActivity(intent, []);
+
+    await service.reconcile("account-restart", activity, gateway);
+    await service.reconcile(
+      "account-restart",
+      terminalPositionActivity(intent, [
+        openOrder(intent, "STOP_MARKET", intent.clientStopOrderId, "stop-repaired"),
+        openOrder(intent, "TAKE_PROFIT_MARKET", intent.clientTakeProfitOrderId, "tp-repaired")
+      ]),
+      gateway
+    );
+
+    expect(gateway.protectionRequests.map((request) => request.type)).toEqual(["STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+    expect(gateway.cancelled).toHaveLength(0);
+    expect((await repository.listByAccount("account-restart"))[0]?.status).toBe("PROTECTED");
+  });
+
   it("detects external/manual positions without attaching them to bot intents", async () => {
     const repository = new MemoryExecutionIntentRepository();
     const service = new TradingReconciliationService(repository, fakeLogger());
@@ -1130,6 +1403,44 @@ async function seedFilledIntent(repository: MemoryExecutionIntentRepository, acc
   return seedIntent(repository, accountId, "ENTRY_FILLED");
 }
 
+async function seedCustomIntent(
+  repository: MemoryExecutionIntentRepository,
+  input: {
+    id: string;
+    symbol: string;
+    side: "long" | "short";
+    entry: number;
+    quantity: number;
+    entryOrderId: string;
+    status: "ENTRY_FILLED" | "CLOSED";
+    accountId?: string;
+  }
+): Promise<ExecutionIntent> {
+  const created = await repository.createOrGet({
+    id: input.id,
+    tradingAccountId: input.accountId ?? "account-ltc",
+    symbol: input.symbol,
+    side: input.side,
+    setupKey: `${input.id}:setup`,
+    entryType: "market",
+    requestedEntry: input.entry,
+    requestedStopLoss: input.entry - 5,
+    requestedTakeProfit: input.entry + 10,
+    quantity: input.quantity,
+    clientEntryOrderId: `${input.id}-client-entry`,
+    clientStopOrderId: `${input.id}-client-stop`,
+    clientTakeProfitOrderId: `${input.id}-client-tp`
+  });
+  await repository.transitionStatus(created.intent.id, ["CREATED"], "ENTRY_FILLED", {
+    binanceEntryOrderId: input.entryOrderId,
+    lastError: null
+  });
+  if (input.status === "CLOSED") await repository.transitionStatus(created.intent.id, ["ENTRY_FILLED"], "CLOSED");
+  const saved = (await repository.listByAccount(input.accountId ?? "account-ltc")).find((intent) => intent.id === input.id);
+  if (!saved) throw new Error("Missing custom intent");
+  return saved;
+}
+
 async function seedIntent(repository: MemoryExecutionIntentRepository, accountId: string, status: "ENTRY_SUBMITTING" | "ENTRY_FILLED"): Promise<ExecutionIntent> {
   const created = await repository.createOrGet({
     id: `${accountId}-intent-1`,
@@ -1181,6 +1492,79 @@ function activityWithPosition(intent: ExecutionIntent, openOrders: ReturnType<ty
     ],
     openOrders,
     orderHistory: [],
+    tradeHistory: []
+  });
+}
+
+function positionActivity(
+  intent: ExecutionIntent,
+  openOrders: ReturnType<typeof openOrder>[],
+  orderHistory: ReturnType<typeof entryHistory>[] = [],
+  actualEntryPrice = intent.requestedEntry ?? 100
+) {
+  return async () => ({
+    connected: true,
+    positions: [
+      {
+        id: `binance:${intent.symbol}:${intent.side}`,
+        symbol: intent.symbol,
+        side: intent.side,
+        entryPrice: actualEntryPrice,
+        entryTime: null,
+        quantity: intent.quantity ?? 10,
+        notional: 1000,
+        leverage: 5,
+        margin: 200,
+        unrealizedProfit: 0,
+        stopLoss: openOrders.find((order) => order.type === "STOP_MARKET")?.stopPrice ?? null,
+        takeProfit: openOrders.find((order) => order.type === "TAKE_PROFIT_MARKET")?.stopPrice ?? null
+      }
+    ],
+    openOrders,
+    orderHistory,
+    tradeHistory: []
+  });
+}
+
+function entryHistory(intent: ExecutionIntent, averagePrice: number, quantity: number) {
+  return {
+    ...openOrder(intent, "STOP_MARKET", intent.clientEntryOrderId, intent.binanceEntryOrderId ?? "entry-history"),
+    type: "MARKET" as const,
+    reduceOnly: false,
+    quantity,
+    executedQuantity: quantity,
+    averagePrice
+  };
+}
+
+function terminalPositionActivity(intent: ExecutionIntent, openOrders: ReturnType<typeof openOrder>[]) {
+  return async () => ({
+    connected: true,
+    positions: [
+      {
+        id: `binance:${intent.symbol}:${intent.side}`,
+        symbol: intent.symbol,
+        side: intent.side,
+        entryPrice: intent.requestedEntry ?? 100,
+        entryTime: null,
+        quantity: intent.quantity ?? 10,
+        notional: 1000,
+        leverage: 5,
+        margin: 200,
+        unrealizedProfit: 0,
+        stopLoss: openOrders.find((order) => order.type === "STOP_MARKET")?.stopPrice ?? null,
+        takeProfit: openOrders.find((order) => order.type === "TAKE_PROFIT_MARKET")?.stopPrice ?? null
+      }
+    ],
+    openOrders,
+    orderHistory: [
+      {
+        ...openOrder(intent, "STOP_MARKET", intent.clientEntryOrderId, intent.binanceEntryOrderId ?? "entry-history"),
+        type: "MARKET",
+        reduceOnly: false,
+        averagePrice: intent.requestedEntry ?? 100
+      }
+    ],
     tradeHistory: []
   });
 }

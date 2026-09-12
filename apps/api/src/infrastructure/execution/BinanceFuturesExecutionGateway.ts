@@ -14,6 +14,26 @@ import { PostEntryProtectionError } from "../../application/execution/PostEntryP
 
 type BinanceOrderSide = "BUY" | "SELL";
 type EntryMode = "limit" | "market";
+type MarginMode = "CROSS" | "ISOLATED";
+type MarginModePolicy = MarginMode | (() => MarginMode);
+
+interface SymbolAccountState {
+  marginType: MarginMode | "UNKNOWN";
+  leverage: number | null;
+}
+
+interface PositionRiskResponse {
+  symbol?: string;
+  positionAmt?: string;
+  marginType?: string;
+  leverage?: string;
+}
+
+interface OpenOrderResponse {
+  symbol?: string;
+  orderId?: number | string;
+  algoId?: number | string;
+}
 
 export class BinanceFuturesExecutionGateway implements RecoverableExecutionGateway {
   private readonly baseUrl: string;
@@ -25,12 +45,16 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     private readonly apiSecret: string,
     private readonly mode: "testnet" | "live",
     private readonly entryMode: EntryMode,
-    private readonly leverage: number
+    private readonly leverage: number,
+    private readonly expectedMarginMode: MarginModePolicy = "ISOLATED",
+    private readonly readOnlySoak = false
   ) {
     this.baseUrl = mode === "testnet" ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
   }
 
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision, context?: ExecutionOrderContext): Promise<SubmittedOrder> {
+    if (this.mode !== "testnet") throw new Error("REAL_EXECUTION_LOCKED");
+    this.assertMutationAllowed();
     const symbol = risk.symbol;
     const rules = await this.getSymbolRules(symbol);
     const entryOrderType = this.entryMode.toUpperCase();
@@ -40,7 +64,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       quantity: risk.quantity,
       price: this.entryMode === "limit" ? plan.entry : null,
       notional: risk.notional,
-      leverage: risk.leverage
+      leverage: risk.selectedLeverage
     });
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
     const quantity = formatRuleNumber(validation.normalized.quantity);
@@ -48,10 +72,11 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       await this.validateMarketOrderNotional(symbol, validation.normalized.quantity, rules);
     }
 
-    await this.setLeverage(symbol, risk.leverage);
+    await this.prepareSymbolForExecution(symbol, risk.selectedLeverage);
 
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
+    await this.verifyPreparedSymbol(symbol, risk.selectedLeverage);
     const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatRuleNumber(normalizePrice(plan.entry, rules.tickSize)), context?.clientEntryOrderId);
     const partialOrder = (): SubmittedOrder => ({
       orderId: String(entry.orderId),
@@ -89,6 +114,66 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     };
   }
 
+  async prepareSymbolForExecution(symbol: string, selectedLeverage: number): Promise<void> {
+    if (this.mode !== "testnet") throw new Error("REAL_EXECUTION_LOCKED");
+    this.assertMutationAllowed();
+    if (!Number.isInteger(selectedLeverage) || selectedLeverage < 1) throw new Error("SYMBOL_PREPARATION_INVALID_LEVERAGE");
+
+    let state = await this.readSymbolAccountState(symbol);
+    const expectedMarginMode = this.getExpectedMarginMode();
+    if (state.marginType !== expectedMarginMode) {
+      const active = await this.readActiveSymbolState(symbol);
+      if (active.position) throw new Error("SYMBOL_PREPARATION_POSITION_CONFLICT");
+      if (active.regularOrders.length > 0) throw new Error("SYMBOL_PREPARATION_OPEN_ORDERS_CONFLICT");
+      if (active.algoOrders.length > 0) throw new Error("SYMBOL_PREPARATION_ALGO_ORDERS_CONFLICT");
+
+      await this.setMarginType(symbol, expectedMarginMode);
+      state = await this.readSymbolAccountState(symbol);
+      if (state.marginType !== expectedMarginMode) throw new Error("SYMBOL_PREPARATION_MARGIN_MODE_MISMATCH");
+    }
+
+    if (state.leverage !== selectedLeverage) {
+      await this.setLeverage(symbol, selectedLeverage);
+      state = await this.readSymbolAccountState(symbol);
+      if (state.leverage !== selectedLeverage) throw new Error("SYMBOL_PREPARATION_LEVERAGE_MISMATCH");
+    }
+
+    await this.verifyPreparedSymbol(symbol, selectedLeverage);
+  }
+
+  private async verifyPreparedSymbol(symbol: string, selectedLeverage: number): Promise<void> {
+    const state = await this.readSymbolAccountState(symbol);
+    if (state.marginType !== this.getExpectedMarginMode()) throw new Error("SYMBOL_PREPARATION_MARGIN_MODE_MISMATCH");
+    if (state.leverage !== selectedLeverage) throw new Error("SYMBOL_PREPARATION_LEVERAGE_MISMATCH");
+  }
+
+  private getExpectedMarginMode(): MarginMode {
+    return typeof this.expectedMarginMode === "function" ? this.expectedMarginMode() : this.expectedMarginMode;
+  }
+
+  private async readSymbolAccountState(symbol: string): Promise<SymbolAccountState> {
+    const positions = await this.signedGet<PositionRiskResponse[]>("/fapi/v2/positionRisk", { symbol });
+    const position = positions.find((item) => item.symbol === symbol) ?? positions[0];
+    const marginType = String(position?.marginType ?? "").toUpperCase();
+    return {
+      marginType: marginType === "CROSS" || marginType === "ISOLATED" ? marginType : "UNKNOWN",
+      leverage: numberOrNull(position?.leverage)
+    };
+  }
+
+  private async readActiveSymbolState(symbol: string): Promise<{ position: boolean; regularOrders: OpenOrderResponse[]; algoOrders: OpenOrderResponse[] }> {
+    const [positions, regularOrders, algoOrders] = await Promise.all([
+      this.signedGet<PositionRiskResponse[]>("/fapi/v2/positionRisk", { symbol }),
+      this.signedGet<OpenOrderResponse[]>("/fapi/v1/openOrders", { symbol }),
+      this.signedGet<OpenOrderResponse[]>("/fapi/v1/openAlgoOrders", { symbol })
+    ]);
+    return {
+      position: positions.some((item) => Math.abs(Number(item.positionAmt ?? 0)) > 0),
+      regularOrders,
+      algoOrders
+    };
+  }
+
   async findOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<ExecutionOrderLookupResult | null> {
     try {
       const order = await this.signedGet<BinanceOrderResponse>("/fapi/v1/order", {
@@ -103,6 +188,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
   }
 
   async submitProtectionOrder(request: ProtectionOrderRequest): Promise<ExecutionOrderLookupResult> {
+    this.assertMutationAllowed();
     const rules = await this.getSymbolRules(request.symbol);
     const validation = validateAgainstSymbolRules(rules, {
       symbol: request.symbol,
@@ -137,6 +223,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
   }
 
   async closePosition(request: EmergencyCloseRequest): Promise<ExecutionOrderLookupResult> {
+    this.assertMutationAllowed();
     const existing = await this.findOrderByClientOrderId(request.symbol, request.clientOrderId);
     if (existing) return existing;
     const rules = await this.getSymbolRules(request.symbol);
@@ -162,6 +249,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
   }
 
   async cancelOrderByClientOrderId(symbol: string, clientOrderId: string): Promise<void> {
+    this.assertMutationAllowed();
     const params = new URLSearchParams({
       symbol,
       origClientOrderId: clientOrderId,
@@ -237,7 +325,17 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     await this.signedPost("/fapi/v1/leverage", params, "Binance leverage update failed");
   }
 
-  private async signedPost<T extends BinanceOrderResponse | BinanceAlgoOrderResponse>(path: string, params: URLSearchParams, label: string): Promise<T> {
+  private async setMarginType(symbol: string, marginMode: MarginMode): Promise<void> {
+    const params = new URLSearchParams({
+      symbol,
+      marginType: marginMode,
+      timestamp: String(Date.now())
+    });
+    await this.signedPost("/fapi/v1/marginType", params, "Binance margin mode update failed");
+  }
+
+  private async signedPost<T = unknown>(path: string, params: URLSearchParams, label: string): Promise<T> {
+    this.assertMutationAllowed();
     params.set("signature", this.sign(params.toString()));
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
@@ -267,6 +365,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
   }
 
   private async signedDelete(path: string, params: URLSearchParams, label: string): Promise<BinanceOrderResponse | BinanceAlgoOrderResponse> {
+    this.assertMutationAllowed();
     params.set("signature", this.sign(params.toString()));
     const response = await fetch(`${this.baseUrl}${path}?${params.toString()}`, {
       method: "DELETE",
@@ -282,6 +381,11 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
 
   private sign(payload: string): string {
     return crypto.createHmac("sha256", this.apiSecret).update(payload).digest("hex");
+  }
+
+  private assertMutationAllowed(): void {
+    if (this.mode !== "testnet") throw new Error("REAL_EXECUTION_LOCKED");
+    if (this.readOnlySoak) throw new Error("READ_ONLY_SOAK_EXECUTION_BLOCKED");
   }
 
   private async getSymbolRules(symbol: string): Promise<FuturesSymbolRules> {

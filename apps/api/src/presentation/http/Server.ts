@@ -35,6 +35,7 @@ import { detectM5StructureSignal } from "../../domain/market-structure/Structure
 import type { MarketStructureSignal } from "../../domain/market-structure/MarketStructureSignal.js";
 import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
+import { getPostgresPoolObservability } from "../../infrastructure/persistence/PgPoolFactory.js";
 
 export interface HttpServerParams {
   port: number;
@@ -428,7 +429,8 @@ function healthReady(params: HttpServerParams, dbReady: boolean, ready: boolean)
     dependencies: {
       database: dbReady ? "ok" : "unavailable",
       bootstrap: params.appState?.bootstrapComplete ? "complete" : "pending",
-      shutdown: params.appState?.shuttingDown ? "active" : "inactive"
+      shutdown: params.appState?.shuttingDown ? "active" : "inactive",
+      postgresPool: getPostgresPoolObservability()
     }
   };
 }
@@ -456,7 +458,11 @@ function systemStatus(params: HttpServerParams): Record<string, unknown> {
       shuttingDown: Boolean(params.appState?.shuttingDown),
       reconciliationSuccess: 0,
       reconciliationFailure: 0
-    }
+    },
+    executionPolicy: params.config.readOnlySoak ? "READ_ONLY_SOAK" : "NORMAL",
+    executionCapability: params.config.readOnlySoak ? "BLOCKED_READ_ONLY" : "CONFIGURED",
+    processReadOnlySoak: params.config.readOnlySoak,
+    effectiveReadOnlySoak: params.config.readOnlySoak
   };
 }
 
@@ -678,7 +684,8 @@ async function handleTradingAccountRoute(params: {
         execution: snapshot.execution,
         realReadiness: snapshot.realReadiness,
         dailyRisk: snapshot.dailyRisk,
-        accountProtection: snapshot.accountProtection
+        accountProtection: snapshot.accountProtection,
+        funnelMetrics: snapshot.funnelMetrics
       },
       corsHeaders
     );
@@ -2447,7 +2454,7 @@ async function getCachedOpenPositions(
     logger.warn("Binance watchlist position sync failed", {
       error: error instanceof Error ? error.message : String(error)
     });
-    return { positions: cache ?? [], cacheAt };
+    throw error;
   }
 }
 
@@ -2532,7 +2539,7 @@ async function readAccountActivity<T>(label: string, read: () => Promise<T[]>, l
     logger.warn(`Binance ${label} check failed`, {
       error: error instanceof Error ? error.message : String(error)
     });
-    return [];
+    throw error;
   }
 }
 

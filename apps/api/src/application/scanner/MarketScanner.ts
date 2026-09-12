@@ -1,5 +1,5 @@
 import type { AppConfig } from "../config/AppConfig.js";
-import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type CurrentUsedMarginProvider, type SetupDiagnostic, type SymbolRulesProvider } from "../engine/TradingEngine.js";
+import { countSetupEvidence, TradingEngine, type AvailableBalanceProvider, type CurrentUsedMarginProvider, type FunnelMetrics, type FunnelTelemetryContext, type SetupDiagnostic, type SymbolRulesProvider } from "../engine/TradingEngine.js";
 import type { ExecutionGateway } from "../ports/ExecutionGateway.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { TradingRepository } from "../ports/Repositories.js";
@@ -34,7 +34,8 @@ export class MarketScanner {
     private readonly marketData: BinanceFuturesMarketData,
     private readonly availableBalanceProvider: AvailableBalanceProvider | null,
     private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
-    private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null
+    private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null,
+    private readonly funnelContext: FunnelTelemetryContext = { accountId: "unknown" }
   ) {
     for (const symbol of config.watchlist) {
       this.engines.set(symbol, this.createEngine(symbol));
@@ -52,6 +53,11 @@ export class MarketScanner {
 
   getSetupDiagnostic(symbol: string): SetupDiagnostic | null {
     return this.engines.get(symbol)?.getSetupDiagnostic() ?? null;
+  }
+
+  getFunnelMetrics(symbol?: string): Record<string, FunnelMetrics> {
+    const entries = symbol ? [[symbol, this.engines.get(symbol)] as const] : [...this.engines.entries()];
+    return Object.fromEntries(entries.filter((entry): entry is [string, TradingEngine] => entry[1] !== undefined).map(([key, engine]) => [key, engine.getFunnelMetrics()]));
   }
 
   getWatchlistStatus(): WatchlistStatus[] {
@@ -133,6 +139,7 @@ export class MarketScanner {
 
   private async scanSymbol(symbol: string, bootstrap: boolean): Promise<void> {
     const engine = this.engines.get(symbol) ?? this.createEngine(symbol);
+    engine.recordScan(bootstrap ? "BOOTSTRAP_REPLAY" : "LIVE_SCAN");
     const activePosition = this.activePositions.get(symbol);
     if (activePosition) {
       engine.syncActivePosition(activePosition, this.activePositions.size);
@@ -163,7 +170,17 @@ export class MarketScanner {
 
   private createEngine(symbol: string): TradingEngine {
     const symbolConfig: AppConfig = { ...this.config, symbol };
-    const engine = new TradingEngine(symbolConfig, this.repository, this.execution, this.logger, this.availableBalanceProvider, this.symbolRulesProvider, this.currentUsedMarginProvider);
+    const engine = new TradingEngine(
+      symbolConfig,
+      this.repository,
+      this.execution,
+      this.logger,
+      this.availableBalanceProvider,
+      this.symbolRulesProvider,
+      this.currentUsedMarginProvider,
+      10_000,
+      this.funnelContext
+    );
     this.engines.set(symbol, engine);
     return engine;
   }

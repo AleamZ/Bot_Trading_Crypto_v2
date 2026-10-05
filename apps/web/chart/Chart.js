@@ -263,8 +263,9 @@ export class TradingChart {
   }
 
   setAccountTables(accountActivity) {
+    const originBySymbol = botOriginBySymbol([...(accountActivity?.openOrders ?? []), ...(accountActivity?.orderHistory ?? [])]);
     this.accountTables = {
-      positions: (accountActivity?.positions ?? []).map(toAccountPositionRow),
+      positions: (accountActivity?.positions ?? []).map((position) => ({ ...toAccountPositionRow(position), origin: originBySymbol.get(position.symbol) ?? null })),
       openOrders: accountActivity?.openOrders ?? [],
       orderHistory: accountActivity?.orderHistory ?? [],
       tradeHistory: accountActivity?.tradeHistory ?? [],
@@ -327,7 +328,7 @@ export class TradingChart {
           textCell(formatMargin(position)),
           pnlCell(position),
           textCell(formatRatio(position.riskReward)),
-          sourceCell(position),
+          sourceCell(position, position.origin),
         );
         return row;
       }),
@@ -347,7 +348,7 @@ export class TradingChart {
         const row = document.createElement("tr");
         row.className = `position-row ${sideClass(order.side)}`;
         row.append(
-          stackedCell(order.symbol, order.status),
+          withOriginBadge(stackedCell(order.symbol, order.status), orderOrigin(order)),
           stackedCell(order.type, `#${order.orderId}`),
           toneCell(order.side, sideClass(order.side)),
           textCell(formatNullablePrice(order.price)),
@@ -375,7 +376,7 @@ export class TradingChart {
         const row = document.createElement("tr");
         row.className = `position-row ${sideClass(order.side)}`;
         row.append(
-          stackedCell(order.symbol, order.type),
+          withOriginBadge(stackedCell(order.symbol, order.type), orderOrigin(order)),
           textCell(`#${order.orderId}`),
           toneCell(order.side, sideClass(order.side)),
           textCell(formatNullablePrice(order.averagePrice)),
@@ -537,11 +538,39 @@ function pnlValueCell(value) {
   return cell;
 }
 
-function sourceCell(position) {
+function sourceCell(position, origin = null) {
   const cell = document.createElement("td");
   const badge = document.createElement("span");
   badge.className = `source-badge ${position.source ?? "unknown"}`;
   badge.textContent = position.source === "binance" || position.source === "manual" ? "Binance" : "Bot";
+  cell.append(badge);
+  return withOriginBadge(cell, origin);
+}
+
+// Bot client order ids: `smc_ai<22 hex>_E/_S/_T` for AI decisions, `smc_<24 hex>_*` for the strategy engine.
+function orderOrigin(order) {
+  const clientOrderId = String(order?.clientOrderId ?? "");
+  if (clientOrderId.startsWith("smc_ai")) return "AI";
+  if (clientOrderId.startsWith("smc_")) return "BOT";
+  return null;
+}
+
+// A position carries no client id; its bot SL/TP or entry orders on the same symbol tell who opened it.
+function botOriginBySymbol(orders) {
+  const origins = new Map();
+  for (const order of orders) {
+    const origin = orderOrigin(order);
+    if (origin && !origins.has(order.symbol)) origins.set(order.symbol, origin);
+  }
+  return origins;
+}
+
+function withOriginBadge(cell, origin) {
+  if (!origin) return cell;
+  const badge = document.createElement("span");
+  badge.className = `origin-badge ${origin.toLowerCase()}`;
+  badge.textContent = origin;
+  badge.title = origin === "AI" ? "Lệnh do AI quyết định" : "Lệnh do bot (strategy engine) đặt";
   cell.append(badge);
   return cell;
 }

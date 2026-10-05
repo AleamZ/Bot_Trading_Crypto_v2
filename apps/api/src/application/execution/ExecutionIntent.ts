@@ -20,7 +20,9 @@ export type ExecutionIntentStatus =
   | "BINANCE_CONNECTION_LOST";
 
 export type ExecutionSide = "long" | "short";
-export type ExecutionSource = "BOT" | "EXTERNAL" | "UNKNOWN";
+export type ExecutionSource = "BOT" | "AI" | "EXTERNAL" | "UNKNOWN";
+/** Who initiated a bot-placed order: the strategy engine itself or the AI advisor. */
+export type ExecutionOrigin = "BOT" | "AI";
 
 export interface ExecutionIntent {
   id: string;
@@ -61,6 +63,8 @@ export interface CreateExecutionIntentInput {
   clientEntryOrderId: string;
   clientStopOrderId: string;
   clientTakeProfitOrderId: string;
+  /** Defaults to BOT. */
+  source?: ExecutionSource;
 }
 
 export interface ExecutionAuditEvent {

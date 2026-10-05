@@ -284,7 +284,7 @@ describe("trading account HTTP flow", () => {
     const body = await response.json();
     expect(body.presets.map((preset: { level: number }) => preset.level)).toEqual([1, 2, 3, 4, 5]);
     expect(body.presets[0]).toMatchObject({ label: "Rất an toàn", values: { maxLeverage: 5, entryMode: "limit" } });
-    expect(body.simpleModeUserFields).toEqual(["watchlist", "riskPerTradeUsdt", "tradingEnabled", "killSwitch"]);
+    expect(body.simpleModeUserFields).toEqual(["watchlist", "riskPerTradeUsdt", "tradingEnabled", "killSwitch", "aiTradingMode"]);
   });
 
   it("starts new accounts in simple mode and derives preset fields server-side on simple saves", async () => {

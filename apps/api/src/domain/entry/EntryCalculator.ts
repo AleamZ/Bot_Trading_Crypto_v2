@@ -15,6 +15,8 @@ export interface EntryPlan {
   reason: string;
   triggeringFvgId?: string;
   protectiveClusterFvgIds?: string[];
+  /** Who initiated the order; absent means the strategy engine (BOT). */
+  origin?: "BOT" | "AI";
 }
 
 export interface EntryCalculatorConfig {

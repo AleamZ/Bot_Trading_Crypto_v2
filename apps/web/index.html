@@ -275,6 +275,30 @@
           </div>
           <ol id="events"></ol>
         </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>AI Decisions</h2>
+            <span id="ai-decision-count">0 decisions</span>
+          </div>
+          <div class="positions-table-wrap">
+            <table class="positions-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Action</th>
+                  <th>Confidence</th>
+                  <th>Result</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="ai-decisions-body">
+                <tr><td colspan="6" class="empty-position">Chưa có quyết định AI</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
       </section>
 
       <section class="view" id="chart-view">
@@ -757,6 +781,33 @@
               <button class="segmented-option" data-setting-value="false" type="button">OFF</button>
               <button class="segmented-option" data-setting-value="true" type="button">ON</button>
             </div>
+          </article>
+
+          </div>
+        </section>
+
+        <section class="settings-group settings-basic">
+          <h2>AI Advisor</h2>
+          <div class="settings-grid">
+          <article class="setting-card">
+            <label>Chế độ AI</label>
+            <div class="segmented-control" data-setting-group="aiTradingMode">
+              <button class="segmented-option" data-setting-value="OFF" type="button">OFF</button>
+              <button class="segmented-option" data-setting-value="ADVISORY" type="button">ADVISORY</button>
+              <button class="segmented-option" data-setting-value="AUTO" type="button">AUTO</button>
+            </div>
+            <small>ADVISORY chỉ ghi lại quyết định. AUTO được đặt lệnh trên tài khoản DEMO, vẫn qua đủ risk/kill switch.</small>
+          </article>
+
+          <article class="setting-card config-advanced-only">
+            <label for="setting-ai-model">AI Model</label>
+            <input id="setting-ai-model" autocomplete="off" placeholder="Mặc định server (AI_MODEL)" type="text" />
+          </article>
+
+          <article class="setting-card config-advanced-only">
+            <label for="setting-ai-min-confidence">AI Min Confidence</label>
+            <input id="setting-ai-min-confidence" inputmode="decimal" type="text" />
+            <small>0 - 1. Quyết định có confidence thấp hơn sẽ bị từ chối.</small>
           </article>
 
           </div>

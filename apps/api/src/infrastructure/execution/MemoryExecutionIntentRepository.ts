@@ -30,7 +30,7 @@ export class MemoryExecutionIntentRepository implements ExecutionIntentRepositor
       clientEntryOrderId: input.clientEntryOrderId,
       clientStopOrderId: input.clientStopOrderId,
       clientTakeProfitOrderId: input.clientTakeProfitOrderId,
-      source: "BOT",
+      source: input.source ?? "BOT",
       version: 0,
       lastError: null,
       createdAt: now,
@@ -81,9 +81,9 @@ export class MemoryExecutionIntentRepository implements ExecutionIntentRepositor
     this.auditEvents.push({ ...event, metadata: { ...event.metadata } });
   }
 
-  async listAuditEvents(tradingAccountId: string, executionIntentId?: string, limit = 100): Promise<ExecutionAuditEvent[]> {
+  async listAuditEvents(tradingAccountId: string, executionIntentId?: string, limit = 100, type?: string): Promise<ExecutionAuditEvent[]> {
     return this.auditEvents
-      .filter((event) => event.tradingAccountId === tradingAccountId && (!executionIntentId || event.executionIntentId === executionIntentId))
+      .filter((event) => event.tradingAccountId === tradingAccountId && (!executionIntentId || event.executionIntentId === executionIntentId) && (!type || event.type === type))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, limit)
       .map((event) => ({ ...event, metadata: { ...event.metadata } }));

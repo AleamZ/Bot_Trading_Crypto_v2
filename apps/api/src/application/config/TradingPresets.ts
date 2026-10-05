@@ -6,7 +6,7 @@ export type RiskLevel = 1 | 2 | 3 | 4 | 5;
 export const riskLevels: readonly RiskLevel[] = [1, 2, 3, 4, 5];
 
 // Fields the user still controls in simple mode; everything else comes from the preset or the stored settings.
-export const simpleModeUserFields = ["watchlist", "riskPerTradeUsdt", "tradingEnabled", "killSwitch"] as const;
+export const simpleModeUserFields = ["watchlist", "riskPerTradeUsdt", "tradingEnabled", "killSwitch", "aiTradingMode"] as const;
 
 export type TradingPresetValues = Pick<
   TradingSettings,

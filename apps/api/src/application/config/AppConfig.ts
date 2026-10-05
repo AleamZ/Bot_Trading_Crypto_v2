@@ -72,7 +72,13 @@ const schema = z.object({
   postgresPoolMax: z.coerce.number().int().positive().max(10).default(8),
   readOnlySoak: z.coerce.boolean().default(false),
   realLiveExecutionEnabled: z.coerce.boolean().default(false),
-  localTradingRuntimeEnabled: z.coerce.boolean().default(false)
+  localTradingRuntimeEnabled: z.coerce.boolean().default(false),
+  // AI advisor (local OpenAI-compatible LLM). OFF never calls the model, ADVISORY only records
+  // decisions, AUTO may place orders on DEMO accounts through the normal risk/execution path.
+  aiTradingMode: z.enum(["OFF", "ADVISORY", "AUTO"]).default("OFF"),
+  // Empty means the process default model (AI_MODEL).
+  aiModel: z.string().trim().max(120).default(""),
+  aiMinConfidence: z.coerce.number().min(0).max(1).default(0.7)
 });
 
 export type AppConfig = z.infer<typeof schema>;
@@ -141,7 +147,10 @@ export const defaultTradingSettings: TradingSettings = {
   stopLossAtrMultiplier: 1,
   requireDisplacement: false,
   displacementBodyMultiplier: 1.5,
-  displacementLookback: 20
+  displacementLookback: 20,
+  aiTradingMode: "OFF",
+  aiModel: "",
+  aiMinConfidence: 0.7
 };
 
 const tradingSettingsSchema = schema.omit({

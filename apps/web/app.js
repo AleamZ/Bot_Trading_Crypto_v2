@@ -60,6 +60,9 @@ const defaultSettings = {
   requireDisplacement: "false",
   displacementBodyMultiplier: "1.5",
   displacementLookback: "20",
+  aiTradingMode: "OFF",
+  aiModel: "",
+  aiMinConfidence: "0.7",
 };
 const settingsState = { ...defaultSettings };
 const realSafetyState = {
@@ -779,6 +782,75 @@ function pollHomeOnce() {
   load().catch((error) => {
     if (activeView === "home") console.error(userFacingApiError(error));
   });
+  loadAiDecisions().catch((error) => {
+    if (activeView === "home") console.error(userFacingApiError(error));
+  });
+}
+
+async function loadAiDecisions() {
+  const accountId = accountState.activeAccount?.id;
+  if (!accountId) return;
+  const response = await apiFetch(`/api/trading-accounts/${accountId}/ai-decisions?limit=20`);
+  if (accountId !== accountState.activeAccount?.id || activeView !== "home") return;
+  if (handleUnauthorized(response)) return;
+  if (!response.ok) throw new Error(`AI decisions request failed: ${response.status}`);
+  const body = await response.json();
+  renderAiDecisions(Array.isArray(body.decisions) ? body.decisions : []);
+}
+
+function renderAiDecisions(decisions) {
+  $("ai-decision-count").textContent = `${decisions.length} decisions`;
+  if (decisions.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 6;
+    cell.className = "empty-position";
+    cell.textContent = "Chưa có quyết định AI";
+    row.append(cell);
+    $("ai-decisions-body").replaceChildren(row);
+    return;
+  }
+  $("ai-decisions-body").replaceChildren(
+    ...decisions.map((decision) => {
+      const row = document.createElement("tr");
+      const action = decision.decision?.action ?? "-";
+      const direction = decision.decision?.direction ? ` ${decision.decision.direction}` : "";
+      const confidence = Number(decision.decision?.confidence);
+      const result = aiDecisionResult(decision);
+      row.className = `position-row ${decision.decision?.direction === "bullish" ? "long" : decision.decision?.direction === "bearish" ? "short" : ""}`;
+      row.append(
+        aiTextCell(formatDateTime(decision.createdAt)),
+        aiTextCell(decision.symbol ?? "-"),
+        aiTextCell(`${action}${direction}`),
+        aiTextCell(Number.isFinite(confidence) ? `${Math.round(confidence * 100)}%` : "-"),
+        aiResultCell(result),
+        aiTextCell(decision.decision?.reason || decision.rejectReason || "-"),
+      );
+      return row;
+    }),
+  );
+}
+
+// accepted = passed the bot's validation; the outcome says what happened next.
+function aiDecisionResult(decision) {
+  const why = decision.rejectCode ? `: ${decision.rejectCode}` : "";
+  if (decision.outcome === "SUBMITTED") return { label: "Đã đặt lệnh", tone: "profit", title: decision.executionIntentId ?? "" };
+  if (decision.outcome === "ADVISORY") return { label: `Chấp nhận (advisory)${why}`, tone: "profit", title: decision.rejectReason ?? "" };
+  if (decision.outcome === "SKIPPED") return { label: "AI bỏ qua", tone: "", title: "" };
+  return { label: `Từ chối${why}`, tone: "danger", title: decision.rejectReason ?? "" };
+}
+
+function aiTextCell(value) {
+  const cell = document.createElement("td");
+  cell.textContent = value;
+  return cell;
+}
+
+function aiResultCell(result) {
+  const cell = aiTextCell(result.label);
+  if (result.tone) cell.className = result.tone;
+  if (result.title) cell.title = result.title;
+  return cell;
 }
 
 function pollChartOnce() {
@@ -944,6 +1016,11 @@ $("setting-sl-atr-period").addEventListener("input", updateSettingFromInput);
 $("setting-sl-atr-multiplier").addEventListener("input", updateSettingFromInput);
 $("setting-displacement-body").addEventListener("input", updateSettingFromInput);
 $("setting-displacement-lookback").addEventListener("input", updateSettingFromInput);
+$("setting-ai-min-confidence").addEventListener("input", updateSettingFromInput);
+$("setting-ai-model").addEventListener("input", (event) => {
+  settingsState.aiModel = event.target.value;
+  $("settings-status").textContent = "Unsaved changes";
+});
 document.querySelectorAll("[data-setting-group]").forEach((group) => {
   group.addEventListener("click", (event) => {
     const button = event.target.closest("[data-setting-value]");
@@ -1310,6 +1387,8 @@ function renderSettings() {
   $("setting-sl-atr-multiplier").value = settingsState.stopLossAtrMultiplier;
   $("setting-displacement-body").value = settingsState.displacementBodyMultiplier;
   $("setting-displacement-lookback").value = settingsState.displacementLookback;
+  $("setting-ai-model").value = settingsState.aiModel;
+  $("setting-ai-min-confidence").value = settingsState.aiMinConfidence;
   updateConditionalSettingVisibility();
   renderRiskSummary();
   renderConfigMode();
@@ -1673,6 +1752,9 @@ function settingsFromApi(settings) {
     requireDisplacement: String(settings.requireDisplacement ?? "false"),
     displacementBodyMultiplier: String(settings.displacementBodyMultiplier ?? defaultSettings.displacementBodyMultiplier),
     displacementLookback: String(settings.displacementLookback ?? defaultSettings.displacementLookback),
+    aiTradingMode: ["OFF", "ADVISORY", "AUTO"].includes(settings.aiTradingMode) ? settings.aiTradingMode : defaultSettings.aiTradingMode,
+    aiModel: String(settings.aiModel ?? defaultSettings.aiModel),
+    aiMinConfidence: String(settings.aiMinConfidence ?? defaultSettings.aiMinConfidence),
   };
 }
 
@@ -1711,6 +1793,9 @@ function settingsPayload() {
     requireDisplacement: settingsState.requireDisplacement === "true",
     displacementBodyMultiplier: settingNumber("displacementBodyMultiplier"),
     displacementLookback: settingNumber("displacementLookback"),
+    aiTradingMode: settingsState.aiTradingMode,
+    aiModel: String(settingsState.aiModel ?? "").trim(),
+    aiMinConfidence: settingNumber("aiMinConfidence"),
   };
 }
 
@@ -1723,6 +1808,7 @@ function simpleSettingsPayload() {
     riskPerTradeUsdt: settingNumber("riskPerTradeUsdt"),
     tradingEnabled: settingsState.tradingEnabled === "true",
     killSwitch: settingsState.killSwitch === "true",
+    aiTradingMode: settingsState.aiTradingMode,
   };
 }
 
@@ -1755,6 +1841,7 @@ const settingFieldByInputId = {
   "setting-sl-atr-multiplier": "stopLossAtrMultiplier",
   "setting-displacement-body": "displacementBodyMultiplier",
   "setting-displacement-lookback": "displacementLookback",
+  "setting-ai-min-confidence": "aiMinConfidence",
 };
 
 const numericSettingRules = {
@@ -1777,6 +1864,7 @@ const numericSettingRules = {
   stopLossAtrMultiplier: { id: "setting-sl-atr-multiplier", label: "ATR Multiplier", min: 0 },
   displacementBodyMultiplier: { id: "setting-displacement-body", label: "Body Multiplier", min: 0, exclusiveMin: true },
   displacementLookback: { id: "setting-displacement-lookback", label: "Body Lookback", min: 1, integer: true },
+  aiMinConfidence: { id: "setting-ai-min-confidence", label: "AI Min Confidence", min: 0, max: 1 },
 };
 
 function sanitizeNumericDraft(value, rule) {

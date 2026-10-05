@@ -43,6 +43,8 @@ import { calculateDailyRiskStatus, type DailyRiskStatus } from "../risk/DailyRis
 import { updateAccountProtectionState, type AccountProtectionStatus } from "../risk/AccountProtectionService.js";
 import { withPostgresMigrationLock, withPostgresStartupRetry } from "../../infrastructure/persistence/PgPoolFactory.js";
 import { resolveEffectiveExecutionPolicy, type EffectiveExecutionPolicy } from "./ExecutionPolicy.js";
+import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor } from "../ai/AiTradeAdvisor.js";
+import type { LlmClient } from "../ai/LocalLlmClient.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -184,7 +186,9 @@ export class TradingRuntimeManager {
     private readonly accountClientFactory: AccountRuntimeClientFactory = (apiKey, apiSecret, testnet) => new BinanceFuturesAccountClient(apiKey, apiSecret, testnet),
     private readonly symbolMetadata: BinanceFuturesSymbolMetadataService = new BinanceFuturesSymbolMetadataService(),
     private readonly realProposalRepository: RealExecutionProposalRepository = new MemoryRealExecutionProposalRepository(),
-    private readonly runtimeMarketDataFactory: RuntimeMarketDataFactory = (testnet) => new BinanceFuturesMarketData(testnet)
+    private readonly runtimeMarketDataFactory: RuntimeMarketDataFactory = (testnet) => new BinanceFuturesMarketData(testnet),
+    /** Local LLM for the AI advisor; null disables AI decisions for every account. */
+    private readonly aiLlm: { client: LlmClient; defaultModel: string } | null = null
   ) {
     this.processReadOnlySoak = baseConfig.readOnlySoak;
   }
@@ -264,6 +268,18 @@ export class TradingRuntimeManager {
             logger: this.logger
           });
     const reconciliationGateway = account.mode === "DEMO" && isRecoverableExecutionGateway(rawExecution) ? new GatedRecoverableExecutionGateway(rawExecution, executionGate) : undefined;
+    // AI orders go through the same gateway as the engine; on REAL accounts the advisor is advisory-only.
+    const aiAdvisor = this.aiLlm
+      ? new AiTradeAdvisor({
+          tradingAccountId: account.id,
+          accountMode: account.mode,
+          llm: this.aiLlm.client,
+          defaultModel: this.aiLlm.defaultModel,
+          repository: this.executionIntentRepository,
+          execution,
+          logger: this.logger
+        })
+      : null;
     const scanner = new MarketScanner(
       config,
       repository,
@@ -285,7 +301,8 @@ export class TradingRuntimeManager {
           ? margins.reduce<number>((total, margin) => total + (margin === null ? 0 : margin), 0)
           : null;
       },
-      { accountId: account.id, runtimeId: account.id }
+      { accountId: account.id, runtimeId: account.id },
+      aiAdvisor
     );
     const reconciliation = new TradingReconciliationService(this.executionIntentRepository, this.logger);
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
@@ -706,6 +723,12 @@ export class TradingRuntimeManager {
 
   async listExecutionAuditEvents(accountId: string, executionIntentId?: string, limit = 100): Promise<unknown[]> {
     return this.executionIntentRepository.listAuditEvents(accountId, executionIntentId, limit);
+  }
+
+  /** Recent AI advisor decisions (AI_DECISION audit events), newest first. */
+  async listAiDecisions(accountId: string, limit = 50): Promise<Array<Record<string, unknown>>> {
+    const events = await this.executionIntentRepository.listAuditEvents(accountId, undefined, limit, AI_DECISION_AUDIT_TYPE);
+    return events.map((event) => ({ ...event.metadata, id: event.id, symbol: event.symbol, executionIntentId: event.executionIntentId, createdAt: event.createdAt }));
   }
 
   getOperationalStatus(): {

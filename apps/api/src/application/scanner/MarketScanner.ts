@@ -6,6 +6,7 @@ import type { TradingRepository } from "../ports/Repositories.js";
 import type { Candle } from "../../domain/market-data/Candle.js";
 import type { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
 import type { BinanceFuturesPositionStatus } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
+import type { AiScanHook } from "../ai/AiTradeAdvisor.js";
 
 export interface WatchlistStatus {
   symbol: string;
@@ -39,7 +40,8 @@ export class MarketScanner {
     private readonly availableBalanceProvider: AvailableBalanceProvider | null,
     private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
     private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null,
-    private readonly funnelContext: FunnelTelemetryContext = { accountId: "unknown" }
+    private readonly funnelContext: FunnelTelemetryContext = { accountId: "unknown" },
+    private readonly aiAdvisor: AiScanHook | null = null
   ) {
     for (const symbol of config.watchlist) {
       this.engines.set(symbol, this.createEngine(symbol));
@@ -189,6 +191,45 @@ export class MarketScanner {
     }
 
     this.logger.info(`[SCANNER] ${symbol} -> ${engine.getState().setupState}`);
+    // AI hook: runs after the engine has handled this scan's candles (so an engine entry on the
+    // same candle wins), in the background so the model never delays the next symbol.
+    if (!bootstrap) this.notifyAiAdvisor(symbol, engine);
+  }
+
+  /** Resolves when every background AI consultation has finished (tests, shutdown). */
+  async whenAiIdle(): Promise<void> {
+    await this.aiAdvisor?.whenIdle();
+  }
+
+  /**
+   * Marks a symbol as owned by an entry placed outside the engine (the AI advisor) until the next
+   * reconciliation sees the real position or resting order.
+   */
+  markEntryPlaced(symbol: string): void {
+    if (!this.activePositions.has(symbol)) this.pendingEntrySymbols.add(symbol);
+    const accountOpenPositions = this.activePositions.size + this.pendingEntrySymbols.size;
+    for (const [engineSymbol, engine] of this.engines) {
+      const position = this.activePositions.get(engineSymbol) ?? null;
+      const pending = this.pendingEntrySymbols.has(engineSymbol);
+      // An engine that just submitted its own order is not yet known here; leave it to reconciliation.
+      if (!position && !pending && engine.getState().openPositions > 0) continue;
+      engine.syncActivePosition(position, accountOpenPositions, pending);
+    }
+  }
+
+  private notifyAiAdvisor(symbol: string, engine: TradingEngine): void {
+    const m5CloseTime = this.lastCloseTime.get(closeTimeKey(symbol, "M5"));
+    if (!this.aiAdvisor || m5CloseTime === undefined) return;
+    this.aiAdvisor.onScan({
+      symbol,
+      engine,
+      m5CloseTime,
+      config: () => ({ ...this.config, symbol }),
+      livePrice: async () => (this.marketData.getLastPrice ? this.marketData.getLastPrice(symbol) : null),
+      hasActiveEntry: () => this.activePositions.has(symbol) || this.pendingEntrySymbols.has(symbol),
+      accountOpenPositions: () => this.activePositions.size + this.pendingEntrySymbols.size,
+      markEntryPlaced: () => this.markEntryPlaced(symbol)
+    });
   }
 
   private createEngine(symbol: string): TradingEngine {

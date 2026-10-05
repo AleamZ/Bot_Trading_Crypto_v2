@@ -4,7 +4,7 @@ import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { ExecutionGateway, SubmittedOrder } from "../ports/ExecutionGateway.js";
 import { isRecoverableExecutionGateway } from "../ports/ExecutionGateway.js";
-import { buildSetupKey, sideFromDirection, type ExecutionIntent, type ExecutionIntentStatus } from "./ExecutionIntent.js";
+import { buildSetupKey, sideFromDirection, type ExecutionIntent, type ExecutionIntentStatus, type ExecutionOrigin } from "./ExecutionIntent.js";
 import type { ExecutionIntentRepository } from "./ExecutionIntentRepository.js";
 import { classifyExecutionError } from "./ExecutionErrors.js";
 import { isPostEntryProtectionError } from "./PostEntryProtectionError.js";
@@ -60,9 +60,10 @@ export class ExecutionCoordinator implements ExecutionGateway {
     if (!risk.accepted) throw new Error("Risk is not approved");
     await this.options.preTradeValidation?.(plan, risk);
 
+    const origin: ExecutionOrigin = plan.origin === "AI" ? "AI" : "BOT";
     const setupKey = buildSetupKey(this.options.tradingAccountId, plan, risk);
     const intentId = deterministicUuid(`${this.options.tradingAccountId}:${setupKey}`);
-    const clientIds = clientOrderIds(intentId);
+    const clientIds = clientOrderIds(intentId, origin);
     const { intent, created } = await this.options.repository.createOrGet({
       id: intentId,
       tradingAccountId: this.options.tradingAccountId,
@@ -76,9 +77,10 @@ export class ExecutionCoordinator implements ExecutionGateway {
       quantity: risk.quantity,
       clientEntryOrderId: clientIds.entry,
       clientStopOrderId: clientIds.stop,
-      clientTakeProfitOrderId: clientIds.takeProfit
+      clientTakeProfitOrderId: clientIds.takeProfit,
+      source: origin
     });
-    if (created) await this.audit("EXECUTION_INTENT_CREATED", intent, { setupKey });
+    if (created) await this.audit("EXECUTION_INTENT_CREATED", intent, { setupKey, origin });
 
     const duplicate = orderFromExistingIntent(intent);
     if (duplicate) {
@@ -256,8 +258,11 @@ function withClientIds(order: SubmittedOrder, intent: ExecutionIntent): Submitte
   };
 }
 
-function clientOrderIds(intentId: string): { entry: string; stop: string; takeProfit: string } {
-  const short = intentId.replace(/-/g, "").slice(0, 24);
+// Reconciliation and resting-entry detection rely on the `smc_` prefix and the `_E/_S/_T` suffixes.
+// AI orders swap two hex chars for `ai` so the ids keep the same length and stay recognizable.
+export function clientOrderIds(intentId: string, origin: ExecutionOrigin = "BOT"): { entry: string; stop: string; takeProfit: string } {
+  const hex = intentId.replace(/-/g, "");
+  const short = origin === "AI" ? `ai${hex.slice(0, 22)}` : hex.slice(0, 24);
   return {
     entry: `smc_${short}_E`,
     stop: `smc_${short}_S`,

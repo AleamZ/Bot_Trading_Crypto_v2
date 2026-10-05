@@ -658,36 +658,7 @@ export class TradingEngine {
 
     this.emitFunnel("RR_GATE_REACHED", "M5", source, touchedLtfFvg.id);
     this.emitFunnel(executionPlan.riskReward >= this.config.minimumRiskReward ? "RR_GATE_PASSED" : "RR_GATE_REJECTED", "M5", source, touchedLtfFvg.id);
-    const availableBalance = await this.getAvailableBalance();
-    const currentUsedMargin = this.currentUsedMarginProvider ? await this.currentUsedMarginProvider() : 0;
-    const symbolRules = await this.getSymbolRules();
-    const risk = evaluateRisk({
-      symbol: this.config.symbol,
-      direction: executionPlan.direction,
-      availableBalance,
-      symbolRules,
-      riskPerTradeUsdt: this.config.riskPerTradeUsdt,
-      maxLeverage: this.config.maxLeverage,
-      maxMarginUsagePercent: this.config.maxMarginUsagePercent,
-      maxTotalMarginUsagePercent: this.config.maxTotalMarginUsagePercent,
-      currentUsedMargin: currentUsedMargin ?? 0,
-      marginMode: this.config.marginMode,
-      liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
-      entry: executionPlan.entry,
-      stopLoss: executionPlan.stopLoss,
-      takeProfit: executionPlan.takeProfit,
-      minimumRiskReward: this.config.minimumRiskReward,
-      openPositions: this.state.accountOpenPositions,
-      maxOpenPositions: this.config.maxOpenPositions,
-      symbolOpenPositions: this.state.openPositions,
-      maxPositionPerSymbol: this.config.maxPositionPerSymbol,
-      availableAt: candle.closeTime,
-      drawdownPercent: this.state.drawdownPercent,
-      maxDrawdownPercent: this.config.maxDrawdownPercent,
-      tradingEnabled: this.config.tradingEnabled,
-      killSwitch: this.config.killSwitch,
-      createdAt: candle.closeTime
-    });
+    const risk = await this.assessRisk(executionPlan, candle.closeTime);
     this.emitFunnel("RISK_MANAGER_REACHED", "ACCOUNT", source, touchedLtfFvg.id);
     await this.repository.saveRiskDecision(risk);
     await this.events.publish({
@@ -741,6 +712,43 @@ export class TradingEngine {
       at: candle.closeTime,
       orderId: order.orderId,
       reason: `Submitted ${order.mode} bracket order after risk approval`
+    });
+  }
+
+  /**
+   * Runs the risk manager for an executable plan with this engine's live account inputs. The
+   * engine's own entry and the AI advisor both go through here, so every gate is identical.
+   */
+  async assessRisk(executionPlan: EntryPlan, at: number): Promise<RiskDecision> {
+    const availableBalance = await this.getAvailableBalance();
+    const currentUsedMargin = this.currentUsedMarginProvider ? await this.currentUsedMarginProvider() : 0;
+    const symbolRules = await this.getSymbolRules();
+    return evaluateRisk({
+      symbol: this.config.symbol,
+      direction: executionPlan.direction,
+      availableBalance,
+      symbolRules,
+      riskPerTradeUsdt: this.config.riskPerTradeUsdt,
+      maxLeverage: this.config.maxLeverage,
+      maxMarginUsagePercent: this.config.maxMarginUsagePercent,
+      maxTotalMarginUsagePercent: this.config.maxTotalMarginUsagePercent,
+      currentUsedMargin: currentUsedMargin ?? 0,
+      marginMode: this.config.marginMode,
+      liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
+      entry: executionPlan.entry,
+      stopLoss: executionPlan.stopLoss,
+      takeProfit: executionPlan.takeProfit,
+      minimumRiskReward: this.config.minimumRiskReward,
+      openPositions: this.state.accountOpenPositions,
+      maxOpenPositions: this.config.maxOpenPositions,
+      symbolOpenPositions: this.state.openPositions,
+      maxPositionPerSymbol: this.config.maxPositionPerSymbol,
+      availableAt: at,
+      drawdownPercent: this.state.drawdownPercent,
+      maxDrawdownPercent: this.config.maxDrawdownPercent,
+      tradingEnabled: this.config.tradingEnabled,
+      killSwitch: this.config.killSwitch,
+      createdAt: at
     });
   }
 

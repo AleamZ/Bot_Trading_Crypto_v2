@@ -17,6 +17,7 @@ import { createExecutionIntentRepository } from "./infrastructure/execution/Post
 import { createRealExecutionProposalRepository } from "./infrastructure/execution/PostgresRealExecutionProposalRepository.js";
 import { closeAllPostgresPools, verifyPostgresConnection } from "./infrastructure/persistence/PgPoolFactory.js";
 import { startHttpServer } from "./presentation/http/Server.js";
+import { LocalLlmClient, loadLocalLlmConfig } from "./application/ai/LocalLlmClient.js";
 
 let config = loadConfig();
 const logger = new ConsoleDecisionLogger();
@@ -59,6 +60,10 @@ const availableBalanceProvider = async () => {
   return status?.connected ? status.availableBalance : null;
 };
 const marketData = new BinanceFuturesMarketData(config.binanceTestnet);
+// Process-level LLM settings come from env (AI_BASE_URL, AI_API_KEY, AI_MODEL, AI_TIMEOUT_MS);
+// each account opts in with its aiTradingMode setting.
+const llmConfig = loadLocalLlmConfig();
+logger.info("AI advisor configuration", { baseUrl: llmConfig.baseUrl, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.timeoutMs, apiKey: llmConfig.apiKey ? "configured" : "not_configured" });
 const runtimeManager = new TradingRuntimeManager(
   config,
   config.databaseUrl,
@@ -70,7 +75,9 @@ const runtimeManager = new TradingRuntimeManager(
   logger,
   undefined,
   undefined,
-  realExecutionProposalRepository
+  realExecutionProposalRepository,
+  undefined,
+  { client: new LocalLlmClient(llmConfig), defaultModel: llmConfig.defaultModel }
 );
 const scanner = new MarketScanner(config, repository, execution, logger, marketData, availableBalanceProvider);
 const engine = scanner.getPrimaryEngine();

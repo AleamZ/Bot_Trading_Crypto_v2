@@ -1,7 +1,7 @@
 import pg from "pg";
 import { getPostgresPool, withPostgresMigrationLock, withPostgresStartupRetry } from "../persistence/PgPoolFactory.js";
 import { recordSchemaMigration } from "../persistence/SchemaMigrations.js";
-import type { CreateExecutionIntentInput, ExecutionAuditEvent, ExecutionIntent, ExecutionIntentStatus } from "../../application/execution/ExecutionIntent.js";
+import type { CreateExecutionIntentInput, ExecutionAuditEvent, ExecutionIntent, ExecutionIntentStatus, ExecutionSource } from "../../application/execution/ExecutionIntent.js";
 import type { ExecutionIntentRepository } from "../../application/execution/ExecutionIntentRepository.js";
 import { MemoryExecutionIntentRepository } from "./MemoryExecutionIntentRepository.js";
 
@@ -65,7 +65,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
          client_entry_order_id, client_stop_order_id, client_take_profit_order_id,
          source, created_at, updated_at
        )
-       values ($1, $2, $3, $4, $5, 'CREATED', $6, $7, $8, $9, $10, $11, $12, $13, 'BOT', $14, $14)
+       values ($1, $2, $3, $4, $5, 'CREATED', $6, $7, $8, $9, $10, $11, $12, $13, $15, $14, $14)
        on conflict (trading_account_id, setup_key) do nothing
        returning *`,
       [
@@ -82,7 +82,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         input.clientEntryOrderId,
         input.clientStopOrderId,
         input.clientTakeProfitOrderId,
-        now
+        now,
+        input.source ?? "BOT"
       ]
     );
     if (result.rows[0]) return { intent: toExecutionIntent(result.rows[0]), created: true };
@@ -153,12 +154,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     );
   }
 
-  async listAuditEvents(tradingAccountId: string, executionIntentId?: string, limit = 100): Promise<ExecutionAuditEvent[]> {
+  async listAuditEvents(tradingAccountId: string, executionIntentId?: string, limit = 100, type?: string): Promise<ExecutionAuditEvent[]> {
     const result = await this.pool.query(
       `select * from execution_audit_events
-       where trading_account_id = $1 and ($2::uuid is null or execution_intent_id = $2::uuid)
+       where trading_account_id = $1 and ($2::uuid is null or execution_intent_id = $2::uuid) and ($4::text is null or type = $4)
        order by created_at desc limit $3`,
-      [tradingAccountId, executionIntentId ?? null, limit]
+      [tradingAccountId, executionIntentId ?? null, limit, type ?? null]
     );
     return result.rows.map(toAuditEvent);
   }
@@ -202,7 +203,7 @@ function toExecutionIntent(row: Record<string, unknown>): ExecutionIntent {
     clientEntryOrderId: stringOrNull(row.client_entry_order_id),
     clientStopOrderId: stringOrNull(row.client_stop_order_id),
     clientTakeProfitOrderId: stringOrNull(row.client_take_profit_order_id),
-    source: row.source === "EXTERNAL" || row.source === "UNKNOWN" ? row.source : "BOT",
+    source: toExecutionSource(row.source),
     version: Number(row.version ?? 0),
     lastError: stringOrNull(row.last_error),
     createdAt: toIso(row.created_at),
@@ -220,6 +221,11 @@ function toAuditEvent(row: Record<string, unknown>): ExecutionAuditEvent {
     metadata: typeof row.metadata === "object" && row.metadata !== null ? (row.metadata as Record<string, unknown>) : {},
     createdAt: toIso(row.created_at)
   };
+}
+
+// Legacy rows have no source and were all placed by the strategy engine.
+export function toExecutionSource(value: unknown): ExecutionSource {
+  return value === "AI" || value === "EXTERNAL" || value === "UNKNOWN" ? value : "BOT";
 }
 
 function numberOrNull(value: unknown): number | null {

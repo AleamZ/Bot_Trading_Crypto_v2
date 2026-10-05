@@ -1862,3 +1862,27 @@ code {
   font-weight: 400;
   white-space: normal;
 }
+
+/* Who initiated a bot order: the strategy engine (BOT) or the AI advisor (AI). */
+.origin-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  margin-left: 6px;
+  border-radius: 4px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+.origin-badge.bot {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.origin-badge.ai {
+  background: #f5f3ff;
+  color: #6d28d9;
+}

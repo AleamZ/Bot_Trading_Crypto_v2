@@ -826,6 +826,17 @@ async function handleTradingAccountRoute(params: {
     return;
   }
 
+  if (child === "ai-decisions" && parts.length === 4 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    const limit = clampLimit(requestUrl.searchParams.get("limit"), 50, 200);
+    sendJson(response, 200, { decisions: await runtimeManager.listAiDecisions(accountId, limit) }, corsHeaders);
+    return;
+  }
+
   if ((child === "execution-proposals" || child === "real-execution-proposals") && parts.length === 4 && request.method === "GET") {
     if (!runtimeManager) {
       sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
@@ -1149,7 +1160,7 @@ function buildActivePositionAnalysis(symbol: string, position: BinanceFuturesPos
   };
 }
 
-type AnalysisStatus = "PASSED" | "WAITING" | "INVALIDATED";
+export type AnalysisStatus = "PASSED" | "WAITING" | "INVALIDATED";
 type AnalysisSetupState =
   | "WAITING_HTF_CONTEXT"
   | "WAITING_HTF_FVG"
@@ -1161,7 +1172,7 @@ type AnalysisSetupState =
   | "ORDER_PLACED"
   | "INVALIDATED";
 
-interface AnalysisCondition {
+export interface AnalysisCondition {
   id: string;
   label: string;
   status: AnalysisStatus;
@@ -1280,6 +1291,11 @@ export async function buildSymbolAnalysis(
       }
     }
   };
+}
+
+/** The seven runtime setup conditions exactly as the analysis UI renders them; the AI skill reuses them. */
+export function buildRuntimeSetupConditions(symbol: string, diagnostic: SetupDiagnostic, config: AppConfig): AnalysisCondition[] {
+  return buildLifecycleConditions(setupFromDiagnostic(symbol, diagnostic), config);
 }
 
 function setupFromDiagnostic(symbol: string, diagnostic: SetupDiagnostic): AnalysisSetupContext {

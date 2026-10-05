@@ -4,7 +4,8 @@ import type { BinanceAccountVerifier, BinanceAccountInfo } from "./BinanceAccoun
 import { BinanceVerificationError } from "./BinanceAccountVerifier.js";
 import type { TradingAccountRepository } from "./TradingAccountRepository.js";
 import type { TradingRuntimeConfigRepository } from "./TradingRuntimeConfigRepository.js";
-import { validateTradingSettings, type TradingSettings } from "../config/AppConfig.js";
+import { newAccountTradingSettings, validateTradingSettings, type TradingSettings } from "../config/AppConfig.js";
+import { resolveSettingsInput } from "../config/TradingPresets.js";
 import type { CredentialCipher } from "../../infrastructure/security/CredentialCipher.js";
 import type {
   BinanceConnection,
@@ -96,6 +97,11 @@ export class TradingAccountService {
     const settings = await this.runtimeConfigRepository?.getSettings(account.id);
     if (!settings) throw new InvalidTradingAccountInputError("Trading settings are unavailable");
     return settings;
+  }
+
+  // Saves settings sent by the settings page. Simple mode keeps only the user-specific fields from the request.
+  async saveSettingsFromRequest(userId: string, accountId: string, input: unknown): Promise<TradingSettings> {
+    return this.saveSettings(userId, accountId, resolveSettingsInput(input, await this.getSettings(userId, accountId)));
   }
 
   async saveSettings(userId: string, accountId: string, input: unknown): Promise<TradingSettings> {
@@ -248,7 +254,7 @@ export class TradingAccountService {
 
   private async ensureRuntimeDefaults(tradingAccountId: string): Promise<void> {
     if (!this.runtimeConfigRepository || !this.defaultSettings) return;
-    await this.runtimeConfigRepository.ensureDefaults(tradingAccountId, this.defaultSettings);
+    await this.runtimeConfigRepository.ensureDefaults(tradingAccountId, newAccountTradingSettings(this.defaultSettings));
   }
 }
 

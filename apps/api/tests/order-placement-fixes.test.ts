@@ -103,6 +103,7 @@ describe("Execution intents for resting LIMIT entries", () => {
     const service = new TradingReconciliationService(repository, fakeLogger(), 0);
 
     await service.reconcile("account-a", async () => ({
+      ...activityMeta(),
       connected: true,
       positions: [],
       openOrders: [restingEntry(intent.clientEntryOrderId ?? "")],
@@ -122,6 +123,7 @@ describe("Execution intents for resting LIMIT entries", () => {
     const service = new TradingReconciliationService(repository, fakeLogger());
 
     await service.reconcile("account-a", async () => ({
+      ...activityMeta(),
       connected: true,
       positions: [],
       openOrders: [{ ...restingEntry(intent.clientStopOrderId ?? ""), type: "STOP_MARKET", side: "SELL", reduceOnly: true }],
@@ -140,6 +142,7 @@ describe("Execution intents for resting LIMIT entries", () => {
     const service = new TradingReconciliationService(repository, fakeLogger(), 60 * 60 * 1000);
 
     await service.reconcile("account-a", async () => ({
+      ...activityMeta(),
       connected: true,
       positions: [position()],
       openOrders: [],
@@ -370,6 +373,10 @@ async function seedLimitIntent(repository: MemoryExecutionIntentRepository) {
   return saved;
 }
 
+function activityMeta() {
+  return { source: "BINANCE_SIGNED_ACCOUNT" as const, sourceEnvironment: "TESTNET" as const, tradingAccountId: "account-a" };
+}
+
 function restingEntry(clientOrderId: string) {
   return {
     id: "binance:open-order:BTCUSDT:entry-1",
@@ -536,5 +543,5 @@ function json(body: unknown, status = 200): Response {
 }
 
 function fakeLogger(): DecisionLogger {
-  return { debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined };
+  return { info: () => undefined, warn: () => undefined, error: () => undefined };
 }

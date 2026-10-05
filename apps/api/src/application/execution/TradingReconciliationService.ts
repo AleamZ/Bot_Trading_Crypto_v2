@@ -4,6 +4,7 @@ import type { ExecutionIntentRepository } from "./ExecutionIntentRepository.js";
 import type { AccountActivitySnapshot } from "../runtime/TradingRuntimeManager.js";
 import type { ExecutionIntent, ExecutionIntentStatus } from "./ExecutionIntent.js";
 import type { ExecutionOrderLookupResult, RecoverableExecutionGateway } from "../ports/ExecutionGateway.js";
+import { isImmediateTriggerError } from "./ExecutionErrors.js";
 import type { BinanceFuturesOpenOrderStatus, BinanceFuturesOrderHistoryStatus, BinanceFuturesPositionStatus } from "../../infrastructure/execution/BinanceFuturesAccountClient.js";
 
 export interface ReconciliationResult {
@@ -25,7 +26,8 @@ export class TradingReconciliationService {
 
   constructor(
     private readonly repository: ExecutionIntentRepository,
-    private readonly logger: DecisionLogger
+    private readonly logger: DecisionLogger,
+    private readonly limitEntryTimeoutMs = 15 * 60 * 1000
   ) {}
 
   async reconcile(
@@ -177,6 +179,9 @@ export class TradingReconciliationService {
       });
     }
 
+    const expired = await this.cancelExpiredLimitEntry(current, activity, gateway, Boolean(position));
+    if (expired) return { intent: expired, terminalStateMismatch };
+
     if (this.shouldCloseIntent(current, position)) {
       await this.cancelBotOwnedProtectionOrders(current, activity.openOrders, gateway);
       current = (await this.transition(current, "CLOSED", { lastError: null })) ?? current;
@@ -202,6 +207,27 @@ export class TradingReconciliationService {
     }
 
     return { intent: await this.repairProtection(current, position, activity.openOrders, gateway, !terminalStateMismatch), terminalStateMismatch };
+  }
+
+  // A LIMIT entry that has not filled within the timeout is stale: the setup moment has passed.
+  // Any partially filled size stays open and is protected by the closePosition SL/TP.
+  private async cancelExpiredLimitEntry(
+    intent: ExecutionIntent,
+    activity: AccountActivitySnapshot,
+    gateway: RecoverableExecutionGateway | undefined,
+    hasPosition: boolean
+  ): Promise<ExecutionIntent | null> {
+    if (!gateway || intent.entryType !== "limit" || !intent.clientEntryOrderId) return null;
+    if (!["ENTRY_SUBMITTED", "ENTRY_FILLED", "PROTECTION_INCOMPLETE", "PROTECTED"].includes(intent.status)) return null;
+    const openEntry = activity.openOrders.find((order) => order.symbol === intent.symbol && order.clientOrderId === intent.clientEntryOrderId);
+    if (!openEntry) return null;
+    const ageMs = Date.now() - Date.parse(intent.createdAt);
+    if (!Number.isFinite(ageMs) || ageMs < this.limitEntryTimeoutMs) return null;
+
+    await gateway.cancelOrderByClientOrderId(intent.symbol, intent.clientEntryOrderId);
+    await this.audit(intent.tradingAccountId, intent.id, intent.symbol, "LIMIT_ENTRY_EXPIRED", { clientEntryOrderId: intent.clientEntryOrderId, ageMs, partiallyFilled: hasPosition });
+    if (hasPosition || intent.status !== "ENTRY_SUBMITTED") return null;
+    return (await this.transition(intent, "CANCELLED", { lastError: "LIMIT_ENTRY_EXPIRED" })) ?? intent;
   }
 
   private async repairProtection(
@@ -305,7 +331,8 @@ export class TradingReconciliationService {
     };
     const failures = { attempts: prior.attempts + 1, firstAt: prior.firstAt };
     this.repairFailures.set(intent.id, failures);
-    const thresholdReached = failures.attempts >= this.repairMaxAttempts || now - failures.firstAt >= this.repairTimeoutMs;
+    // A crossed trigger price (-2021) will never succeed on retry; close without waiting.
+    const thresholdReached = isImmediateTriggerError(error) || failures.attempts >= this.repairMaxAttempts || now - failures.firstAt >= this.repairTimeoutMs;
     const nextStatus = allowFailSafeClose ? thresholdReached ? "FAIL_SAFE_CLOSE_REQUIRED" : "RECONCILIATION_REQUIRED" : "RECOVERY_REQUIRED";
     const next = (await this.transition(intent, nextStatus, { lastError: error })) ?? intent;
     await this.audit(intent.tradingAccountId, intent.id, intent.symbol, thresholdReached && allowFailSafeClose ? "FAIL_SAFE_CLOSE_REQUIRED" : "PROTECTION_REPAIR_FAILED", { error, attempts: failures.attempts });
@@ -366,7 +393,16 @@ export class TradingReconciliationService {
     const requiredIds = new Set(intents.flatMap((intent) => [intent.clientStopOrderId, intent.clientTakeProfitOrderId]).filter((id): id is string => Boolean(id)));
     for (const order of activity.openOrders) {
       if (!order.clientOrderId?.startsWith("smc_") || !["STOP_MARKET", "TAKE_PROFIT_MARKET"].includes(order.type)) continue;
-      if (openSymbols.has(order.symbol) || this.symbolsWithObservedPositions.has(order.symbol) || requiredIds.has(order.clientOrderId)) continue;
+      if (openSymbols.has(order.symbol)) continue;
+      // Bot exits are closePosition orders: one left over from a finished intent would close the
+      // next position opened on this symbol, so it is removed once the symbol is flat.
+      const owner = intents.find((intent) => intent.clientStopOrderId === order.clientOrderId || intent.clientTakeProfitOrderId === order.clientOrderId);
+      if (owner && isTerminalIntent(owner)) {
+        await gateway.cancelOrderByClientOrderId(order.symbol, order.clientOrderId);
+        await this.audit(tradingAccountId, owner.id, order.symbol, "STALE_PROTECTION_CANCELLED", { orderId: order.orderId, clientOrderId: order.clientOrderId });
+        continue;
+      }
+      if (this.symbolsWithObservedPositions.has(order.symbol) || requiredIds.has(order.clientOrderId)) continue;
       await gateway.cancelOrderByClientOrderId(order.symbol, order.clientOrderId);
       await this.audit(tradingAccountId, null, order.symbol, "ORPHAN_PROTECTION_CANCELLED", { orderId: order.orderId, clientOrderId: order.clientOrderId });
     }

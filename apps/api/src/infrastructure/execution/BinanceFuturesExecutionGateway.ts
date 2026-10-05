@@ -11,11 +11,15 @@ import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { RiskDecision } from "../../domain/risk/RiskDecision.js";
 import { formatRuleNumber, normalizePrice, normalizeQuantity, validateAgainstSymbolRules, type FuturesSymbolRules } from "../../domain/symbol/SymbolRules.js";
 import { PostEntryProtectionError } from "../../application/execution/PostEntryProtectionError.js";
+import { isImmediateTriggerError } from "../../application/execution/ExecutionErrors.js";
 
 type BinanceOrderSide = "BUY" | "SELL";
 type EntryMode = "limit" | "market";
+type EntryModePolicy = EntryMode | (() => EntryMode);
 type MarginMode = "CROSS" | "ISOLATED";
 type MarginModePolicy = MarginMode | (() => MarginMode);
+
+const STOP_LOSS_SUBMIT_ATTEMPTS = 2;
 
 interface SymbolAccountState {
   marginType: MarginMode | "UNKNOWN";
@@ -44,7 +48,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     private readonly apiKey: string,
     private readonly apiSecret: string,
     private readonly mode: "testnet" | "live",
-    private readonly entryMode: EntryMode,
+    private readonly entryModePolicy: EntryModePolicy,
     private readonly leverage: number,
     private readonly expectedMarginMode: MarginModePolicy = "ISOLATED",
     private readonly readOnlySoak = false
@@ -52,23 +56,29 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     this.baseUrl = mode === "testnet" ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
   }
 
+  // Resolved on every call so a settings change applies without rebuilding the runtime.
+  private get entryMode(): EntryMode {
+    return typeof this.entryModePolicy === "function" ? this.entryModePolicy() : this.entryModePolicy;
+  }
+
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision, context?: ExecutionOrderContext): Promise<SubmittedOrder> {
     if (this.mode !== "testnet") throw new Error("REAL_EXECUTION_LOCKED");
     this.assertMutationAllowed();
+    const entryMode = this.entryMode;
     const symbol = risk.symbol;
     const rules = await this.getSymbolRules(symbol);
-    const entryOrderType = this.entryMode.toUpperCase();
+    const entryOrderType = entryMode.toUpperCase();
     const validation = validateAgainstSymbolRules(rules, {
       symbol,
       orderType: entryOrderType,
       quantity: risk.quantity,
-      price: this.entryMode === "limit" ? plan.entry : null,
+      price: entryMode === "limit" ? plan.entry : null,
       notional: risk.notional,
       leverage: risk.selectedLeverage
     });
     if (!validation.ok) throw new Error(validation.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
     const quantity = formatRuleNumber(validation.normalized.quantity);
-    if (this.entryMode === "market") {
+    if (entryMode === "market") {
       await this.validateMarketOrderNotional(symbol, validation.normalized.quantity, rules);
     }
 
@@ -77,26 +87,60 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     const entrySide = plan.direction === "bullish" ? "BUY" : "SELL";
     const exitSide = oppositeSide(entrySide);
     await this.verifyPreparedSymbol(symbol, risk.selectedLeverage);
-    const entry = await this.submitEntryOrder(symbol, entrySide, quantity, formatRuleNumber(normalizePrice(plan.entry, rules.tickSize)), context?.clientEntryOrderId);
-    const partialOrder = (): SubmittedOrder => ({
-      orderId: String(entry.orderId),
+    // Last line of defence: a STOP_MARKET whose trigger is already crossed is rejected by
+    // Binance (-2021), which would leave the new position without a stop loss.
+    await this.assertPriceInsideProtection(symbol, plan);
+    const entry = await this.submitEntryOrder(entryMode, symbol, entrySide, quantity, formatRuleNumber(normalizePrice(plan.entry, rules.tickSize)), context?.clientEntryOrderId);
+    const contextIds = {
       ...(context?.clientEntryOrderId ? { clientEntryOrderId: context.clientEntryOrderId } : {}),
       ...(context?.clientStopOrderId ? { clientStopOrderId: context.clientStopOrderId } : {}),
-      ...(context?.clientTakeProfitOrderId ? { clientTakeProfitOrderId: context.clientTakeProfitOrderId } : {}),
-      mode: this.mode
-    });
+      ...(context?.clientTakeProfitOrderId ? { clientTakeProfitOrderId: context.clientTakeProfitOrderId } : {})
+    };
+    const filledQuantity = Number(entry.executedQty ?? 0);
+    const entryFilled = isFilledStatus(entry.status) || filledQuantity > 0;
 
-    let stopLoss: BinanceAlgoOrderResponse;
-    try {
-      stopLoss = await this.submitAlgoTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
-    } catch (error) {
-      throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), partialOrder());
+    // A resting LIMIT entry gets its protection from reconciliation once a position exists.
+    // Placing reduce-only exits before the fill leaves them orphaned if the entry never fills.
+    if (entryMode === "limit" && !entryFilled) {
+      return { orderId: String(entry.orderId), entryFilled: false, ...contextIds, mode: this.mode };
+    }
+    const partialOrder = (): SubmittedOrder => ({ orderId: String(entry.orderId), entryFilled: true, ...contextIds, mode: this.mode });
+
+    let stopLoss: BinanceAlgoOrderResponse | null = null;
+    let stopLossError: unknown = null;
+    for (let attempt = 1; attempt <= STOP_LOSS_SUBMIT_ATTEMPTS && !stopLoss; attempt += 1) {
+      try {
+        stopLoss = await this.submitAlgoTriggerOrder(symbol, "STOP_MARKET", exitSide, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
+      } catch (error) {
+        stopLossError = error;
+        if (isImmediateTriggerError(error)) break;
+      }
+    }
+    if (!stopLoss) {
+      // Never keep a position open without a stop loss: flatten it immediately.
+      const message = stopLossError instanceof Error ? stopLossError.message : String(stopLossError);
+      try {
+        await this.closePosition({
+          symbol,
+          side: exitSide,
+          quantity: filledQuantity > 0 ? filledQuantity : validation.normalized.quantity,
+          clientOrderId: `${context?.clientEntryOrderId ?? `smc_${Date.now()}`}`.replace(/_E$/, "_C")
+        });
+      } catch (closeError) {
+        const closeMessage = closeError instanceof Error ? closeError.message : String(closeError);
+        throw new PostEntryProtectionError(`STOP_LOSS_FAILED_AND_CLOSE_FAILED: ${message}; close: ${closeMessage}`, partialOrder());
+      }
+      // An ambiguous failure may still have created the closePosition stop; left behind it would
+      // close the next position on this symbol, so remove it best-effort.
+      if (context?.clientStopOrderId) await this.cancelOrderByClientOrderId(symbol, context.clientStopOrderId).catch(() => undefined);
+      throw new Error(`PROTECTION_FAILED_POSITION_CLOSED: ${message}`);
     }
 
     let takeProfit: BinanceAlgoOrderResponse;
     try {
-      takeProfit = await this.submitAlgoTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
+      takeProfit = await this.submitAlgoTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
     } catch (error) {
+      // The stop loss is live, so the position is protected; reconciliation repairs the TP.
       throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), {
         ...partialOrder(),
         stopLossOrderId: String(stopLoss.algoId)
@@ -107,11 +151,17 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       orderId: String(entry.orderId),
       stopLossOrderId: String(stopLoss.algoId),
       takeProfitOrderId: String(takeProfit.algoId),
-      ...(context?.clientEntryOrderId ? { clientEntryOrderId: context.clientEntryOrderId } : {}),
-      ...(context?.clientStopOrderId ? { clientStopOrderId: context.clientStopOrderId } : {}),
-      ...(context?.clientTakeProfitOrderId ? { clientTakeProfitOrderId: context.clientTakeProfitOrderId } : {}),
+      entryFilled: true,
+      ...contextIds,
       mode: this.mode
     };
+  }
+
+  private async assertPriceInsideProtection(symbol: string, plan: EntryPlan): Promise<void> {
+    this.marketPrices.delete(symbol);
+    const price = await this.getCurrentPrice(symbol);
+    const inside = plan.direction === "bullish" ? price > plan.stopLoss && price < plan.takeProfit : price < plan.stopLoss && price > plan.takeProfit;
+    if (!inside) throw new Error(`ENTRY_PRICE_BEYOND_PROTECTION: price ${price} outside SL ${plan.stopLoss} / TP ${plan.takeProfit}`);
   }
 
   async prepareSymbolForExecution(symbol: string, selectedLeverage: number): Promise<void> {
@@ -206,7 +256,6 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       request.symbol,
       request.type,
       request.side,
-      formatRuleNumber(validation.normalized.quantity),
       formatRuleNumber(validation.normalized.stopPrice ?? normalizePrice(request.stopPrice, rules.tickSize)),
       request.clientOrderId
     );
@@ -274,17 +323,18 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     }
   }
 
-  private async submitEntryOrder(symbol: string, side: BinanceOrderSide, quantity: string, price: string, clientOrderId?: string): Promise<BinanceOrderResponse> {
+  private async submitEntryOrder(entryMode: EntryMode, symbol: string, side: BinanceOrderSide, quantity: string, price: string, clientOrderId?: string): Promise<BinanceOrderResponse> {
     const params = new URLSearchParams({
       symbol,
       side,
-      type: this.entryMode.toUpperCase(),
+      type: entryMode.toUpperCase(),
       quantity,
+      newOrderRespType: "RESULT",
       timestamp: String(Date.now())
     });
     if (clientOrderId) params.set("newClientOrderId", clientOrderId);
 
-    if (this.entryMode === "limit") {
+    if (entryMode === "limit") {
       params.set("timeInForce", "GTC");
       params.set("price", price);
     }
@@ -292,11 +342,12 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     return this.signedPost("/fapi/v1/order", params, "Binance entry order failed");
   }
 
+  // closePosition=true exits whatever size is actually open (partial fills, later fills),
+  // instead of a fixed quantity that can drift from the real position.
   private async submitAlgoTriggerOrder(
     symbol: string,
     type: "STOP_MARKET" | "TAKE_PROFIT_MARKET",
     side: BinanceOrderSide,
-    quantity: string,
     triggerPrice: string,
     clientOrderId?: string
   ): Promise<BinanceAlgoOrderResponse> {
@@ -305,9 +356,8 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       symbol,
       side,
       type,
-      quantity,
       triggerPrice,
-      reduceOnly: "true",
+      closePosition: "true",
       workingType: "CONTRACT_PRICE",
       timestamp: String(Date.now())
     });
@@ -538,6 +588,10 @@ function toExecutionOrderLookupResult(order: BinanceOrderResponse | BinanceAlgoO
 function numberOrNull(value: string | number | undefined): number | null {
   const number = Number(value ?? 0);
   return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function isFilledStatus(status: string | undefined): boolean {
+  return status === "FILLED" || status === "PARTIALLY_FILLED";
 }
 
 function isOrderNotFound(error: unknown): boolean {

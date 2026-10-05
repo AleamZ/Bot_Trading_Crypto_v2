@@ -116,7 +116,9 @@ describe("scanner setup lifecycle", () => {
     const afterDiagnostic = afterScanner.getSetupDiagnostic("SOLUSDT");
     const afterAnalysis = await buildSymbolAnalysis("SOLUSDT", config("account-a", "SOLUSDT"), afterPullbackData as never, afterDiagnostic);
 
-    expect(afterHome).toMatchObject({ symbol: "SOLUSDT", state: "ReadyToEnter", conditions: "7/7", status: "Ready" });
+    // Trading is disabled in the test settings, so the ready setup is reported as blocked, with the reason.
+    expect(afterHome).toMatchObject({ symbol: "SOLUSDT", state: "ReadyToEnter", conditions: "7/7", status: "Blocked: TRADING_DISABLED" });
+    expect(afterHome?.blockedReason).toContain("TRADING_DISABLED");
     expect(afterAnalysis.setupState).toBe("READY_TO_ENTRY");
     expect(afterAnalysis.conditions.filter((condition) => condition.status === "PASSED")).toHaveLength(7);
     expect(afterDiagnostic?.ltfFvg?.id).toBe("SOLUSDT:M5:bullish:9:10:11");

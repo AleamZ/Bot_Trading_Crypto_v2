@@ -8,6 +8,8 @@ export interface SubmittedOrder {
   clientEntryOrderId?: string;
   clientStopOrderId?: string;
   clientTakeProfitOrderId?: string;
+  /** false when a LIMIT entry is resting on the book; protection is added after the fill. */
+  entryFilled?: boolean;
   mode: "paper" | "testnet" | "live";
 }
 

@@ -51,6 +51,16 @@ export class BinanceFuturesMarketData {
       .filter((candle) => candle.closeTime <= now && candle.isClosed);
   }
 
+  async getLastPrice(symbol: string): Promise<number | null> {
+    const baseUrl = this.testnet ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
+    const url = new URL("/fapi/v1/ticker/price", baseUrl);
+    url.searchParams.set("symbol", symbol);
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const price = Number(((await response.json()) as { price?: string }).price ?? Number.NaN);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  }
+
   async getKlines(symbol: string, interval: string, limit: number): Promise<BinanceKline[]> {
     const baseUrl = this.testnet ? "https://demo-fapi.binance.com" : "https://fapi.binance.com";
     const url = new URL("/fapi/v1/klines", baseUrl);

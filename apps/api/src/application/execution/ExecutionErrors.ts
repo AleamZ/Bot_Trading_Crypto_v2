@@ -10,7 +10,9 @@ export type ExecutionErrorCode =
   | "RECONCILIATION_REQUIRED"
   | "REAL_EXECUTION_LOCKED"
   | "BINANCE_TIME_SYNC_ERROR"
-  | "PERSISTENCE_UNAVAILABLE";
+  | "PERSISTENCE_UNAVAILABLE"
+  | "PRICE_BEYOND_PROTECTION"
+  | "PROTECTION_FAILED";
 
 export interface ClassifiedExecutionError {
   code: ExecutionErrorCode;
@@ -23,6 +25,9 @@ export function classifyExecutionError(error: unknown): ClassifiedExecutionError
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
   if (message.includes("REAL_EXECUTION_LOCKED")) return { code: "REAL_EXECUTION_LOCKED", retryable: false, ambiguous: false, message };
+  // Both are definitive: no position is left open by the bot, so the intent can fail cleanly.
+  if (message.includes("ENTRY_PRICE_BEYOND_PROTECTION")) return { code: "PRICE_BEYOND_PROTECTION", retryable: false, ambiguous: false, message };
+  if (message.includes("PROTECTION_FAILED_POSITION_CLOSED")) return { code: "PROTECTION_FAILED", retryable: false, ambiguous: false, message };
   if (lower.includes("timestamp") || lower.includes("-1021")) return { code: "BINANCE_TIME_SYNC_ERROR", retryable: false, ambiguous: true, message };
   if (lower.includes("rate") || lower.includes("429") || lower.includes("418")) return { code: "RATE_LIMITED", retryable: true, ambiguous: true, message };
   if (lower.includes("timeout") || lower.includes("econnreset") || lower.includes("network")) return { code: "NETWORK_TIMEOUT", retryable: true, ambiguous: true, message };
@@ -32,4 +37,10 @@ export function classifyExecutionError(error: unknown): ClassifiedExecutionError
   if (lower.includes("auth") || lower.includes("401") || lower.includes("403")) return { code: "AUTH_ERROR", retryable: false, ambiguous: false, message };
   if (lower.includes("duplicate")) return { code: "DUPLICATE_REQUEST", retryable: false, ambiguous: true, message };
   return { code: "BINANCE_UNAVAILABLE", retryable: false, ambiguous: true, message };
+}
+
+/** Binance -2021: the conditional order's trigger price is already crossed. Retrying cannot succeed. */
+export function isImmediateTriggerError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("-2021") || message.toLowerCase().includes("immediately trigger");
 }

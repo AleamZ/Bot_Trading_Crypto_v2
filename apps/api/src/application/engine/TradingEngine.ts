@@ -33,11 +33,24 @@ export interface EngineState {
   pendingEntryPlan: EntryPlan | null;
   activeRisk: RiskDecision | null;
   setupEvidence: SetupEvidence;
+  /** Why the last ready setup did not become an order. Surfaced to the UI. */
+  lastRejection: EntryRejection | null;
+}
+
+export interface EntryRejection {
+  code: string;
+  reason: string;
+  at: number;
 }
 
 export type AvailableBalanceProvider = () => Promise<number | null>;
 export type CurrentUsedMarginProvider = () => Promise<number | null>;
 export type SymbolRulesProvider = (symbol: string) => Promise<FuturesSymbolRules>;
+export type CurrentPriceProvider = (symbol: string) => Promise<number | null>;
+
+/** A touched H1 FVG only provides context for this long; older reactions are stale. */
+export const HTF_CONTEXT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const LTF_ACTIVE_STATES: readonly SetupState[] = ["MonitoringLTF", "WaitingCHOCH", "WaitingLtfFvg", "WaitingLtfMitigation", "ReadyToEnter"];
 
 export type FunnelSource = "LIVE_SCAN" | "BOOTSTRAP_REPLAY" | "RECONCILIATION" | "HISTORICAL";
 export type FunnelStage =
@@ -111,6 +124,8 @@ export type PlanNullReason =
   | "INVALID_SL_GEOMETRY"
   | "INVALID_PRICE_ORDERING"
   | "MISSING_SYMBOL_METADATA"
+  | "PRICE_BEYOND_PROTECTION"
+  | "TRIGGER_CLOSED_BEYOND_STOP"
   | "STALE_FVG"
   | "ALREADY_TOUCHED_FVG"
   | "INVALIDATED_STRUCTURE";
@@ -149,6 +164,7 @@ export interface SetupDiagnostic {
   entryPlan: EntryPlan | null;
   evidenceCount: number;
   invariantOk: boolean;
+  lastRejection: EntryRejection | null;
 }
 
 export class TradingEngine {
@@ -164,7 +180,8 @@ export class TradingEngine {
     private readonly symbolRulesProvider: SymbolRulesProvider | null = null,
     private readonly currentUsedMarginProvider: CurrentUsedMarginProvider | null = null,
     initialBalance = 10_000,
-    private readonly funnelContext: FunnelTelemetryContext = { accountId: "unknown" }
+    private readonly funnelContext: FunnelTelemetryContext = { accountId: "unknown" },
+    private readonly currentPriceProvider: CurrentPriceProvider | null = null
   ) {
     this.events = new EventBus(repository, logger);
     this.state = {
@@ -182,7 +199,8 @@ export class TradingEngine {
       frozenProtectiveCluster: [],
       pendingEntryPlan: null,
       activeRisk: null,
-      setupEvidence: emptySetupEvidence()
+      setupEvidence: emptySetupEvidence(),
+      lastRejection: null
     };
   }
 
@@ -220,8 +238,17 @@ export class TradingEngine {
     return this.state;
   }
 
-  syncActivePosition(position: { side: "long" | "short"; quantity: number; entryPrice: number; unrealizedProfit: number; stopLoss: number | null; takeProfit: number | null } | null, accountOpenPositions = position ? 1 : 0): void {
+  syncActivePosition(
+    position: { side: "long" | "short"; quantity: number; entryPrice: number; unrealizedProfit: number; stopLoss: number | null; takeProfit: number | null } | null,
+    accountOpenPositions = position ? 1 : 0,
+    hasPendingEntry = false
+  ): void {
     this.state.accountOpenPositions = accountOpenPositions;
+    if ((!position || position.quantity <= 0) && hasPendingEntry) {
+      // A resting LIMIT entry still owns this symbol: no new setup until it fills or is cancelled.
+      this.state.openPositions = 1;
+      return;
+    }
     if (!position || position.quantity <= 0) {
       if (this.state.openPositions > 0) {
         this.state.openPositions = 0;
@@ -340,7 +367,8 @@ export class TradingEngine {
       frozenProtectiveCluster: evidence.frozenProtectiveCluster,
       entryPlan: evidence.entryPlan,
       evidenceCount,
-      invariantOk: this.state.setupState !== "ReadyToEnter" || evidenceCount === 7
+      invariantOk: this.state.setupState !== "ReadyToEnter" || evidenceCount === 7,
+      lastRejection: this.state.lastRejection
     };
   }
 
@@ -389,6 +417,8 @@ export class TradingEngine {
     if (this.state.trend === "neutral") return;
 
     const htfFvgs = await this.syncHtfFvgCandidates(candle, historical, source);
+    // An open position (or resting entry) owns the symbol; the next setup starts after it ends.
+    if (this.state.openPositions > 0) return;
     const currentEvidence = this.state.setupEvidence.htfFvg ? htfFvgs.find((fvg) => fvg.id === this.state.setupEvidence.htfFvg?.id) ?? null : null;
     if (currentEvidence?.status === "invalidated") {
       this.state.setupEvidence.htfFvg = currentEvidence;
@@ -401,39 +431,36 @@ export class TradingEngine {
       });
     }
 
+    const alreadyActivated = isActivatedHtfFvg(this.state.setupEvidence.htfFvg);
     const touched = htfFvgs.find((fvg) => fvg.status === "touched" && fvg.id === currentEvidence?.id);
-    if (touched && !historical && touched.firstTouchedAt === candle.closeTime) {
-      const activated = historical || touched.activatedAt !== undefined ? touched : { ...touched, activatedAt: touched.firstTouchedAt ?? candle.closeTime };
-      await this.repository.updateFvg(activated);
-      this.state.setupEvidence.htfFvg = activated;
-      this.state.setupEvidence.htfFirstTouchedAt = activated.firstTouchedAt ?? activated.activatedAt ?? null;
-      this.syncSetupStateWithHtfFvg(activated);
-      await this.events.publish({
-        type: "FVGActivated",
-        at: candle.closeTime,
-        fvg: activated,
-        reason: "H1 FVG first touch reached the nearest boundary"
-      });
-      this.emitFunnel("HTF_FIRST_TOUCH_CONFIRMED", "H1", source, activated.id);
-      this.markState("MonitoringLTF");
+    if (touched && !alreadyActivated && touched.firstTouchedAt === candle.closeTime) {
+      await this.activateHtfFvg({ ...touched, activatedAt: touched.firstTouchedAt }, candle, source, "H1 FVG first touch reached the nearest boundary");
       return;
     }
 
+    // Once the HTF context is active the LTF setup keeps running: older fresh H1 FVGs further
+    // away must not reset it on every H1 close. It ends on invalidation, a trend flip, expiry, or
+    // when price displaced into a newer H1 FVG before any M5 structure break happened.
     const selected = selectNearestFreshHtfFvg(htfFvgs, this.state.trend, candle.close);
-    if (!selected) {
-      const latestTouched = htfFvgs
-        .filter((fvg) => fvg.status === "touched")
-        .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id))[0];
-      if (latestTouched) {
-        this.state.setupEvidence.htfFvg = latestTouched;
-        this.state.setupEvidence.htfFirstTouchedAt = latestTouched.firstTouchedAt ?? latestTouched.activatedAt ?? null;
-        this.syncSetupStateWithHtfFvg(latestTouched);
+    if (alreadyActivated && touched && LTF_ACTIVE_STATES.includes(this.state.setupState)) {
+      if (this.isHtfContextExpired(candle.closeTime)) {
+        this.archiveCandidate("HTF_CONTEXT_EXPIRED");
+      } else {
+        const touchedAt = this.state.setupEvidence.htfFirstTouchedAt ?? Number.POSITIVE_INFINITY;
+        const superseded = selected !== null && selected.createdAt > touchedAt && this.state.setupState === "MonitoringLTF";
+        if (!superseded) return;
       }
-      if (touched) {
-        this.state.setupEvidence.htfFvg = touched;
-        this.state.setupEvidence.htfFirstTouchedAt = touched.firstTouchedAt ?? touched.activatedAt ?? null;
-        this.syncSetupStateWithHtfFvg(touched);
-        return;
+    }
+
+    if (!selected) {
+      // Restart recovery: adopt a touched H1 FVG only while its reaction window is still open.
+      const latestTouched = htfFvgs
+        .filter((fvg) => fvg.status === "touched" && candle.closeTime - (fvg.firstTouchedAt ?? 0) <= HTF_CONTEXT_MAX_AGE_MS)
+        .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id))[0];
+      if (latestTouched && !alreadyActivated && this.state.setupState !== "Archived") {
+        const adopted = { ...latestTouched, activatedAt: latestTouched.activatedAt ?? latestTouched.firstTouchedAt ?? candle.closeTime };
+        this.state.setupEvidence = { ...emptySetupEvidence(), htfFvg: adopted, htfFirstTouchedAt: adopted.firstTouchedAt ?? adopted.activatedAt ?? null };
+        this.syncSetupStateWithHtfFvg(adopted);
       }
       return;
     }
@@ -445,6 +472,7 @@ export class TradingEngine {
         this.resetArchivedSetup(trend.direction);
       }
       this.state.setupEvidence = { ...emptySetupEvidence(), htfFvg: selected };
+      this.state.lastRejection = null;
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "FVGDetected");
       this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "WaitingMitigation");
       await this.events.publish({
@@ -463,11 +491,33 @@ export class TradingEngine {
     this.syncSetupStateWithHtfFvg(selected);
   }
 
+  private async activateHtfFvg(activated: Fvg, candle: Candle, source: FunnelSource, reason: string): Promise<void> {
+    await this.repository.updateFvg(activated);
+    this.state.setupEvidence.htfFvg = activated;
+    this.state.setupEvidence.htfFirstTouchedAt = activated.firstTouchedAt ?? activated.activatedAt ?? null;
+    this.syncSetupStateWithHtfFvg(activated);
+    await this.events.publish({ type: "FVGActivated", at: candle.closeTime, fvg: activated, reason });
+    this.emitFunnel("HTF_FIRST_TOUCH_CONFIRMED", candle.timeframe === "H1" ? "H1" : "M5", source, activated.id);
+    this.markState("MonitoringLTF");
+  }
+
+  private isHtfContextExpired(now: number): boolean {
+    const touchedAt = this.state.setupEvidence.htfFirstTouchedAt;
+    return touchedAt !== null && now - touchedAt > HTF_CONTEXT_MAX_AGE_MS;
+  }
+
   private async processM5(candle: Candle, historical: boolean, source: FunnelSource): Promise<void> {
-    if (historical) return;
+    // Bootstrap replays M5 too, so a restart rebuilds an in-progress LTF setup. Replay never
+    // places orders: a trigger found in history is already in the past and is archived.
+    if (this.state.openPositions > 0) return;
     if (this.state.setupState === "ReadyToEnter") {
-      await this.processReadyToEnterM5Invalidation(candle);
+      await this.processReadyToEnterM5(candle);
       return;
+    }
+    if (this.state.setupState === "WaitingMitigation") {
+      // H1 first touch is detected on the M5 candle that reaches it, not an hour later.
+      const activated = await this.detectHtfTouchOnM5(candle, source);
+      if (!activated) return;
     }
     if (!["MonitoringLTF", "WaitingCHOCH", "WaitingLtfFvg", "WaitingLtfMitigation"].includes(this.state.setupState)) return;
 
@@ -475,6 +525,10 @@ export class TradingEngine {
     const htfActivatedAt = htfFvg?.activatedAt ?? htfFvg?.firstTouchedAt;
     if (!htfFvg || htfFvg.status !== "touched" || htfActivatedAt === undefined || this.state.trend === "neutral") return;
     if (candle.closeTime < htfActivatedAt) return;
+    if (this.isHtfContextExpired(candle.closeTime)) {
+      this.archiveCandidate("HTF_CONTEXT_EXPIRED");
+      return;
+    }
 
     if (!this.state.pendingSignal) {
       const signal = detectM5StructureSignal(this.state.m5Candles, this.state.trend, {
@@ -543,9 +597,15 @@ export class TradingEngine {
     const triggeringFvg = this.state.activeLtfFvgCluster.find((fvg) => isFreshFvg(fvg) && isFvgTouched(fvg, candle));
     if (!triggeringFvg) return;
 
+    // Every cluster FVG this candle reached is spent: first touch happens once, so a failed
+    // attempt can never re-trigger on a later (second) touch.
     const touchedLtfFvg = { ...triggeringFvg, status: "touched" as const, firstTouchedAt: candle.closeTime, activatedAt: candle.closeTime };
-    const frozenCluster = this.state.activeLtfFvgCluster.map((fvg) => (fvg.id === touchedLtfFvg.id ? touchedLtfFvg : fvg));
+    const frozenCluster = this.state.activeLtfFvgCluster.map((fvg) =>
+      fvg.id === touchedLtfFvg.id ? touchedLtfFvg : isFreshFvg(fvg) && isFvgTouched(fvg, candle) ? { ...fvg, status: "touched" as const, firstTouchedAt: candle.closeTime } : fvg
+    );
     await this.repository.updateFvg(touchedLtfFvg);
+    this.state.activeLtfFvgCluster = frozenCluster;
+    this.state.setupEvidence.activeLtfFvgCluster = frozenCluster;
     this.state.pendingLtfFvg = touchedLtfFvg;
     this.state.frozenProtectiveCluster = frozenCluster;
     this.state.setupEvidence.ltfFvg = touchedLtfFvg;
@@ -564,26 +624,46 @@ export class TradingEngine {
 
     if (!planResult.plan) {
       this.emitFunnel("ENTRY_PLAN_REJECTED", "M5", source, touchedLtfFvg.id, planResult.reason);
-      this.logger.warn("Entry plan rejected before risk manager", {
-        reason: planResult.reason,
-        classification: planResult.terminal ? "PERMANENT_CANDIDATE_INVALID" : "TEMPORARY_RETRYABLE"
-      });
-      if (planResult.terminal) this.archiveCandidate(planResult.reason);
+      this.logger.warn("Entry plan rejected before risk manager", { symbol: this.config.symbol, reason: planResult.reason });
+      // The first-touch moment is gone; retrying later would mean a late, off-rule entry.
+      this.rejectEntry(planResult.reason, `Entry plan rejected: ${planResult.reason}`, candle.closeTime);
+      this.archiveCandidate(planResult.reason);
       return;
     }
     const plan = planResult.plan;
+    if (isBeyondStop(plan.direction, candle.close, plan.stopLoss)) {
+      this.emitFunnel("ENTRY_PLAN_REJECTED", "M5", source, touchedLtfFvg.id, "TRIGGER_CLOSED_BEYOND_STOP");
+      this.rejectEntry("TRIGGER_CLOSED_BEYOND_STOP", "Trigger candle closed beyond the cluster stop loss", candle.closeTime);
+      this.archiveCandidate("TRIGGER_CLOSED_BEYOND_STOP");
+      return;
+    }
 
     this.state.setupEvidence.entryPlan = plan;
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "ReadyToEnter");
     this.emitFunnel("ENTRY_PLAN_CREATED", "M5", source, touchedLtfFvg.id);
+    if (historical) {
+      this.rejectEntry("HISTORICAL_TRIGGER", "Trigger happened before the runtime started; entry window has passed", candle.closeTime);
+      this.archiveCandidate("HISTORICAL_TRIGGER");
+      return;
+    }
+
+    const execution = await this.buildExecutionPlan(plan, candle);
+    if (!execution.plan) {
+      this.emitFunnel("ENTRY_PLAN_REJECTED", "M5", source, touchedLtfFvg.id, execution.reason);
+      this.rejectEntry(execution.reason, `Live price ${execution.price} is outside SL/TP; entry skipped`, candle.closeTime);
+      this.archiveCandidate(execution.reason);
+      return;
+    }
+    const executionPlan = execution.plan;
+
     this.emitFunnel("RR_GATE_REACHED", "M5", source, touchedLtfFvg.id);
-    this.emitFunnel(plan.riskReward >= this.config.minimumRiskReward ? "RR_GATE_PASSED" : "RR_GATE_REJECTED", "M5", source, touchedLtfFvg.id);
+    this.emitFunnel(executionPlan.riskReward >= this.config.minimumRiskReward ? "RR_GATE_PASSED" : "RR_GATE_REJECTED", "M5", source, touchedLtfFvg.id);
     const availableBalance = await this.getAvailableBalance();
     const currentUsedMargin = this.currentUsedMarginProvider ? await this.currentUsedMarginProvider() : 0;
     const symbolRules = await this.getSymbolRules();
     const risk = evaluateRisk({
       symbol: this.config.symbol,
-      direction: plan.direction,
+      direction: executionPlan.direction,
       availableBalance,
       symbolRules,
       riskPerTradeUsdt: this.config.riskPerTradeUsdt,
@@ -593,9 +673,9 @@ export class TradingEngine {
       currentUsedMargin: currentUsedMargin ?? 0,
       marginMode: this.config.marginMode,
       liquidationSafetyBufferPercent: this.config.liquidationSafetyBufferPercent,
-      entry: plan.entry,
-      stopLoss: plan.stopLoss,
-      takeProfit: plan.takeProfit,
+      entry: executionPlan.entry,
+      stopLoss: executionPlan.stopLoss,
+      takeProfit: executionPlan.takeProfit,
       minimumRiskReward: this.config.minimumRiskReward,
       openPositions: this.state.accountOpenPositions,
       maxOpenPositions: this.config.maxOpenPositions,
@@ -631,6 +711,8 @@ export class TradingEngine {
         symbolOpenPositions: this.state.openPositions,
         maxOpenPositions: this.config.maxOpenPositions,
       });
+      this.rejectEntry(risk.rejectCode ?? "RISK_REJECTED", risk.reason, candle.closeTime);
+      // Terminal codes archive now; the rest stay visible as "Blocked" until the next M5 close.
       if (risk.rejectCode && terminalRiskRejectCodes.has(risk.rejectCode)) this.archiveCandidate(risk.rejectCode);
       return;
     }
@@ -638,24 +720,18 @@ export class TradingEngine {
 
     let order;
     try {
-      order = await this.execution.submitBracketOrder(plan, risk);
+      order = await this.execution.submitBracketOrder(executionPlan, risk);
     } catch (error) {
-      await this.events.publish({
-        type: "OrderRejected",
-        at: candle.closeTime,
-        reason: error instanceof Error ? error.message : String(error)
-      });
-      this.state.pendingSignal = null;
-      this.state.pendingLtfFvg = null;
-      this.state.activeLtfFvgCluster = [];
-      this.state.frozenProtectiveCluster = [];
-      this.state.pendingEntryPlan = null;
+      const message = error instanceof Error ? error.message : String(error);
+      await this.events.publish({ type: "OrderRejected", at: candle.closeTime, reason: message });
+      this.rejectEntry("ORDER_REJECTED", message, candle.closeTime);
       return;
     }
 
     this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "PositionOpened");
     this.state.openPositions += 1;
     this.state.activeRisk = risk;
+    this.state.lastRejection = null;
     this.state.pendingSignal = null;
     this.state.pendingLtfFvg = null;
     this.state.activeLtfFvgCluster = [];
@@ -666,6 +742,47 @@ export class TradingEngine {
       orderId: order.orderId,
       reason: `Submitted ${order.mode} bracket order after risk approval`
     });
+  }
+
+  private async detectHtfTouchOnM5(candle: Candle, source: FunnelSource): Promise<boolean> {
+    const htf = this.state.setupEvidence.htfFvg;
+    if (!htf || htf.status !== "untouched" || this.state.trend === "neutral") return false;
+    if (candle.closeTime <= htf.createdAt || !isFvgTouched(htf, candle)) return false;
+    // A candle that closes through the whole zone is a break, not a reaction; H1 close decides invalidation.
+    if (isFvgInvalidated(htf, candle)) return false;
+    const activated: Fvg = { ...htf, status: "touched", firstTouchedAt: candle.closeTime, activatedAt: candle.closeTime };
+    await this.activateHtfFvg(activated, candle, source, "H1 FVG first touch reached on M5");
+    return true;
+  }
+
+  /**
+   * Converts the strategy plan into the plan that is executable now. A MARKET entry fills at
+   * the live price, so quantity and RR must come from that price; a LIMIT entry whose price was
+   * already crossed also fills immediately at the live price.
+   */
+  private async buildExecutionPlan(
+    plan: EntryPlan,
+    candle: Candle
+  ): Promise<{ plan: EntryPlan; reason: "NONE"; price: number } | { plan: null; reason: "PRICE_BEYOND_PROTECTION"; price: number }> {
+    let price: number | null = null;
+    try {
+      price = this.currentPriceProvider ? await this.currentPriceProvider(this.config.symbol) : null;
+    } catch (error) {
+      this.logger.warn("Live price check failed; using trigger candle close", { symbol: this.config.symbol, error: error instanceof Error ? error.message : String(error) });
+    }
+    const livePrice = price !== null && Number.isFinite(price) && price > 0 ? price : candle.close;
+    const bullish = plan.direction === "bullish";
+    const inside = bullish ? livePrice > plan.stopLoss && livePrice < plan.takeProfit : livePrice < plan.stopLoss && livePrice > plan.takeProfit;
+    if (!inside) return { plan: null, reason: "PRICE_BEYOND_PROTECTION", price: livePrice };
+
+    const crossed = bullish ? livePrice < plan.entry : livePrice > plan.entry;
+    const entry = this.config.entryMode === "market" || crossed ? livePrice : plan.entry;
+    const riskReward = Math.abs(plan.takeProfit - entry) / Math.abs(entry - plan.stopLoss);
+    return { plan: { ...plan, entry, riskReward }, reason: "NONE", price: livePrice };
+  }
+
+  private rejectEntry(code: string, reason: string, at: number): void {
+    this.state.lastRejection = { code, reason, at };
   }
 
   private async syncHtfFvgCandidates(candle: Candle, historical: boolean, source: FunnelSource): Promise<Fvg[]> {
@@ -845,26 +962,24 @@ export class TradingEngine {
     }
   }
 
-  private async processReadyToEnterM5Invalidation(candle: Candle): Promise<void> {
+  private async processReadyToEnterM5(candle: Candle): Promise<void> {
     const ltfFvg = this.state.setupEvidence.ltfFvg;
-    if (this.state.openPositions > 0 || !ltfFvg || ltfFvg.status === "invalidated") return;
-    if (!isFvgInvalidated(ltfFvg, candle)) return;
-
-    const invalidated = { ...ltfFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
-    await this.repository.updateFvg(invalidated);
-    this.state.setupEvidence.ltfFvg = invalidated;
-    this.state.pendingSignal = null;
-    this.state.pendingLtfFvg = null;
-    this.state.activeLtfFvgCluster = [];
-    this.state.frozenProtectiveCluster = [];
-    this.state.pendingEntryPlan = null;
-    this.state.setupState = transitionSetupStateIfPossible(this.state.setupState, "Archived");
-    await this.events.publish({
-      type: "FVGInvalidated",
-      at: candle.closeTime,
-      fvg: invalidated,
-      reason: "M5 entry FVG was invalidated after ready state before position opened"
-    });
+    if (ltfFvg && ltfFvg.status !== "invalidated" && isFvgInvalidated(ltfFvg, candle)) {
+      const invalidated = { ...ltfFvg, status: "invalidated" as const, invalidatedAt: candle.closeTime };
+      await this.repository.updateFvg(invalidated);
+      this.state.setupEvidence.ltfFvg = invalidated;
+      this.archiveCandidate("LTF_FVG_INVALIDATED");
+      await this.events.publish({
+        type: "FVGInvalidated",
+        at: candle.closeTime,
+        fvg: invalidated,
+        reason: "M5 entry FVG was invalidated after ready state before position opened"
+      });
+      return;
+    }
+    // A ready setup that did not become an order on its trigger candle is never entered late.
+    const triggeredAt = this.state.setupEvidence.ltfFirstTouchedAt;
+    if (triggeredAt !== null && candle.closeTime > triggeredAt) this.archiveCandidate("ENTRY_WINDOW_EXPIRED");
   }
 
   private resetArchivedSetup(direction: Direction | "neutral"): void {
@@ -903,6 +1018,14 @@ function isDisplacementSignal(
   const body = Math.abs(signalCandle.close - signalCandle.open);
   const strongClose = signal.direction === "bullish" ? signalCandle.close > signalCandle.open : signalCandle.close < signalCandle.open;
   return strongClose && body >= averageBody * bodyMultiplier;
+}
+
+function isActivatedHtfFvg(fvg: Fvg | null): boolean {
+  return fvg !== null && fvg.status === "touched" && (fvg.activatedAt !== undefined || fvg.firstTouchedAt !== undefined);
+}
+
+function isBeyondStop(direction: Direction, price: number, stopLoss: number): boolean {
+  return direction === "bullish" ? price <= stopLoss : price >= stopLoss;
 }
 
 function isFreshFvg(fvg: Fvg): boolean {

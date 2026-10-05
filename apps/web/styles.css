@@ -1752,3 +1752,16 @@ code {
     justify-content: flex-start;
   }
 }
+
+.status-blocked {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.status-blocked-reason {
+  max-width: 260px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+  white-space: normal;
+}

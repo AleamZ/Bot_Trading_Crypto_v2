@@ -105,12 +105,14 @@ describe("BinanceFuturesExecutionGateway", () => {
       side: "BUY",
       algoType: "CONDITIONAL",
       type: "STOP_MARKET",
-      quantity: "100",
       triggerPrice: "1.7088",
-      reduceOnly: "true",
+      closePosition: "true",
       workingType: "CONTRACT_PRICE",
       clientAlgoId: "smc_intent_SL"
     });
+    // closePosition exits the real position size, so no fixed quantity / reduceOnly is sent.
+    expect(algoOrders[0]?.params.quantity).toBeUndefined();
+    expect(algoOrders[0]?.params.reduceOnly).toBeUndefined();
     expect(algoOrders[0]?.params.stopPrice).toBeUndefined();
     expect(algoOrders[0]?.params.newClientOrderId).toBeUndefined();
     expect(algoOrders[1]?.params).toMatchObject({

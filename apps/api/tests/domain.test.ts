@@ -478,7 +478,7 @@ describe("risk and state", () => {
     expect(decision.liquidationSafetyStatus).toBe("SAFE");
   });
 
-  it("fails CROSS margin liquidation safety closed while preserving LINKUSDT sizing", () => {
+  it("bounds CROSS liquidation with the isolated estimate and fails closed when collateral is shared", () => {
     const isolated = evaluateRisk(
       riskInput({
         symbol: "LINKUSDT",
@@ -512,12 +512,31 @@ describe("risk and state", () => {
       })
     );
 
+    const crossShared = evaluateRisk(
+      riskInput({
+        symbol: "LINKUSDT",
+        direction: "bearish",
+        availableBalance: 5893.7684269,
+        symbolRules: linkSymbolRules(),
+        riskPerTradeUsdt: 5,
+        maxLeverage: 125,
+        maxMarginUsagePercent: 20,
+        marginMode: "CROSS",
+        currentUsedMargin: 100,
+        entry: 11.563,
+        stopLoss: 11.572,
+        takeProfit: 11.524,
+        minimumRiskReward: 1
+      })
+    );
+
     expect(isolated).toMatchObject({ accepted: true, selectedLeverage: 6, liquidationSafetyStatus: "SAFE" });
-    expect(cross).toMatchObject({
+    expect(cross).toMatchObject({ accepted: true, selectedLeverage: 6, liquidationSafetyStatus: "SAFE" });
+    expect(cross.estimatedLiquidationPrice).toBeCloseTo(isolated.estimatedLiquidationPrice ?? 0, 8);
+    expect(crossShared).toMatchObject({
       accepted: false,
       rejectCode: "CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED",
-      liquidationSafetyStatus: "UNAVAILABLE",
-      selectedLeverage: 6
+      liquidationSafetyStatus: "UNAVAILABLE"
     });
     expect(cross.quantity).toBe(isolated.quantity);
     expect(cross.actualRiskUsdt).toBeCloseTo(isolated.actualRiskUsdt, 8);

@@ -227,14 +227,14 @@ export class TradingRuntimeManager {
     const repository = await this.createRuntimeTradingRepository(account.id);
     await repository.saveTradingSettings(config);
     const health = createRecoveringHealth();
-    const rawExecution = await this.createExecutionGateway(account, config.entryMode, config.maxLeverage, () => configRef.current.marginMode, config.readOnlySoak);
+    const rawExecution = await this.createExecutionGateway(account, () => configRef.current.entryMode, config.maxLeverage, () => configRef.current.marginMode, config.readOnlySoak);
     const executionGate = () => this.resolveRuntimeExecutionGate(account, health, configRef.current, rawExecution);
     const execution =
       account.mode === "DEMO"
         ? new ExecutionCoordinator({
             tradingAccountId: account.id,
             mode: account.mode,
-            entryType: config.entryMode,
+            entryType: () => configRef.current.entryMode,
             repository: this.executionIntentRepository,
             delegate: rawExecution,
             logger: this.logger,
@@ -332,6 +332,14 @@ export class TradingRuntimeManager {
           runtime.scanner.start();
         }
         runtime.scannerBootstrapInFlight = null;
+        // A failed bootstrap used to leave the scanner stopped forever; retry until it succeeds.
+        if (!bootstrapSucceeded && !this.shuttingDown) {
+          setTimeout(() => {
+            if (this.shuttingDown || this.runtimes.get(runtime.account.id) !== runtime || runtime.reconciliationTimer === null) return;
+            runtime.scannerBootstrapStarted = false;
+            this.startScannerBootstrap(runtime);
+          }, SCANNER_BOOTSTRAP_RETRY_MS).unref?.();
+        }
       });
   }
 
@@ -778,7 +786,7 @@ export class TradingRuntimeManager {
 
   private async createExecutionGateway(
     account: TradingAccount,
-    entryMode: "limit" | "market",
+    entryMode: "limit" | "market" | (() => "limit" | "market"),
     leverage: number,
     marginMode: "CROSS" | "ISOLATED" | (() => "CROSS" | "ISOLATED"),
     readOnlySoak: boolean
@@ -870,7 +878,7 @@ export class TradingRuntimeManager {
     );
     const activity = await this.getAccountActivity(runtime.account.id, undefined, 100);
     runtime.lastPositions = activity.positions;
-    runtime.scanner.syncPositions(activity.positions);
+    runtime.scanner.syncPositions(activity.positions, pendingBotEntrySymbols(activity.openOrders));
     runtime.health.lastReconciliationAt = result.checkedAt;
     runtime.health.lastReconciliationError = result.error;
     runtime.health.reconciliationStatus = result.status;
@@ -1016,6 +1024,13 @@ async function readAccountRuntimeData<T>(label: string, read: () => Promise<T[]>
     logger.warn(`Account runtime ${label} sync failed`, { error: error instanceof Error ? error.message : String(error) });
     throw error;
   }
+}
+
+const SCANNER_BOOTSTRAP_RETRY_MS = 60_000;
+
+/** Symbols with a resting bot entry order (client id `smc_<intent>_E`). */
+function pendingBotEntrySymbols(openOrders: readonly { symbol: string; clientOrderId: string | null; type: string }[]): string[] {
+  return openOrders.filter((order) => order.clientOrderId?.startsWith("smc_") && order.clientOrderId.endsWith("_E") && order.type === "LIMIT").map((order) => order.symbol);
 }
 
 class AccountRuntime {

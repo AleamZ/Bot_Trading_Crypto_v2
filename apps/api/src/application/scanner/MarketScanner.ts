@@ -14,6 +14,8 @@ export interface WatchlistStatus {
   rr: number | null;
   position: "None" | "Open" | "Paper" | "LONG" | "SHORT";
   status: string;
+  /** Rejection code when the setup was ready but no order was placed. */
+  blockedReason: string | null;
   lastScanAt: string | null;
   positionSource?: "binance" | "paper" | "engine";
 }
@@ -23,8 +25,10 @@ export class MarketScanner {
   private readonly lastCloseTime = new Map<string, number>();
   private readonly lastScanTime = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
+  private alignTimer: NodeJS.Timeout | null = null;
   private scanning = false;
   private activePositions = new Map<string, BinanceFuturesPositionStatus>();
+  private pendingEntrySymbols = new Set<string>();
 
   constructor(
     private config: AppConfig,
@@ -72,19 +76,23 @@ export class MarketScanner {
         conditions: `${passed}/7`,
         rr: pending?.riskReward ?? state.activeRisk?.riskReward ?? null,
         position: positionFromState(state.openPositions, this.config.executionMode),
-        status: statusFromState(state.setupState, this.config.executionMode, diagnostic.invariantOk),
+        status: statusFromState(state.setupState, this.config.executionMode, diagnostic.invariantOk, state.lastRejection?.code ?? null),
+        blockedReason: state.lastRejection ? `${state.lastRejection.code}: ${state.lastRejection.reason}` : null,
         lastScanAt: this.lastScanTime.has(symbol) ? new Date(this.lastScanTime.get(symbol) ?? 0).toISOString() : null
       };
     });
   }
 
-  syncPositions(positions: readonly BinanceFuturesPositionStatus[]): void {
+  syncPositions(positions: readonly BinanceFuturesPositionStatus[], pendingEntrySymbols: Iterable<string> = []): void {
     this.activePositions.clear();
     for (const position of positions) {
       if (position.quantity > 0) this.activePositions.set(position.symbol, position);
     }
+    // Resting bot LIMIT entries count as positions: they become one the moment they fill.
+    this.pendingEntrySymbols = new Set([...pendingEntrySymbols].filter((symbol) => !this.activePositions.has(symbol)));
+    const accountOpenPositions = this.activePositions.size + this.pendingEntrySymbols.size;
     for (const [symbol, engine] of this.engines) {
-      engine.syncActivePosition(this.activePositions.get(symbol) ?? null, this.activePositions.size);
+      engine.syncActivePosition(this.activePositions.get(symbol) ?? null, accountOpenPositions, this.pendingEntrySymbols.has(symbol));
     }
   }
 
@@ -111,17 +119,27 @@ export class MarketScanner {
     }
   }
 
-  start(intervalMs = 60_000): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => {
+  // Scans are aligned a few seconds after each minute boundary so a closed M5 candle is
+  // evaluated within seconds instead of up to a full interval later.
+  start(intervalMs = 60_000, offsetMs = 2_000): void {
+    if (this.timer || this.alignTimer) return;
+    const run = () => {
       this.scan().catch((error: unknown) => {
         this.logger.error("[SCANNER] scan failed", { error: error instanceof Error ? error.message : String(error) });
       });
-    }, intervalMs);
+    };
+    const delay = intervalMs - (Date.now() % intervalMs) + offsetMs;
+    this.alignTimer = setTimeout(() => {
+      this.alignTimer = null;
+      run();
+      this.timer = setInterval(run, intervalMs);
+    }, delay);
   }
 
   stop(): void {
+    if (this.alignTimer) clearTimeout(this.alignTimer);
     if (this.timer) clearInterval(this.timer);
+    this.alignTimer = null;
     this.timer = null;
   }
 
@@ -130,7 +148,12 @@ export class MarketScanner {
     this.scanning = true;
     try {
       for (const symbol of this.config.watchlist) {
-        await this.scanSymbol(symbol, false);
+        // One failing symbol (bad data, API hiccup) must not stop the rest of the watchlist.
+        try {
+          await this.scanSymbol(symbol, false);
+        } catch (error) {
+          this.logger.error("[SCANNER] symbol scan failed", { symbol, error: error instanceof Error ? error.message : String(error) });
+        }
       }
     } finally {
       this.scanning = false;
@@ -141,8 +164,8 @@ export class MarketScanner {
     const engine = this.engines.get(symbol) ?? this.createEngine(symbol);
     engine.recordScan(bootstrap ? "BOOTSTRAP_REPLAY" : "LIVE_SCAN");
     const activePosition = this.activePositions.get(symbol);
-    if (activePosition) {
-      engine.syncActivePosition(activePosition, this.activePositions.size);
+    if (activePosition || this.pendingEntrySymbols.has(symbol)) {
+      engine.syncActivePosition(activePosition ?? null, this.activePositions.size + this.pendingEntrySymbols.size, this.pendingEntrySymbols.has(symbol));
       this.lastScanTime.set(symbol, Date.now());
       this.logger.info(`[SCANNER] ${symbol} -> ${engine.getState().setupState} (active position)`);
       return;
@@ -179,7 +202,8 @@ export class MarketScanner {
       this.symbolRulesProvider,
       this.currentUsedMarginProvider,
       10_000,
-      this.funnelContext
+      this.funnelContext,
+      async (priceSymbol) => (this.marketData.getLastPrice ? this.marketData.getLastPrice(priceSymbol) : null)
     );
     this.engines.set(symbol, engine);
     return engine;
@@ -195,7 +219,8 @@ function positionFromState(openPositions: number, executionMode: string): "None"
   return executionMode === "paper" ? "Paper" : "Open";
 }
 
-function statusFromState(state: string, executionMode: string, invariantOk: boolean): string {
+function statusFromState(state: string, executionMode: string, invariantOk: boolean, blockedCode: string | null): string {
+  if (state === "ReadyToEnter" && blockedCode) return `Blocked: ${blockedCode}`;
   if (state === "ReadyToEnter") return invariantOk ? "Ready" : "Monitoring";
   if (state === "PositionOpened" || state === "ManagingTrade") return executionMode === "paper" ? "Simulated" : "Active";
   if (state === "Archived") return "Invalidated";

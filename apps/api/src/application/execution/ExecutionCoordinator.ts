@@ -13,7 +13,7 @@ import { backoffDelay, sleep, type RetryPolicyOptions } from "./RetryPolicy.js";
 export interface ExecutionCoordinatorOptions {
   tradingAccountId: string;
   mode: "DEMO" | "REAL";
-  entryType: "limit" | "market";
+  entryType: "limit" | "market" | (() => "limit" | "market");
   repository: ExecutionIntentRepository;
   delegate: ExecutionGateway;
   logger: DecisionLogger;
@@ -69,7 +69,7 @@ export class ExecutionCoordinator implements ExecutionGateway {
       symbol: risk.symbol,
       side: sideFromDirection(plan.direction),
       setupKey,
-      entryType: this.options.entryType,
+      entryType: typeof this.options.entryType === "function" ? this.options.entryType() : this.options.entryType,
       requestedEntry: plan.entry,
       requestedStopLoss: plan.stopLoss,
       requestedTakeProfit: plan.takeProfit,
@@ -113,7 +113,8 @@ export class ExecutionCoordinator implements ExecutionGateway {
     try {
       const order = await this.submitWithClientLookup(plan, risk, beforeSubmit, context);
 
-      const protectedStatus = order.stopLossOrderId && order.takeProfitOrderId ? "PROTECTED" : "PROTECTION_INCOMPLETE";
+      // A resting LIMIT entry stays ENTRY_SUBMITTED; reconciliation protects it once filled or cancels it on timeout.
+      const protectedStatus = order.entryFilled === false ? "ENTRY_SUBMITTED" : order.stopLossOrderId && order.takeProfitOrderId ? "PROTECTED" : "PROTECTION_INCOMPLETE";
       await this.options.repository.transitionStatus(beforeSubmit.id, ["ENTRY_SUBMITTING", "ENTRY_SUBMITTED", "ENTRY_FILLED"], protectedStatus, {
         binanceEntryOrderId: order.orderId,
         binanceStopOrderId: order.stopLossOrderId ?? null,

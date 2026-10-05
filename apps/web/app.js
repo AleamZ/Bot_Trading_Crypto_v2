@@ -866,7 +866,7 @@ function renderWatchlist(rows) {
         tableCell(item.conditions === undefined || item.conditions === null ? "—" : item.conditions),
         tableCell(item.rr === null || item.rr === undefined ? "-" : formatRatio(item.rr)),
         tableCell(item.position),
-        tableCell(item.status),
+        statusCell(item),
         tableCell(item.lastScanAt ? new Date(item.lastScanAt).toLocaleTimeString() : "-"),
       );
       return row;
@@ -877,6 +877,20 @@ function renderWatchlist(rows) {
 function tableCell(value) {
   const cell = document.createElement("td");
   cell.textContent = value ?? "-";
+  return cell;
+}
+
+// Explains why a 7/7 setup did not become an order (risk gate, disabled trading, live price...).
+function statusCell(item) {
+  const cell = tableCell(item.status);
+  if (item.blockedReason) {
+    cell.title = item.blockedReason;
+    cell.classList.add("status-blocked");
+    const reason = document.createElement("div");
+    reason.className = "status-blocked-reason";
+    reason.textContent = item.blockedReason;
+    cell.append(reason);
+  }
   return cell;
 }
 

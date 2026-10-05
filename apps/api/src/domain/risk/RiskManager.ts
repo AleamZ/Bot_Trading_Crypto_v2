@@ -121,10 +121,13 @@ function evaluateLiquidationSafety(input: RiskInput, quantity: number, notional:
     return unavailable("LIQUIDATION_SAFETY_UNAVAILABLE", "Valid quantity, notional and initial margin are required for liquidation safety");
   }
 
-  if (input.marginMode === "CROSS") {
+  // Under CROSS the whole wallet backs the position, so liquidation is at least as far away as the
+  // isolated estimate below: that estimate is a safe lower bound. It stops being one once other
+  // positions share the collateral, because their losses can pull liquidation closer.
+  if (input.marginMode === "CROSS" && (input.currentUsedMargin ?? 0) > 0) {
     return unavailable(
       "CROSS_MARGIN_LIQUIDATION_SAFETY_UNSUPPORTED",
-      "Cross-margin liquidation safety is not supported for automated execution because account-wide cross collateral exposure is not fully modeled"
+      "Cross-margin liquidation safety cannot be bounded while other positions share the cross collateral"
     );
   }
 

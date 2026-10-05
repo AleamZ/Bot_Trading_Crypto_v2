@@ -55,6 +55,12 @@ Required:
 
 Historical FVGs already touched before the current runtime evaluation are not eligible as fresh HTF setup candidates.
 
+First touch of the selected H1 FVG is detected on the first M5 candle that reaches its nearest boundary (it does not wait for the H1 close). An M5 candle that closes through the whole H1 FVG is a break, not a reaction, and does not activate it; H1 close still decides invalidation.
+
+Once activated, the HTF context stays active for at most 12 hours (`HTF_CONTEXT_MAX_AGE_MS`). It ends early on H1 invalidation, an H1 trend flip, or when a newer same-direction H1 FVG forms after the touch while no M5 BOS/CHOCH has happened yet. Other, older fresh H1 FVGs never reset an active LTF setup.
+
+After a restart, bootstrap replays both H1 and M5 history without placing orders, so an in-progress setup is rebuilt. A touched H1 FVG is adopted on restart only while its 12-hour window is still open. A trigger found in replayed history is archived (`HISTORICAL_TRIGGER`).
+
 ## M5 Structure
 
 After HTF first touch, the bot waits for M5 BOS/CHOCH.
@@ -94,6 +100,10 @@ At that first touch:
 - calculate entry, SL, TP, R/R, and risk sizing
 
 The same first-touch event must be idempotent and must not create duplicate execution intents.
+
+Every cluster FVG reached by the trigger candle becomes touched. A failed entry attempt never re-triggers on a later (second) touch.
+
+If the trigger candle closes beyond the cluster stop loss, the setup is archived (`TRIGGER_CLOSED_BEYOND_STOP`).
 
 ## Entry, Stop Loss, Take Profit
 
@@ -139,6 +149,25 @@ If RR is below the configured minimum, reject the setup with the existing RR rej
 
 The bot must not shrink SL or move TP to make RR pass.
 
+## Execution Price
+
+The plan above is the strategy plan. Before risk sizing the bot reads the live price:
+
+- If the live price is at/beyond SL or TP, the entry is skipped (`PRICE_BEYOND_PROTECTION`).
+- MARKET entry: entry = live price. RR and 1R quantity are computed from the live price.
+- LIMIT entry: entry = FVG boundary, unless price already crossed it, in which case entry = live price.
+
+A ready setup is only entered on its trigger candle. If it is blocked (risk gate, trading disabled, order error) it is shown as `Blocked: <code>` and archived on the next M5 close (`ENTRY_WINDOW_EXPIRED`). It is never entered late.
+
+## Protection Orders
+
+- SL and TP are `STOP_MARKET` / `TAKE_PROFIT_MARKET` with `closePosition=true`, so they always exit the real position size.
+- The gateway re-checks the live price right before the entry and refuses if it is outside SL/TP.
+- If the SL cannot be placed after a MARKET fill, the position is closed immediately (`PROTECTION_FAILED_POSITION_CLOSED`).
+- If only the TP fails, the SL protects the position and reconciliation repairs the TP.
+- A LIMIT entry gets SL/TP only after it fills (via reconciliation). An unfilled LIMIT entry is cancelled after 15 minutes. While it rests, the symbol counts as occupied.
+- A repair that fails because the trigger price is already crossed (Binance -2021) closes the position immediately instead of retrying.
+
 ## 1R Risk-Based Sizing
 
 Risk per Trade (1R) is the target monetary risk.
@@ -174,6 +203,11 @@ Concurrency:
 
 - Max Open Positions limits simultaneous account positions only
 - Max Position Per Symbol remains locked at 1
+
+Margin mode:
+
+- ISOLATED: liquidation price is estimated from the position's own margin.
+- CROSS: the isolated estimate is used as a safe lower bound, but only while no other position shares the cross collateral; otherwise new entries are blocked.
 
 ## REAL Execution
 

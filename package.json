@@ -6,7 +6,8 @@
   "workspaces": [
     "apps/api",
     "apps/web",
-    "packages/shared"
+    "packages/shared",
+    "tools/ai-dev-agent"
   ],
   "scripts": {
     "dev:api": "npm run dev -w @smc-futures-bot/api",
@@ -16,7 +17,8 @@
     "build": "npm run build:api && npm run build:web",
     "start:api": "npm run start -w @smc-futures-bot/api",
     "test": "npm run test -w @smc-futures-bot/api",
-    "typecheck": "npm run typecheck -w @smc-futures-bot/api && npm run typecheck -w @smc-futures-bot/web"
+    "typecheck": "npm run typecheck -w @smc-futures-bot/api && npm run typecheck -w @smc-futures-bot/web",
+    "ai-agent": "npm run start -w @smc-futures-bot/ai-dev-agent"
   },
   "dependencies": {
     "argon2": "^0.45.1",

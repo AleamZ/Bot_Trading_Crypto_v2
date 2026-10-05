@@ -276,6 +276,92 @@ describe("trading account HTTP flow", () => {
     expect(response.status).toBe(404);
   });
 
+  it("serves trading presets to authenticated users only", async () => {
+    expect((await fetch(`${baseUrl}/api/trading-presets`)).status).toBe(401);
+    const cookie = await register("presets@example.com");
+    const response = await fetch(`${baseUrl}/api/trading-presets`, { headers: { cookie } });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.presets.map((preset: { level: number }) => preset.level)).toEqual([1, 2, 3, 4, 5]);
+    expect(body.presets[0]).toMatchObject({ label: "Rất an toàn", values: { maxLeverage: 5, entryMode: "limit" } });
+    expect(body.simpleModeUserFields).toEqual(["watchlist", "riskPerTradeUsdt", "tradingEnabled", "killSwitch"]);
+  });
+
+  it("starts new accounts in simple mode and derives preset fields server-side on simple saves", async () => {
+    const cookie = await register("simple-mode@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Simple", mode: "REAL" }, cookie)).json()).account;
+    const settingsPath = `/api/trading-accounts/${account.id}/settings`;
+
+    const initial = await (await fetch(`${baseUrl}${settingsPath}`, { headers: { cookie } })).json();
+    expect(initial).toMatchObject({ settingsMode: "simple", riskLevel: 3, maxLeverage: 20, maxOpenPositions: 2 });
+
+    expect((await putJson(`/api/trading-accounts/${account.id}/real-execution-mode`, { mode: "DRY_RUN" }, cookie)).status).toBe(200);
+    const response = await putJson(
+      settingsPath,
+      {
+        settingsMode: "simple",
+        riskLevel: 1,
+        watchlist: ["ethusdt"],
+        riskPerTradeUsdt: 12,
+        tradingEnabled: true,
+        killSwitch: false,
+        maxLeverage: 125,
+        maxOpenPositions: 9,
+        minimumRiskReward: 0.5,
+        marginMode: "CROSS",
+        entryMode: "market",
+        realExecutionMode: "APPROVAL_REQUIRED"
+      },
+      cookie
+    );
+    expect(response.status).toBe(200);
+    const expected = {
+      settingsMode: "simple",
+      riskLevel: 1,
+      watchlist: ["ETHUSDT"],
+      riskPerTradeUsdt: 12,
+      tradingEnabled: true,
+      killSwitch: false,
+      realExecutionMode: "DRY_RUN",
+      minimumRiskReward: 3,
+      maxLeverage: 5,
+      maxMarginUsagePercent: 10,
+      maxTotalMarginUsagePercent: 30,
+      maxOpenPositions: 1,
+      dailyLossLimitR: 1,
+      dailyProfitLimitR: 3,
+      maxDrawdownPercent: 5,
+      requireDisplacement: true,
+      stopLossBufferTicks: 10,
+      liquidationSafetyBufferPercent: 1,
+      entryMode: "limit",
+      marginMode: "ISOLATED"
+    };
+    expect(await response.json()).toMatchObject(expected);
+    expect(await (await fetch(`${baseUrl}${settingsPath}`, { headers: { cookie } })).json()).toMatchObject(expected);
+    expect(await configRepository.getWatchlist(account.id)).toEqual(["ETHUSDT"]);
+  });
+
+  it("saves advanced settings as sent and rejects invalid risk levels", async () => {
+    const cookie = await register("advanced-mode@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Advanced", mode: "DEMO" }, cookie)).json()).account;
+    const settingsPath = `/api/trading-accounts/${account.id}/settings`;
+
+    const advanced = await putJson(
+      settingsPath,
+      { ...testConfig(), settingsMode: "advanced", riskLevel: 1, maxLeverage: 42, minimumRiskReward: 2.2, maxOpenPositions: 4, entryMode: "market", watchlist: ["BTCUSDT"] },
+      cookie
+    );
+    expect(advanced.status).toBe(200);
+    expect(await advanced.json()).toMatchObject({ settingsMode: "advanced", riskLevel: 1, maxLeverage: 42, minimumRiskReward: 2.2, maxOpenPositions: 4, entryMode: "market" });
+
+    for (const riskLevel of [0, 6, 1.5, "high"]) {
+      expect((await putJson(settingsPath, { settingsMode: "simple", riskLevel, riskPerTradeUsdt: 10 }, cookie)).status).toBe(400);
+    }
+    expect((await putJson(settingsPath, { ...testConfig(), settingsMode: "expert" }, cookie)).status).toBe(400);
+    expect(await (await fetch(`${baseUrl}${settingsPath}`, { headers: { cookie } })).json()).toMatchObject({ settingsMode: "advanced", maxLeverage: 42 });
+  });
+
   it("permanently deletes an inactive DEMO account and account-scoped data", async () => {
     const cookie = await register("delete-demo@example.com");
     const account = (await (await postJson("/api/trading-accounts", { name: "Demo Delete", mode: "DEMO" }, cookie)).json()).account;

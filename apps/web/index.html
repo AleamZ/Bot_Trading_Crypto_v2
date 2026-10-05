@@ -403,7 +403,7 @@
         </section>
       </section>
 
-      <section class="view" id="settings-view" data-settings-mode="basic">
+      <section class="view" id="settings-view" data-settings-mode="basic" data-config-mode="advanced">
         <section class="settings-toolbar">
           <div>
             <h1>Setting</h1>
@@ -415,7 +415,31 @@
           </div>
         </section>
 
-        <section class="risk-summary settings-panel">
+        <section class="config-mode-bar">
+          <div class="segmented-control config-mode-control" id="config-mode-control" role="tablist" aria-label="Configuration mode">
+            <button class="segmented-option" data-config-mode="simple" type="button">Simple</button>
+            <button class="segmented-option" data-config-mode="advanced" type="button">Advanced</button>
+          </div>
+          <small id="config-mode-note">Simple: choose a risk level, the bot applies a tested preset.</small>
+        </section>
+
+        <section class="settings-group config-simple-only">
+          <h2>Risk Level</h2>
+          <div class="risk-level-selector" id="risk-level-selector" role="radiogroup" aria-label="Risk level">
+            <span class="empty-selection">Loading presets</span>
+          </div>
+          <p class="risk-level-description" id="risk-level-description"></p>
+          <div class="risk-summary-grid preset-summary-grid">
+            <span><small>Minimum R/R</small><strong id="preset-summary-rr">-</strong></span>
+            <span><small>Max Leverage</small><strong id="preset-summary-leverage">-</strong></span>
+            <span><small>Max Margin / Trade</small><strong id="preset-summary-margin">-</strong></span>
+            <span><small>Max Positions</small><strong id="preset-summary-positions">-</strong></span>
+            <span><small>Daily Loss Limit</small><strong id="preset-summary-daily-loss">-</strong></span>
+            <span><small>Order Type</small><strong id="preset-summary-entry">-</strong></span>
+          </div>
+        </section>
+
+        <section class="risk-summary settings-panel config-advanced-only">
           <div class="panel-head">
             <div>
               <h2>Risk Profile</h2>
@@ -475,31 +499,31 @@
             <small>Approximate amount lost if stop loss is hit. Position size is calculated automatically.</small>
           </article>
 
-          <article class="setting-card advanced-setting">
+          <article class="setting-card advanced-setting config-advanced-only">
             <label for="setting-max-leverage">Max Leverage</label>
             <input id="setting-max-leverage" inputmode="numeric" min="1" max="125" step="1" type="text" />
             <small>Maximum leverage the bot may use. Actual leverage is calculated automatically.</small>
           </article>
 
-          <article class="setting-card advanced-setting">
+          <article class="setting-card advanced-setting config-advanced-only">
             <label for="setting-max-margin-usage">Max Margin Usage per Trade %</label>
             <input id="setting-max-margin-usage" inputmode="decimal" min="0.01" max="100" step="0.01" type="text" />
             <small>Maximum percentage of available Futures balance that one new trade may use as margin.</small>
           </article>
 
-          <article class="setting-card advanced-setting">
+          <article class="setting-card advanced-setting config-advanced-only">
             <label for="setting-max-total-margin-usage">Max Total Margin Usage %</label>
             <input id="setting-max-total-margin-usage" inputmode="decimal" min="0.01" max="100" step="0.01" type="text" />
             <small>Combined current position margin plus the candidate trade.</small>
           </article>
 
-          <article class="setting-card advanced-setting">
+          <article class="setting-card advanced-setting config-advanced-only">
             <label for="setting-liquidation-safety-buffer">Liquidation Safety Buffer %</label>
             <input id="setting-liquidation-safety-buffer" inputmode="decimal" min="0" max="100" step="0.01" type="text" />
             <small>Minimum price distance between stop loss and liquidation boundary, measured from entry price.</small>
           </article>
 
-          <article class="setting-card advanced-setting">
+          <article class="setting-card advanced-setting config-advanced-only">
             <label>Margin Mode</label>
             <div class="segmented-control" data-setting-group="marginMode">
               <button class="segmented-option" data-setting-value="ISOLATED" type="button">Isolated</button>
@@ -508,12 +532,12 @@
             <small>Isolated is supported for automated execution. Cross is unsupported because liquidation safety cannot be guaranteed.</small>
           </article>
 
-          <article class="setting-card basic-setting">
+          <article class="setting-card basic-setting config-advanced-only">
             <label for="setting-max-open-positions">Max Open Positions</label>
             <input id="setting-max-open-positions" inputmode="numeric" min="1" step="1" type="text" />
           </article>
 
-          <article class="setting-card basic-setting">
+          <article class="setting-card basic-setting config-advanced-only">
             <label for="setting-max-position-per-symbol">Max Position Per Symbol</label>
             <input id="setting-max-position-per-symbol" inputmode="numeric" min="1" step="1" type="text" value="1" readonly />
             <small>Only one active position per symbol is currently supported.</small>
@@ -521,7 +545,7 @@
           </div>
         </section>
 
-        <section class="settings-group settings-advanced">
+        <section class="settings-group settings-advanced config-advanced-only">
           <h2>Strategy</h2>
           <div class="settings-grid">
           <article class="setting-card">
@@ -559,7 +583,7 @@
           </div>
         </section>
 
-        <section class="settings-group settings-advanced">
+        <section class="settings-group settings-advanced config-advanced-only">
           <h2>Entry / Take Profit</h2>
           <div class="settings-grid">
           <article class="setting-card">
@@ -584,7 +608,7 @@
           </div>
         </section>
 
-        <section class="settings-group settings-advanced">
+        <section class="settings-group settings-advanced config-advanced-only">
           <h2>Stop Loss</h2>
           <div class="settings-grid">
           <article class="setting-card">
@@ -624,7 +648,7 @@
           </div>
         </section>
 
-        <section class="settings-group settings-basic">
+        <section class="settings-group settings-basic config-advanced-only">
           <h2>Daily Protection</h2>
           <div class="settings-grid">
           <article class="setting-card">
@@ -639,7 +663,7 @@
           </div>
         </section>
 
-        <section class="settings-group settings-basic">
+        <section class="settings-group settings-basic config-advanced-only">
           <h2>Account Protection</h2>
           <div class="settings-grid">
           <article class="setting-card">

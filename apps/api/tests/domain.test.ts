@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { Candle } from "../src/domain/market-data/Candle.js";
 import type { RiskInput } from "../src/domain/risk/RiskDecision.js";
 import type { Direction } from "../src/domain/trade/Direction.js";
-import { defaultTradingSettings, validateTradingSettings } from "../src/application/config/AppConfig.js";
+import { defaultTradingSettings, newAccountTradingSettings, validateTradingSettings } from "../src/application/config/AppConfig.js";
+import { getTradingPreset, resolveSettingsInput, tradingPresets } from "../src/application/config/TradingPresets.js";
 import type { ExecutionIntent } from "../src/application/execution/ExecutionIntent.js";
 import { updateAccountProtectionState } from "../src/application/risk/AccountProtectionService.js";
 import { calculateDailyRiskStatus } from "../src/application/risk/DailyRiskService.js";
@@ -968,6 +969,126 @@ describe("trading settings", () => {
     expect(validateTradingSettings({ ...defaultTradingSettings }).maxTotalMarginUsagePercent).toBe(60);
     expect(() => validateTradingSettings({ ...defaultTradingSettings, maxTotalMarginUsagePercent: 0 })).toThrow();
     expect(() => validateTradingSettings({ ...defaultTradingSettings, maxTotalMarginUsagePercent: 101 })).toThrow();
+  });
+
+  it("keeps legacy settings without a settings mode in advanced mode", () => {
+    const { settingsMode: _mode, riskLevel: _level, ...legacy } = defaultTradingSettings;
+    const settings = validateTradingSettings({ ...legacy, maxLeverage: 33, minimumRiskReward: 4 });
+
+    expect(settings.settingsMode).toBe("advanced");
+    expect(settings.maxLeverage).toBe(33);
+    expect(settings.minimumRiskReward).toBe(4);
+  });
+
+  it("defines the five risk level presets", () => {
+    const table = tradingPresets.map(({ level, values }) => [
+      level,
+      values.minimumRiskReward,
+      values.maxLeverage,
+      values.maxMarginUsagePercent,
+      values.maxTotalMarginUsagePercent,
+      values.maxOpenPositions,
+      values.dailyLossLimitR,
+      values.dailyProfitLimitR,
+      values.maxDrawdownPercent,
+      values.requireDisplacement,
+      values.stopLossBufferTicks,
+      values.liquidationSafetyBufferPercent,
+      values.entryMode
+    ]);
+    expect(table).toEqual([
+      [1, 3, 5, 10, 30, 1, 1, 3, 5, true, 10, 1, "limit"],
+      [2, 2.5, 10, 15, 40, 1, 2, 5, 8, true, 8, 0.75, "limit"],
+      [3, 2, 20, 20, 60, 2, 3, 8, 10, false, 5, 0.5, "market"],
+      [4, 1.5, 50, 30, 70, 3, 4, 10, 15, false, 3, 0.4, "market"],
+      [5, 1.2, 75, 40, 80, 5, 5, 15, 20, false, 2, 0.3, "market"]
+    ]);
+    for (const { values } of tradingPresets) {
+      expect(values).toMatchObject({
+        marginMode: "ISOLATED",
+        positionSizingMode: "risk-based",
+        maxPositionPerSymbol: 1,
+        stopLossBufferMode: "ticks",
+        emaPeriod: 50,
+        swingLeft: 2,
+        swingRight: 2
+      });
+    }
+  });
+
+  it("derives every preset field from the risk level in simple mode", () => {
+    for (const preset of tradingPresets) {
+      const settings = validateTradingSettings({ ...defaultTradingSettings, settingsMode: "simple", riskLevel: preset.level });
+      expect(settings).toMatchObject(preset.values);
+    }
+    const level1 = validateTradingSettings({ ...defaultTradingSettings, settingsMode: "simple", riskLevel: 1 });
+    expect(level1).toMatchObject({ minimumRiskReward: 3, maxLeverage: 5, maxOpenPositions: 1, requireDisplacement: true, entryMode: "limit" });
+    const level5 = validateTradingSettings({ ...defaultTradingSettings, settingsMode: "simple", riskLevel: 5 });
+    expect(level5).toMatchObject({ minimumRiskReward: 1.2, maxLeverage: 75, maxOpenPositions: 5, stopLossBufferTicks: 2, entryMode: "market" });
+  });
+
+  it("ignores preset fields sent with simple settings", () => {
+    const settings = validateTradingSettings({
+      ...defaultTradingSettings,
+      settingsMode: "simple",
+      riskLevel: 2,
+      maxLeverage: 125,
+      minimumRiskReward: 0.5,
+      marginMode: "CROSS",
+      entryMode: "market",
+      riskPerTradeUsdt: 15
+    });
+
+    expect(settings).toMatchObject({ ...getTradingPreset(2).values, riskPerTradeUsdt: 15 });
+  });
+
+  it("rejects invalid risk levels and settings modes", () => {
+    for (const riskLevel of [0, 6, 2.5, "abc", null]) {
+      expect(() => validateTradingSettings({ ...defaultTradingSettings, settingsMode: "simple", riskLevel })).toThrow();
+    }
+    expect(() => validateTradingSettings({ ...defaultTradingSettings, settingsMode: "expert" })).toThrow();
+  });
+
+  it("starts brand-new account settings in simple mode at level 3", () => {
+    const settings = newAccountTradingSettings(defaultTradingSettings);
+
+    expect(settings.settingsMode).toBe("simple");
+    expect(settings.riskLevel).toBe(3);
+    expect(settings).toMatchObject(getTradingPreset(3).values);
+  });
+
+  it("keeps only user-specific fields from a simple settings request", () => {
+    const current = validateTradingSettings({ ...defaultTradingSettings, realExecutionMode: "DRY_RUN", symbol: "ETHUSDT" });
+    const resolved = validateTradingSettings(
+      resolveSettingsInput(
+        {
+          settingsMode: "simple",
+          riskLevel: 4,
+          watchlist: ["solusdt"],
+          riskPerTradeUsdt: 7,
+          tradingEnabled: true,
+          killSwitch: true,
+          realExecutionMode: "APPROVAL_REQUIRED",
+          maxLeverage: 125,
+          displacementLookback: 99
+        },
+        current
+      )
+    );
+
+    expect(resolved).toMatchObject({
+      ...getTradingPreset(4).values,
+      settingsMode: "simple",
+      riskLevel: 4,
+      watchlist: ["SOLUSDT"],
+      riskPerTradeUsdt: 7,
+      tradingEnabled: true,
+      killSwitch: true,
+      realExecutionMode: "DRY_RUN",
+      symbol: "ETHUSDT"
+    });
+    const advancedInput = { ...defaultTradingSettings, settingsMode: "advanced", maxLeverage: 42 };
+    expect(resolveSettingsInput(advancedInput, current)).toBe(advancedInput);
   });
 });
 

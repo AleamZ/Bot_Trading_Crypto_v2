@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 import { parseKey } from "../../infrastructure/security/CredentialCipher.js";
+import { applyTradingPreset } from "./TradingPresets.js";
 
 for (const envFile of [resolve(process.cwd(), ".env"), resolve(process.cwd(), "../../.env")]) {
   if (existsSync(envFile)) {
@@ -18,6 +19,8 @@ const schema = z.object({
   corsOrigins: z.array(z.string()).default(["http://localhost:5173", "http://127.0.0.1:5173"]),
   symbol: z.string().default("BTCUSDT"),
   watchlist: z.array(z.string()).default(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]),
+  settingsMode: z.enum(["simple", "advanced"]).default("advanced"),
+  riskLevel: z.coerce.number().int().min(1).max(5).default(3),
   positionSizingMode: z.literal("risk-based").default("risk-based"),
   riskPerTradeUsdt: z.coerce.number().positive().default(20),
   maxLeverage: z.coerce.number().positive().default(125),
@@ -108,6 +111,8 @@ export type TradingSettings = Omit<
 export const defaultTradingSettings: TradingSettings = {
   symbol: "BTCUSDT",
   watchlist: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+  settingsMode: "advanced",
+  riskLevel: 3,
   positionSizingMode: "risk-based",
   riskPerTradeUsdt: 20,
   maxLeverage: 125,
@@ -188,11 +193,14 @@ export function validateTradingSettings(input: unknown): TradingSettings {
   delete source.maxDailyLossPercent;
   delete source.maxConsecutiveLosses;
   delete source.cooldownAfterTradeMinutes;
-  const parsed = tradingSettingsSchema.parse({
-    ...defaultTradingSettings,
-    ...source,
-    watchlist: normalizeWatchlist(source.watchlist ?? defaultTradingSettings.watchlist)
-  });
+  // Settings saved before modes existed have no settingsMode and stay in advanced mode.
+  const parsed = applyTradingPreset(
+    tradingSettingsSchema.parse({
+      ...defaultTradingSettings,
+      ...source,
+      watchlist: normalizeWatchlist(source.watchlist ?? defaultTradingSettings.watchlist)
+    })
+  );
   if (parsed.maxPositionPerSymbol !== 1) {
     throw new Error("Only one active position per symbol is currently supported");
   }
@@ -203,6 +211,11 @@ export function validateTradingSettings(input: unknown): TradingSettings {
     throw new Error("Watchlist cannot be empty when trading is enabled");
   }
   return parsed;
+}
+
+// Brand-new trading accounts start in simple mode at the balanced level.
+export function newAccountTradingSettings(base: TradingSettings): TradingSettings {
+  return validateTradingSettings({ ...base, settingsMode: "simple", riskLevel: 3 });
 }
 
 export function applyTradingSettings(config: AppConfig, settings: TradingSettings): AppConfig {

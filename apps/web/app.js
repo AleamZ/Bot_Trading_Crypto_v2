@@ -30,6 +30,8 @@ const activityState = {
 };
 const defaultSettings = {
   watchlist: "",
+  settingsMode: "advanced",
+  riskLevel: "3",
   positionSizingMode: "risk-based",
   riskPerTradeUsdt: "20",
   maxLeverage: "125",
@@ -66,6 +68,7 @@ const realSafetyState = {
   proposals: [],
 };
 let marketSymbols = [];
+let tradingPresets = [];
 let symbolSearchTerm = "";
 let settingsRequestSequence = 0;
 let analysisRequestSequence = 0;
@@ -936,6 +939,19 @@ document.querySelectorAll("[data-setting-group]").forEach((group) => {
     saveSettings();
   });
 });
+$("config-mode-control").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-config-mode]");
+  if (!button) return;
+  changeConfigMode(button.dataset.configMode);
+});
+$("risk-level-selector").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-risk-level]");
+  if (!button || button.dataset.riskLevel === settingsState.riskLevel) return;
+  settingsState.riskLevel = button.dataset.riskLevel;
+  applyPresetToDraft();
+  renderSettings();
+  saveSettings();
+});
 document.querySelectorAll("[data-settings-mode]").forEach((button) => {
   button.addEventListener("click", () => {
     const mode = button.dataset.settingsMode;
@@ -1236,6 +1252,8 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
     if (!symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
     if (!watchlistResponse.ok) throw new Error(`Watchlist request failed: ${watchlistResponse.status}`);
     marketSymbols = await symbolsResponse.json();
+    await loadTradingPresets();
+    if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
     Object.assign(settingsState, defaultSettings, settingsFromApi(await response.json()));
     const watchlist = await watchlistResponse.json();
     if (Array.isArray(watchlist.watchlist)) {
@@ -1280,6 +1298,7 @@ function renderSettings() {
   $("setting-displacement-lookback").value = settingsState.displacementLookback;
   updateConditionalSettingVisibility();
   renderRiskSummary();
+  renderConfigMode();
 
   document.querySelectorAll("[data-setting-group]").forEach((group) => {
     const value = settingsState[group.dataset.settingGroup];
@@ -1297,6 +1316,92 @@ function renderRiskSummary() {
   $("summary-positions").textContent = settingsState.maxOpenPositions;
   $("summary-margin-mode").textContent = settingsState.marginMode;
   $("settings-risk-summary-note").textContent = "Tighter SL creates a larger position; wider SL creates a smaller position. Approximate loss at SL remains 1R.";
+}
+
+async function loadTradingPresets() {
+  if (tradingPresets.length > 0) return;
+  try {
+    const response = await apiFetch("/api/trading-presets");
+    if (!response.ok) return;
+    const body = await response.json();
+    tradingPresets = Array.isArray(body.presets) ? body.presets : [];
+  } catch {
+    tradingPresets = [];
+  }
+}
+
+function activePreset() {
+  return tradingPresets.find((preset) => String(preset.level) === settingsState.riskLevel) ?? null;
+}
+
+// Copies the selected preset into the draft so the advanced form starts from the preset values.
+function applyPresetToDraft() {
+  const preset = activePreset();
+  if (!preset) return;
+  for (const [field, value] of Object.entries(preset.values)) {
+    settingsState[field] = String(value);
+  }
+}
+
+function changeConfigMode(mode) {
+  if (mode === settingsState.settingsMode) return;
+  if (mode === "simple") {
+    const confirmed = window.confirm("Simple mode replaces strategy and risk settings with the preset of the selected risk level. Continue?");
+    if (!confirmed) return;
+  } else {
+    applyPresetToDraft();
+  }
+  settingsState.settingsMode = mode;
+  renderSettings();
+  saveSettings();
+}
+
+function renderConfigMode() {
+  const mode = settingsState.settingsMode === "simple" ? "simple" : "advanced";
+  const view = $("settings-view");
+  view.dataset.configMode = mode;
+  if (mode === "simple" && view.dataset.settingsMode !== "basic") {
+    // Simple mode shows the basic cards (watchlist, 1R, bot control) only.
+    view.dataset.settingsMode = "basic";
+    document.querySelectorAll(".settings-mode-tab").forEach((item) => item.classList.toggle("active", item.dataset.settingsMode === "basic"));
+  }
+  $("config-mode-control").querySelectorAll("[data-config-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.configMode === mode);
+  });
+  $("config-mode-note").textContent = mode === "simple"
+    ? "Simple: choose a risk level, the bot applies a tested preset."
+    : "Advanced: every strategy and risk parameter is editable.";
+  renderRiskLevelSelector();
+}
+
+function renderRiskLevelSelector() {
+  if (tradingPresets.length === 0) {
+    $("risk-level-selector").innerHTML = `<span class="empty-selection">Presets unavailable</span>`;
+    $("risk-level-description").textContent = "";
+    return;
+  }
+  $("risk-level-selector").replaceChildren(
+    ...tradingPresets.map((preset) => {
+      const button = document.createElement("button");
+      const active = String(preset.level) === settingsState.riskLevel;
+      button.type = "button";
+      button.className = `risk-level-option${active ? " active" : ""}`;
+      button.dataset.riskLevel = String(preset.level);
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", String(active));
+      button.innerHTML = `<strong>${escapeHtml(String(preset.level))}</strong><small>${escapeHtml(preset.label)}</small>`;
+      return button;
+    })
+  );
+  const preset = activePreset();
+  const values = preset?.values;
+  $("risk-level-description").textContent = preset?.description ?? "";
+  $("preset-summary-rr").textContent = values ? `1:${values.minimumRiskReward}` : "-";
+  $("preset-summary-leverage").textContent = values ? `${values.maxLeverage}x` : "-";
+  $("preset-summary-margin").textContent = values ? `${values.maxMarginUsagePercent}%` : "-";
+  $("preset-summary-positions").textContent = values ? String(values.maxOpenPositions) : "-";
+  $("preset-summary-daily-loss").textContent = values ? `${values.dailyLossLimitR}R` : "-";
+  $("preset-summary-entry").textContent = values ? (values.entryMode === "limit" ? "Limit" : "Market") : "-";
 }
 
 function renderRealSafety() {
@@ -1489,7 +1594,7 @@ async function saveSettings() {
     $("settings-status").textContent = "Select a trading account";
     return;
   }
-  const validation = validateSettingsDraft();
+  const validation = settingsState.settingsMode === "simple" ? validateSimpleSettingsDraft() : validateSettingsDraft();
   if (!validation.ok) {
     $("settings-status").textContent = validation.message;
     validation.element?.focus();
@@ -1497,7 +1602,7 @@ async function saveSettings() {
   }
   const settingsPath = `/api/trading-accounts/${accountId}/settings`;
   $("settings-status").textContent = "Saving";
-  const payload = settingsPayload();
+  const payload = settingsState.settingsMode === "simple" ? simpleSettingsPayload() : settingsPayload();
   const response = await apiFetch(settingsPath, {
     method: "PUT",
     headers: { "content-type": "application/json" },
@@ -1515,7 +1620,7 @@ async function saveSettings() {
 }
 
 function resetSettings() {
-  Object.assign(settingsState, defaultSettings);
+  Object.assign(settingsState, defaultSettings, { settingsMode: settingsState.settingsMode });
   renderSettings();
   saveSettings();
 }
@@ -1524,6 +1629,8 @@ function settingsFromApi(settings) {
   return {
     ...settings,
     watchlist: Array.isArray(settings.watchlist) ? settings.watchlist.join(",") : String(settings.watchlist ?? defaultSettings.watchlist),
+    settingsMode: settings.settingsMode === "simple" ? "simple" : "advanced",
+    riskLevel: String(settings.riskLevel ?? defaultSettings.riskLevel),
     positionSizingMode: String(settings.positionSizingMode ?? defaultSettings.positionSizingMode),
     riskPerTradeUsdt: String(settings.riskPerTradeUsdt ?? defaultSettings.riskPerTradeUsdt),
     maxLeverage: String(settings.maxLeverage ?? defaultSettings.maxLeverage),
@@ -1558,6 +1665,8 @@ function settingsFromApi(settings) {
 function settingsPayload() {
   const watchlist = getSelectedWatchlist();
   return {
+    settingsMode: "advanced",
+    riskLevel: settingNumber("riskLevel"),
     watchlist,
     symbol: watchlist[0] ?? "BTCUSDT",
     positionSizingMode: settingsState.positionSizingMode,
@@ -1588,6 +1697,18 @@ function settingsPayload() {
     requireDisplacement: settingsState.requireDisplacement === "true",
     displacementBodyMultiplier: settingNumber("displacementBodyMultiplier"),
     displacementLookback: settingNumber("displacementLookback"),
+  };
+}
+
+// Simple mode only sends the user-specific fields; the server derives every preset field from riskLevel.
+function simpleSettingsPayload() {
+  return {
+    settingsMode: "simple",
+    riskLevel: settingNumber("riskLevel"),
+    watchlist: getSelectedWatchlist(),
+    riskPerTradeUsdt: settingNumber("riskPerTradeUsdt"),
+    tradingEnabled: settingsState.tradingEnabled === "true",
+    killSwitch: settingsState.killSwitch === "true",
   };
 }
 
@@ -1681,6 +1802,26 @@ function validateSettingsDraft() {
       element.classList.add("invalid");
       return { ok: false, message: validationMessage(rule), element };
     }
+  }
+  if (settingsState.tradingEnabled === "true" && getSelectedWatchlist().length === 0) {
+    return { ok: false, message: "Watchlist cannot be empty when trading is enabled", element: $("setting-symbol-search") };
+  }
+  return { ok: true, message: "", element: null };
+}
+
+function validateSimpleSettingsDraft() {
+  clearSettingValidation();
+  const rule = numericSettingRules.riskPerTradeUsdt;
+  const element = $(rule.id);
+  const rawValue = String(settingsState.riskPerTradeUsdt ?? "").trim();
+  const value = parseSettingNumber(rawValue);
+  if (rawValue === "") {
+    element.classList.add("invalid");
+    return { ok: false, message: `${rule.label} is required`, element };
+  }
+  if (!Number.isFinite(value) || value <= rule.min) {
+    element.classList.add("invalid");
+    return { ok: false, message: validationMessage(rule), element };
   }
   if (settingsState.tradingEnabled === "true" && getSelectedWatchlist().length === 0) {
     return { ok: false, message: "Watchlist cannot be empty when trading is enabled", element: $("setting-symbol-search") };

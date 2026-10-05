@@ -13,6 +13,7 @@ import type { TradingRepository } from "../../application/ports/Repositories.js"
 import type { DecisionLogger } from "../../application/ports/Logger.js";
 import type { AppConfig, TradingSettings } from "../../application/config/AppConfig.js";
 import { applyTradingSettings, validateTradingSettings } from "../../application/config/AppConfig.js";
+import { resolveSettingsInput, simpleModeUserFields, tradingPresets } from "../../application/config/TradingPresets.js";
 import {
   BinanceFuturesAccountClient,
   type BinanceFuturesOpenOrderStatus,
@@ -133,6 +134,11 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
         return;
       }
 
+      if (requestUrl.pathname === "/api/trading-presets" && request.method === "GET") {
+        sendJson(response, 200, { presets: tradingPresets, simpleModeUserFields }, requestCorsHeaders);
+        return;
+      }
+
       if (requestUrl.pathname.startsWith("/api/trading-accounts")) {
         if (!params.tradingAccounts) {
           sendJson(response, 503, { error: "Trading account service is unavailable" }, requestCorsHeaders);
@@ -240,7 +246,7 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
         }
 
         if (request.method === "PUT") {
-          const settings = validateTradingSettings(await readJsonBody(request));
+          const settings = validateTradingSettings(resolveSettingsInput(await readJsonBody(request), toTradingSettings(runtimeConfig)));
           await assertValidWatchlistSymbols(settings.watchlist, marketData);
           await params.repository.saveTradingSettings(settings);
           runtimeConfig = applyTradingSettings(runtimeConfig, settings);
@@ -592,7 +598,7 @@ async function handleTradingAccountRoute(params: {
   }
 
   if (child === "settings" && parts.length === 4 && request.method === "PUT") {
-    const settings = await service.saveSettings(userId, accountId, await readJsonBody(request));
+    const settings = await service.saveSettingsFromRequest(userId, accountId, await readJsonBody(request));
     await runtimeManager?.refreshRuntime(accountId);
     sendJson(response, 200, settings, corsHeaders);
     return;

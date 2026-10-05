@@ -1,0 +1,27 @@
+{
+  "name": "@smc-futures-bot/ai-dev-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone AI Dev Agent: watches bot logs, diagnoses behaviour with a local LLM and opens review-only PRs into dat-dev.",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "once": "tsx src/main.ts --once",
+    "digest": "tsx src/main.ts --digest-only",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

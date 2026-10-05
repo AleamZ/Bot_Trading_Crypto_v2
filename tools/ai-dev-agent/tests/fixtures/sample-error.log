@@ -1,0 +1,4 @@
+2026-10-05T11:02:00: TypeError: Cannot read properties of undefined (reading 'price')
+2026-10-05T11:02:00:     at TradingEngine.onCandle (file:///app/apps/api/dist/src/application/engine/TradingEngine.js:612:31)
+2026-10-05T11:05:00: {"timestamp":"2026-10-05T11:05:00.000Z","level":"error","component":"api","message":"Unhandled promise rejection","error":"ECONNRESET 10.0.0.12:443"}
+2026-10-05T11:06:00: {"timestamp":"2026-10-05T11:06:00.000Z","level":"error","component":"api","message":"Unhandled promise rejection","error":"ECONNRESET 10.0.0.13:443"}

@@ -8,3 +8,9 @@ apps/web/config.local.js
 npm-debug.log*
 *.log
 logs/
+
+# AI Dev Agent (tools/ai-dev-agent) runtime state, reports and local config
+tools/ai-dev-agent/state/
+tools/ai-dev-agent/reports/
+tools/ai-dev-agent/.env
+!tools/ai-dev-agent/tests/fixtures/*.log

@@ -7,10 +7,12 @@ const LAST_MAIN_VIEW_STORAGE_KEY = "smc-futures-bot:last-main-view";
 const THEME_STORAGE_KEY = "smc-futures-bot:theme";
 const MAIN_VIEWS = new Set(["home", "chart", "analysis", "settings"]);
 const DEFAULT_SYMBOL = "BTCUSDT";
+const CHART_LIBRARY_URL = "https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js";
 const chartState = {
   instance: null,
   timer: null,
   module: null,
+  library: null,
 };
 const authState = {
   user: null,
@@ -72,6 +74,8 @@ const realSafetyState = {
   proposals: [],
 };
 let marketSymbols = [];
+// Account whose symbol list is in marketSymbols, so reopening Settings skips the large symbols request.
+let marketSymbolsAccountId = null;
 let tradingPresets = [];
 let symbolSearchTerm = "";
 let settingsRequestSequence = 0;
@@ -149,6 +153,12 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (ev
 document.querySelectorAll(".positions-table").forEach((table) => {
   labelTableCells(table);
   new MutationObserver(() => labelTableCells(table)).observe(table, { childList: true, subtree: true });
+});
+// Polls skip while the tab is hidden; refresh at once when it comes back.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (activeView === "home" && authState.dashboardTimer) pollHomeOnce();
+  if (activeView === "chart" && chartState.timer) pollChartOnce();
 });
 
 applyTheme(document.documentElement.dataset.theme === "dark" ? "dark" : "light");
@@ -275,6 +285,7 @@ function showLoggedIn(user) {
 }
 
 function showLoggedOut() {
+  $("boot-loader").hidden = true;
   authState.user = null;
   stopHomePolling();
   stopChartPolling();
@@ -337,12 +348,14 @@ async function initializeTradingAccounts() {
       return;
     }
 
-    await setActiveTradingAccount(accountState.accounts[0]);
+    setActiveTradingAccount(accountState.accounts[0]);
     restoreWorkspaceInputs(accountState.accounts[0].id);
     showView(getStoredMainView());
     document.querySelector(".nav-tabs").hidden = false;
     $("account-selector").hidden = false;
     $("user-menu").hidden = false;
+    // Warm the chart library once the first view is up, so opening Chart later is instant.
+    whenIdle(() => loadChartLibrary().catch(() => {}));
   } catch (error) {
     setStatus("login-message", error instanceof Error ? error.message : String(error));
     showLoggedOut();
@@ -367,14 +380,16 @@ function renderAccountSelector() {
       button.innerHTML = `<strong>${escapeHtml(item.name)}</strong><span>${item.mode}</span>`;
       button.addEventListener("click", async () => {
         $("account-selector-popover").hidden = true;
-        await setActiveTradingAccount(item);
+        setActiveTradingAccount(item);
       });
       return button;
     }),
   );
 }
 
-async function setActiveTradingAccount(account) {
+// Only the visible view fetches: Home gets everything from the snapshot, and Settings,
+// Manage Account and Connect load their own data when opened.
+function setActiveTradingAccount(account) {
   accountState.activeAccount = account;
   chartState.instance?.cancelPendingLoad();
   // The home cards still show the previous account until its first snapshot arrives.
@@ -385,11 +400,11 @@ async function setActiveTradingAccount(account) {
   renderAccountSelector();
   renderSettings();
   restoreWorkspaceInputs(account.id);
-  await Promise.all([loadActiveAccountStatus(), loadSettings(account.id)]);
   dashboardRequestSequence += 1;
-  if ($("chart-view").classList.contains("active")) loadChart();
-  if ($("analysis-view").classList.contains("active")) loadAnalysis();
-  if ($("home-view").classList.contains("active")) load();
+  if (activeView === "chart") loadChart();
+  if (activeView === "analysis") loadAnalysis();
+  if (activeView === "settings") loadSettings(account.id);
+  if (activeView === "home") pollHomeOnce();
 }
 
 function startCreateAccount(mode) {
@@ -593,7 +608,7 @@ async function handleDeletedAccount(deletedAccountId) {
     return;
   }
   $("account-selector").hidden = false;
-  await setActiveTradingAccount(accountState.accounts[0]);
+  setActiveTradingAccount(accountState.accounts[0]);
   showView("home");
 }
 
@@ -841,6 +856,7 @@ function stopChartPolling() {
 }
 
 function pollHomeOnce() {
+  if (document.hidden) return;
   const accountId = accountState.activeAccount?.id;
   const stillCurrent = () => activeView === "home" && accountId === accountState.activeAccount?.id;
   load().catch((error) => {
@@ -1019,6 +1035,7 @@ function emptyTableRow(message, colSpan, tone = "") {
 }
 
 function pollChartOnce() {
+  if (document.hidden) return;
   loadChart().catch((error) => {
     if (activeView === "chart") setStatus("chart-status", userFacingApiError(error));
   });
@@ -1244,6 +1261,7 @@ document.querySelectorAll("[data-settings-mode]").forEach((button) => {
   });
 });
 function showView(view) {
+  $("boot-loader").hidden = true;
   activeView = view;
   if (MAIN_VIEWS.has(view)) localStorage.setItem(LAST_MAIN_VIEW_STORAGE_KEY, view);
   $("home-view").classList.toggle("active", view === "home");
@@ -1319,11 +1337,36 @@ function rememberAnalysisSymbol(symbol) {
   rememberWorkspaceSymbol(symbol);
 }
 
+// lightweight-charts is only needed on the Chart tab, so it loads on demand instead of blocking first paint.
+function loadChartLibrary() {
+  if (window.LightweightCharts) return Promise.resolve();
+  chartState.library ??= new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = CHART_LIBRARY_URL;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => {
+      // Forget the failed attempt so the next Chart visit retries.
+      chartState.library = null;
+      script.remove();
+      reject(new Error("Could not load the chart library"));
+    };
+    document.head.append(script);
+  });
+  return chartState.library;
+}
+
+function whenIdle(callback) {
+  if ("requestIdleCallback" in window) window.requestIdleCallback(callback, { timeout: 5000 });
+  else setTimeout(callback, 2000);
+}
+
 async function ensureChart() {
   if (chartState.instance) return;
   // Same ?v= as index.html so a cached chart module never pairs with a newer app.js.
-  chartState.module ??= import("./chart/Chart.js?v=20261026");
-  const { TradingChart } = await chartState.module;
+  chartState.module ??= import("./chart/Chart.js?v=20261026-2");
+  const [{ TradingChart }] = await Promise.all([chartState.module, loadChartLibrary()]);
+  if (chartState.instance) return;
 
   chartState.instance = new TradingChart({
     container: $("price-chart"),
@@ -1527,19 +1570,23 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
   const watchlistPath = `/api/trading-accounts/${accountId}/watchlist`;
   const symbolsPath = `/api/market/symbols?accountId=${encodeURIComponent(accountId)}`;
   setStatus("settings-status", "Loading");
+  const needsSymbols = marketSymbolsAccountId !== accountId || marketSymbols.length === 0;
   try {
     const [response, symbolsResponse, watchlistResponse] = await Promise.all([
       apiFetch(settingsPath),
-      apiFetch(symbolsPath),
+      needsSymbols ? apiFetch(symbolsPath) : null,
       apiFetch(watchlistPath),
+      loadTradingPresets(),
     ]);
     if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
-    if (handleUnauthorized(response) || handleUnauthorized(symbolsResponse) || handleUnauthorized(watchlistResponse)) return;
+    if (handleUnauthorized(response) || (symbolsResponse && handleUnauthorized(symbolsResponse)) || handleUnauthorized(watchlistResponse)) return;
     if (!response.ok) throw new Error(`Settings request failed: ${response.status}`);
-    if (!symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
+    if (symbolsResponse && !symbolsResponse.ok) throw new Error(`Symbols request failed: ${symbolsResponse.status}`);
     if (!watchlistResponse.ok) throw new Error(`Watchlist request failed: ${watchlistResponse.status}`);
-    marketSymbols = await symbolsResponse.json();
-    await loadTradingPresets();
+    if (symbolsResponse) {
+      marketSymbols = await symbolsResponse.json();
+      marketSymbolsAccountId = accountId;
+    }
     if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
     Object.assign(settingsState, defaultSettings, settingsFromApi(await response.json()));
     const watchlist = await watchlistResponse.json();
@@ -1556,6 +1603,7 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
     if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
     Object.assign(settingsState, defaultSettings);
     marketSymbols = [];
+    marketSymbolsAccountId = null;
     setStatus("settings-status", "Load failed");
   }
   renderSettings();

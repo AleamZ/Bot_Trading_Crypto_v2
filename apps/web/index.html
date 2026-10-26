@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SMC Futures Bot</title>
     <!-- Cloudflare caches .css/.js for 4h: bump ?v= here and in app.js whenever styles.css, app.js or chart/ change. -->
-    <link rel="stylesheet" href="/styles.css?v=20261026" />
+    <link rel="stylesheet" href="/styles.css?v=20261026-2" />
+    <link rel="modulepreload" href="./apiClient.js" />
     <script>
       // Pick the theme before first paint so dark mode does not flash light.
       (function () {
@@ -52,6 +53,11 @@
     </header>
 
     <main class="shell">
+      <div class="boot-loader" id="boot-loader" role="status">
+        <span class="spinner" aria-hidden="true"></span>
+        <span>Loading…</span>
+      </div>
+
       <section class="auth-view" id="auth-view" hidden>
         <form class="auth-panel" id="login-form">
           <h1>Login</h1>
@@ -878,8 +884,7 @@
         <ol class="decision-log-list" id="all-events"></ol>
       </section>
     </div>
-    <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="./app-config.js"></script>
-    <script type="module" src="./app.js?v=20261026"></script>
+    <script type="module" src="./app.js?v=20261026-2"></script>
   </body>
 </html>

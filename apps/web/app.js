@@ -1321,7 +1321,8 @@ function rememberAnalysisSymbol(symbol) {
 
 async function ensureChart() {
   if (chartState.instance) return;
-  chartState.module ??= import("./chart/Chart.js");
+  // Same ?v= as index.html so a cached chart module never pairs with a newer app.js.
+  chartState.module ??= import("./chart/Chart.js?v=20261026");
   const { TradingChart } = await chartState.module;
 
   chartState.instance = new TradingChart({

@@ -61,24 +61,25 @@ export class TradingChart {
   }
 
   createChart() {
+    const theme = chartTheme();
     this.chart = LightweightCharts.createChart(this.container, {
       height: 560,
       autoSize: true,
       layout: {
         background: { color: "transparent" },
-        textColor: "#17202a",
+        textColor: theme.text,
       },
       grid: {
-        vertLines: { color: "#edf1f6" },
-        horzLines: { color: "#edf1f6" },
+        vertLines: { color: theme.grid },
+        horzLines: { color: theme.grid },
       },
       rightPriceScale: {
-        borderColor: "#d7dee8",
+        borderColor: theme.border,
         autoScale: true,
         scaleMargins: { top: 0.08, bottom: 0.18 },
       },
       timeScale: {
-        borderColor: "#d7dee8",
+        borderColor: theme.border,
         timeVisible: true,
         secondsVisible: false,
         rightOffset: 12,
@@ -223,6 +224,17 @@ export class TradingChart {
   resize() {
     this.chart.applyOptions({ width: this.container.clientWidth });
     this.refreshDomOverlays();
+  }
+
+  // Called by app.js when the page switches between light and dark mode.
+  applyTheme() {
+    const theme = chartTheme();
+    this.chart.applyOptions({
+      layout: { textColor: theme.text },
+      grid: { vertLines: { color: theme.grid }, horzLines: { color: theme.grid } },
+      rightPriceScale: { borderColor: theme.border },
+      timeScale: { borderColor: theme.border },
+    });
   }
 
   refreshDomOverlays() {
@@ -439,6 +451,17 @@ export class TradingChart {
     row.append(cell);
     this.positionsBody.replaceChildren(row);
   }
+}
+
+// Canvas colours come from the page's CSS theme tokens (styles.css :root / [data-theme="dark"]).
+function chartTheme() {
+  const styles = getComputedStyle(document.documentElement);
+  const token = (name, fallback) => styles.getPropertyValue(name).trim() || fallback;
+  return {
+    text: token("--chart-text", "#17202a"),
+    grid: token("--chart-grid", "#edf1f6"),
+    border: token("--line", "#d7dee8"),
+  };
 }
 
 function formatUtc7Time(time) {

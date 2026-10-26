@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 const HOME_POLL_INTERVAL_MS = 10_000;
 const CHART_POLL_INTERVAL_MS = 10_000;
 const LAST_MAIN_VIEW_STORAGE_KEY = "smc-futures-bot:last-main-view";
+const THEME_STORAGE_KEY = "smc-futures-bot:theme";
 const MAIN_VIEWS = new Set(["home", "chart", "analysis", "settings"]);
 const DEFAULT_SYMBOL = "BTCUSDT";
 const chartState = {
@@ -134,10 +135,58 @@ $("register-form").addEventListener("submit", (event) => {
 window.addEventListener("resize", () => resizeChart());
 window.addEventListener("auth:unauthorized", () => {
   showLoggedOut();
-  $("login-message").textContent = "Please login to continue";
+  setStatus("login-message", "Please login to continue");
+});
+$("theme-toggle").addEventListener("click", () => {
+  const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  localStorage.setItem(THEME_STORAGE_KEY, theme);
+  applyTheme(theme);
+});
+// Without a saved choice the page keeps following the OS setting.
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (event) => {
+  if (!localStorage.getItem(THEME_STORAGE_KEY)) applyTheme(event.matches ? "dark" : "light");
+});
+document.querySelectorAll(".positions-table").forEach((table) => {
+  labelTableCells(table);
+  new MutationObserver(() => labelTableCells(table)).observe(table, { childList: true, subtree: true });
 });
 
+applyTheme(document.documentElement.dataset.theme === "dark" ? "dark" : "light");
 boot();
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const label = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  $("theme-toggle").setAttribute("aria-label", label);
+  $("theme-toggle").title = label;
+  chartState.instance?.applyTheme();
+}
+
+// Copies each column header onto its cells so narrow screens can show rows as labelled cards.
+function labelTableCells(table) {
+  const labels = [...table.querySelectorAll("thead th")].map((cell) => cell.textContent.trim());
+  table.querySelectorAll("tbody tr").forEach((row) => {
+    [...row.cells].forEach((cell, index) => {
+      const label = labels[index] ?? "";
+      if (cell.dataset.label !== label) cell.dataset.label = label;
+    });
+  });
+}
+
+// Colours a status line from its wording, so callers keep passing plain text.
+function statusTone(text) {
+  const value = String(text ?? "");
+  if (/fail|error|required|must|cannot|invalid|not match|unavailable|offline|please login/i.test(value)) return "error";
+  if (/\b(loading|creating|testing|saving|deleting|analyzing|recovering)\b|unsaved/i.test(value)) return "pending";
+  if (/^(saved|loaded)$|\b(saved|updated)$/i.test(value)) return "ok";
+  return "";
+}
+
+function setStatus(id, text, tone = statusTone(text)) {
+  const element = $(id);
+  element.textContent = text;
+  element.dataset.tone = tone;
+}
 
 async function boot() {
   try {
@@ -167,7 +216,7 @@ async function login() {
 async function register() {
   const password = $("register-password").value;
   if (password !== $("register-confirm-password").value) {
-    $("register-message").textContent = "Passwords do not match";
+    setStatus("register-message", "Passwords do not match");
     return;
   }
 
@@ -183,9 +232,9 @@ async function register() {
 
 async function submitAuth({ form, path, payload }) {
   const submit = $(`${form}-submit`);
-  const message = $(`${form}-message`);
+  const messageId = `${form}-message`;
   submit.disabled = true;
-  message.textContent = "Loading";
+  setStatus(messageId, "Loading");
 
   try {
     const response = await apiFetch(path, {
@@ -195,10 +244,10 @@ async function submitAuth({ form, path, payload }) {
     });
     const body = await safeJson(response);
     if (!response.ok) throw new Error(body.error ?? `Authentication failed: ${response.status}`);
-    message.textContent = "";
+    setStatus(messageId, "");
     showLoggedIn(body.user);
   } catch (error) {
-    message.textContent = error instanceof Error ? error.message : String(error);
+    setStatus(messageId, error instanceof Error ? error.message : String(error));
   } finally {
     submit.disabled = false;
   }
@@ -253,8 +302,8 @@ function showLoggedOut() {
 function showAuthForm(form) {
   $("login-form").hidden = form !== "login";
   $("register-form").hidden = form !== "register";
-  $("login-message").textContent = "";
-  $("register-message").textContent = "";
+  setStatus("login-message", "");
+  setStatus("register-message", "");
 }
 
 function renderAccount(user) {
@@ -274,7 +323,7 @@ async function safeJson(response) {
 function handleUnauthorized(response) {
   if (response.status !== 401) return false;
   showLoggedOut();
-  $("login-message").textContent = "Please login to continue";
+  setStatus("login-message", "Please login to continue");
   return true;
 }
 
@@ -295,7 +344,7 @@ async function initializeTradingAccounts() {
     $("account-selector").hidden = false;
     $("user-menu").hidden = false;
   } catch (error) {
-    $("login-message").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("login-message", error instanceof Error ? error.message : String(error));
     showLoggedOut();
   }
 }
@@ -328,6 +377,9 @@ function renderAccountSelector() {
 async function setActiveTradingAccount(account) {
   accountState.activeAccount = account;
   chartState.instance?.cancelPendingLoad();
+  // The home cards still show the previous account until its first snapshot arrives.
+  $("home-view").dataset.loading = "true";
+  setHomeAlert(null);
   Object.assign(settingsState, defaultSettings);
   Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
   renderAccountSelector();
@@ -345,14 +397,14 @@ function startCreateAccount(mode) {
   $("account-create-title").textContent = accountState.pendingMode === "REAL" ? "Create Real Account" : "Create Demo Account";
   $("account-create-environment").textContent = accountEnvironmentLabel(accountState.pendingMode);
   $("account-create-name").value = accountState.pendingMode === "REAL" ? "My Binance" : "My Testnet";
-  $("account-create-message").textContent = "";
+  setStatus("account-create-message", "");
   showView("account-create");
 }
 
 async function createTradingAccount() {
   const mode = accountState.pendingMode ?? "DEMO";
   $("account-create-submit").disabled = true;
-  $("account-create-message").textContent = "Creating";
+  setStatus("account-create-message", "Creating");
   try {
     const response = await apiFetch("/api/trading-accounts", {
       method: "POST",
@@ -368,7 +420,7 @@ async function createTradingAccount() {
     renderAccountSelector();
     openConnectView();
   } catch (error) {
-    $("account-create-message").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("account-create-message", error instanceof Error ? error.message : String(error));
   } finally {
     $("account-create-submit").disabled = false;
   }
@@ -384,7 +436,7 @@ function openConnectView() {
   $("connect-api-secret").value = "";
   $("connect-save-button").disabled = true;
   $("connect-status").textContent = "Connection Status: Not connected";
-  $("connect-message").textContent = "";
+  setStatus("connect-message", "");
   accountState.testedCredentials = null;
   showView("connect");
 }
@@ -394,7 +446,7 @@ async function testBinanceConnection() {
   if (!account) return;
   const credentials = { apiKey: $("connect-api-key").value, apiSecret: $("connect-api-secret").value };
   $("connect-test-button").disabled = true;
-  $("connect-message").textContent = "Testing connection";
+  setStatus("connect-message", "Testing connection");
   try {
     const response = await apiFetch(`/api/trading-accounts/${account.id}/binance-connection/test`, {
       method: "POST",
@@ -409,11 +461,11 @@ async function testBinanceConnection() {
     $("connect-api-secret").value = "";
     $("connect-save-button").disabled = false;
     $("connect-status").textContent = `✓ ${accountEnvironmentLabel(account.mode)} connected · ${body.connection.apiKeyMasked} · Wallet ${formatUsdt(body.account.walletBalance)}`;
-    $("connect-message").textContent = "";
+    setStatus("connect-message", "");
   } catch (error) {
     accountState.testedCredentials = null;
     $("connect-save-button").disabled = true;
-    $("connect-message").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("connect-message", error instanceof Error ? error.message : String(error));
   } finally {
     $("connect-test-button").disabled = false;
   }
@@ -423,7 +475,7 @@ async function saveBinanceConnection() {
   const account = accountState.activeAccount;
   if (!account || !accountState.testedCredentials) return;
   $("connect-save-button").disabled = true;
-  $("connect-message").textContent = "Saving connection";
+  setStatus("connect-message", "Saving connection");
   try {
     const response = await apiFetch(`/api/trading-accounts/${account.id}/binance-connection`, {
       method: "PUT",
@@ -440,7 +492,7 @@ async function saveBinanceConnection() {
     renderAccountSelector();
     showView("home");
   } catch (error) {
-    $("connect-message").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("connect-message", error instanceof Error ? error.message : String(error));
     $("connect-save-button").disabled = false;
   }
 }
@@ -485,7 +537,7 @@ function openDeleteAccountModal() {
   $("delete-account-real-warning").hidden = account.mode !== "REAL";
   $("delete-account-confirm-label").textContent = `Type "${account.name}" to confirm`;
   $("delete-account-confirm-input").value = "";
-  $("delete-account-confirm-message").textContent = "";
+  setStatus("delete-account-confirm-message", "");
   $("confirm-delete-account-button").disabled = true;
   $("delete-account-modal").hidden = false;
   $("delete-account-confirm-input").focus();
@@ -506,7 +558,7 @@ async function deleteActiveAccount() {
   if (!account || $("delete-account-confirm-input").value !== account.name) return;
   $("confirm-delete-account-button").disabled = true;
   $("cancel-delete-account-button").disabled = true;
-  $("delete-account-confirm-message").textContent = "Deleting account";
+  setStatus("delete-account-confirm-message", "Deleting account");
   stopHomePolling();
   stopChartPolling();
   settingsRequestSequence += 1;
@@ -520,7 +572,7 @@ async function deleteActiveAccount() {
     closeDeleteAccountModal();
     await handleDeletedAccount(account.id);
   } catch (error) {
-    $("delete-account-confirm-message").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("delete-account-confirm-message", error instanceof Error ? error.message : String(error));
     $("confirm-delete-account-button").disabled = $("delete-account-confirm-input").value !== account.name;
   } finally {
     $("cancel-delete-account-button").disabled = false;
@@ -562,9 +614,11 @@ async function load() {
   const snapshotResponse = await apiFetch(`/api/trading-accounts/${accountId}/snapshot`);
   if (sequence !== dashboardRequestSequence || accountId !== accountState.activeAccount?.id || activeView !== "home") return;
   if (handleUnauthorized(snapshotResponse)) return;
-  if (!snapshotResponse.ok) throw new Error(`Snapshot request failed: ${snapshotResponse.status}`);
+  if (!snapshotResponse.ok) throw await responseError(snapshotResponse, "Snapshot request");
   const snapshot = await snapshotResponse.json();
   if (sequence !== dashboardRequestSequence || accountId !== accountState.activeAccount?.id || activeView !== "home") return;
+  delete $("home-view").dataset.loading;
+  setHomeAlert(null);
   const engine = snapshot.engine ?? {};
   const runtime = snapshot.runtime ?? {};
   const store = snapshot.store ?? {};
@@ -606,22 +660,30 @@ async function load() {
   const executionLabel = execution.enabled ? "ENABLED" : "DISABLED";
   const executionReason = execution.reason ? ` · ${execution.reason}` : "";
   const realReadiness = snapshot.realReadiness ?? null;
-  const readinessText = realReadiness
-    ? ` · Mode ${realReadiness.realExecutionMode} · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"} · Master Live Execution ${realReadiness.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER"} · Execution LOCKED · ${realReadiness.executionReason}`
-    : "";
-  const reconciliationError = runtimeHealth.lastReconciliationError ? ` · Error ${runtimeHealth.lastReconciliationError}` : "";
-  const protectionStatus = runtimeHealth.protectionStatus && runtimeHealth.protectionStatus !== "OK"
-    ? ` · Protection ${runtimeHealth.protectionStatus} · Repair attempts ${runtimeHealth.protectionRepairAttempts ?? 0}${runtimeHealth.protectionLastError ? ` · ${runtimeHealth.protectionLastError}` : ""}`
-    : " · Protection PROTECTED/VERIFIED";
-  $("engine-detail").textContent =
-    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"} · Execution ${executionLabel}${executionReason}${readinessText}${reconciliationError}${protectionStatus} · Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`;
+  const protectionLine = runtimeHealth.protectionStatus && runtimeHealth.protectionStatus !== "OK"
+    ? `Protection ${runtimeHealth.protectionStatus} · Repair attempts ${runtimeHealth.protectionRepairAttempts ?? 0}${runtimeHealth.protectionLastError ? ` · ${runtimeHealth.protectionLastError}` : ""}`
+    : "Protection PROTECTED/VERIFIED";
+  // One fact per line: the Engine card renders these with white-space: pre-line.
+  $("engine-detail").textContent = [
+    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"}`,
+    `Execution ${executionLabel}${executionReason}`,
+    ...(realReadiness
+      ? [
+          `Mode ${realReadiness.realExecutionMode} · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"}`,
+          `Master Live Execution ${realReadiness.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER"} · Execution LOCKED · ${realReadiness.executionReason}`,
+        ]
+      : []),
+    ...(runtimeHealth.lastReconciliationError ? [`Error ${runtimeHealth.lastReconciliationError}`] : []),
+    protectionLine,
+    `Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`,
+  ].join("\n");
   $("daily-entry-status").textContent = dailyRisk ? dailyEntryStatusLabel(dailyRisk) : "-";
   $("daily-risk-detail").textContent = dailyRisk
-    ? `Today Realized PnL: ${formatSignedNumber(dailyRisk.realizedR)}R (${formatSignedUsdt(dailyRisk.realizedPnlUsdt)}) · Daily Range: -${dailyRisk.dailyLossLimitR}R → +${dailyRisk.dailyProfitLimitR}R`
+    ? `Today Realized PnL: ${formatSignedNumber(dailyRisk.realizedR)}R (${formatSignedUsdt(dailyRisk.realizedPnlUsdt)})\nDaily Range: -${dailyRisk.dailyLossLimitR}R → +${dailyRisk.dailyProfitLimitR}R`
     : "Daily status unavailable";
   $("account-protection-status").textContent = accountProtection ? accountProtectionStatusLabel(accountProtection) : "-";
   $("account-protection-detail").textContent = accountProtection
-    ? `Current Drawdown: ${formatSignedNumber(accountProtection.drawdownPercent)}% · Max Drawdown: ${accountProtection.maxDrawdownPercent}%`
+    ? `Current Drawdown: ${formatSignedNumber(accountProtection.drawdownPercent)}%\nMax Drawdown: ${accountProtection.maxDrawdownPercent}%`
     : "Account protection unavailable";
 
   $("trend").textContent = engine.trend ?? "-";
@@ -779,12 +841,34 @@ function stopChartPolling() {
 }
 
 function pollHomeOnce() {
+  const accountId = accountState.activeAccount?.id;
+  const stillCurrent = () => activeView === "home" && accountId === accountState.activeAccount?.id;
   load().catch((error) => {
-    if (activeView === "home") console.error(userFacingApiError(error));
+    if (!stillCurrent()) return;
+    // Nothing loaded yet for this account: stop the placeholders and say the connection state is unknown.
+    if ($("home-view").dataset.loading) {
+      setHeroBadge("account-pill", "UNAVAILABLE", false);
+      $("watchlist-body").replaceChildren(emptyTableRow("Scanner data unavailable", 7));
+    }
+    delete $("home-view").dataset.loading;
+    setHomeAlert(userFacingApiError(error));
   });
   loadAiDecisions().catch((error) => {
-    if (activeView === "home") console.error(userFacingApiError(error));
+    if (!stillCurrent()) return;
+    $("ai-decision-count").textContent = "Không tải được";
+    $("ai-decisions-body").replaceChildren(emptyTableRow(`Không tải được quyết định AI · ${userFacingApiError(error)}`, 6, "error"));
   });
+}
+
+function setHomeAlert(message) {
+  $("home-alert").hidden = !message;
+  $("home-alert-text").textContent = message ?? "";
+}
+
+async function responseError(response, label) {
+  const body = await safeJson(response);
+  const detail = body.message ?? (typeof body.error === "string" ? body.error : "");
+  return new Error(`${label} failed: ${response.status}${detail ? ` · ${detail}` : ""}`);
 }
 
 async function loadAiDecisions() {
@@ -793,7 +877,7 @@ async function loadAiDecisions() {
   const response = await apiFetch(`/api/trading-accounts/${accountId}/ai-decisions?limit=20`);
   if (accountId !== accountState.activeAccount?.id || activeView !== "home") return;
   if (handleUnauthorized(response)) return;
-  if (!response.ok) throw new Error(`AI decisions request failed: ${response.status}`);
+  if (!response.ok) throw await responseError(response, "AI decisions request");
   const body = await response.json();
   renderAiDecisions(Array.isArray(body.decisions) ? body.decisions : []);
 }
@@ -801,30 +885,22 @@ async function loadAiDecisions() {
 function renderAiDecisions(decisions) {
   $("ai-decision-count").textContent = `${decisions.length} decisions`;
   if (decisions.length === 0) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.colSpan = 6;
-    cell.className = "empty-position";
-    cell.textContent = "Chưa có quyết định AI";
-    row.append(cell);
-    $("ai-decisions-body").replaceChildren(row);
+    $("ai-decisions-body").replaceChildren(emptyTableRow("Chưa có quyết định AI", 6));
     return;
   }
   $("ai-decisions-body").replaceChildren(
     ...decisions.map((decision) => {
       const row = document.createElement("tr");
-      const action = decision.decision?.action ?? "-";
-      const direction = decision.decision?.direction ? ` ${decision.decision.direction}` : "";
+      const direction = decision.decision?.direction;
       const confidence = Number(decision.decision?.confidence);
-      const result = aiDecisionResult(decision);
-      row.className = `position-row ${decision.decision?.direction === "bullish" ? "long" : decision.decision?.direction === "bearish" ? "short" : ""}`;
+      row.className = `position-row ${direction === "bullish" ? "long" : direction === "bearish" ? "short" : ""}`;
       row.append(
-        aiTextCell(formatDateTime(decision.createdAt)),
-        aiTextCell(decision.symbol ?? "-"),
-        aiTextCell(`${action}${direction}`),
-        aiTextCell(Number.isFinite(confidence) ? `${Math.round(confidence * 100)}%` : "-"),
-        aiResultCell(result),
-        aiTextCell(decision.decision?.reason || decision.rejectReason || "-"),
+        dateTimeCell(decision.createdAt),
+        symbolCell(decision.symbol),
+        aiActionCell(decision.decision?.action, direction),
+        Number.isFinite(confidence) ? meterCell(confidence, `${Math.round(confidence * 100)}%`) : tableCell("-"),
+        aiResultCell(aiDecisionResult(decision)),
+        reasonCell(decision.decision?.reason || decision.rejectReason || "-"),
       );
       return row;
     }),
@@ -833,29 +909,118 @@ function renderAiDecisions(decisions) {
 
 // accepted = passed the bot's validation; the outcome says what happened next.
 function aiDecisionResult(decision) {
-  const why = decision.rejectCode ? `: ${decision.rejectCode}` : "";
-  if (decision.outcome === "SUBMITTED") return { label: "Đã đặt lệnh", tone: "profit", title: decision.executionIntentId ?? "" };
-  if (decision.outcome === "ADVISORY") return { label: `Chấp nhận (advisory)${why}`, tone: "profit", title: decision.rejectReason ?? "" };
-  if (decision.outcome === "SKIPPED") return { label: "AI bỏ qua", tone: "", title: "" };
-  return { label: `Từ chối${why}`, tone: "danger", title: decision.rejectReason ?? "" };
+  const code = decision.rejectCode ?? "";
+  const reason = decision.rejectReason ?? "";
+  if (decision.outcome === "SUBMITTED") return { label: "Đã đặt lệnh", tone: "ok", note: decision.executionIntentId ?? "", title: decision.executionIntentId ?? "" };
+  if (decision.outcome === "ADVISORY") return { label: "Chấp nhận (advisory)", tone: "ok", note: code, title: reason };
+  if (decision.outcome === "SKIPPED") return { label: "AI bỏ qua", tone: "", note: "", title: "" };
+  if (decision.outcome === "LLM_ERROR") return { label: "Lỗi AI", tone: "warn", note: code, title: reason };
+  if (decision.outcome === "EXECUTION_FAILED") return { label: "Đặt lệnh lỗi", tone: "danger", note: "", title: reason };
+  return { label: "Từ chối", tone: "danger", note: code, title: reason };
 }
 
-function aiTextCell(value) {
+function aiActionCell(action, direction) {
   const cell = document.createElement("td");
-  cell.textContent = value;
+  if (!action) {
+    cell.textContent = "-";
+    return cell;
+  }
+  cell.append(badge(action, action === "ENTER" ? "accent" : ""));
+  if (direction === "bullish" || direction === "bearish") {
+    const side = document.createElement("span");
+    side.className = `direction ${direction === "bullish" ? "long" : "short"}`;
+    side.textContent = `${direction === "bullish" ? "▲" : "▼"} ${direction}`;
+    cell.append(side);
+  }
   return cell;
 }
 
 function aiResultCell(result) {
-  const cell = aiTextCell(result.label);
-  if (result.tone) cell.className = result.tone;
+  const cell = document.createElement("td");
+  cell.append(badge(result.label, result.tone));
+  if (result.note) cell.append(cellNote(result.note));
   if (result.title) cell.title = result.title;
   return cell;
 }
 
+function reasonCell(text) {
+  const cell = document.createElement("td");
+  const body = document.createElement("div");
+  cell.className = "cell-wrap";
+  cell.title = text;
+  body.className = "clamp";
+  body.textContent = text;
+  cell.append(body);
+  return cell;
+}
+
+function dateTimeCell(value) {
+  if (!value) return tableCell("-");
+  const date = new Date(value);
+  const cell = document.createElement("td");
+  const time = document.createElement("strong");
+  const day = document.createElement("span");
+  time.textContent = date.toLocaleTimeString();
+  day.textContent = date.toLocaleDateString();
+  cell.title = date.toLocaleString();
+  cell.append(time, day);
+  return cell;
+}
+
+function symbolCell(symbol) {
+  const cell = document.createElement("td");
+  const name = document.createElement("strong");
+  name.textContent = symbol ?? "-";
+  cell.append(name);
+  return cell;
+}
+
+// Small horizontal bar plus the number, used for AI confidence and passed setup conditions.
+function meterCell(ratio, text, tone = "") {
+  const cell = document.createElement("td");
+  const meter = document.createElement("span");
+  const fill = document.createElement("span");
+  const value = document.createElement("span");
+  meter.className = "meter";
+  if (tone) meter.dataset.tone = tone;
+  fill.className = "meter-fill";
+  fill.style.width = `${Math.round(Math.min(Math.max(ratio, 0), 1) * 100)}%`;
+  value.className = "meter-value";
+  value.textContent = text;
+  meter.append(fill);
+  cell.append(meter, value);
+  return cell;
+}
+
+function badge(text, tone = "") {
+  const element = document.createElement("span");
+  element.className = "badge";
+  if (tone) element.dataset.tone = tone;
+  element.textContent = text;
+  return element;
+}
+
+function cellNote(text) {
+  const note = document.createElement("small");
+  note.className = "cell-note";
+  note.textContent = text;
+  return note;
+}
+
+function emptyTableRow(message, colSpan, tone = "") {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.className = "empty-position";
+  cell.colSpan = colSpan;
+  cell.textContent = message;
+  if (tone) cell.dataset.tone = tone;
+  row.append(cell);
+  return row;
+}
+
 function pollChartOnce() {
   loadChart().catch((error) => {
-    if (activeView === "chart") $("chart-status").textContent = userFacingApiError(error);
+    if (activeView === "chart") setStatus("chart-status", userFacingApiError(error));
   });
 }
 
@@ -922,25 +1087,20 @@ function formatRatio(value) {
 function renderWatchlist(rows) {
   $("watchlist-count").textContent = `${rows.length} symbols`;
   if (rows.length === 0) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.className = "empty-position";
-    cell.colSpan = 7;
-    cell.textContent = "Waiting for scanner";
-    row.append(cell);
-    $("watchlist-body").replaceChildren(row);
+    $("watchlist-body").replaceChildren(emptyTableRow("Waiting for scanner", 7));
     return;
   }
 
   $("watchlist-body").replaceChildren(
     ...rows.map((item) => {
       const row = document.createElement("tr");
+      row.className = `position-row ${item.position === "LONG" ? "long" : item.position === "SHORT" ? "short" : ""}`;
       row.append(
-        tableCell(item.symbol),
+        symbolCell(item.symbol),
         tableCell(item.state),
-        tableCell(item.conditions === undefined || item.conditions === null ? "—" : item.conditions),
+        conditionsCell(item.conditions),
         tableCell(item.rr === null || item.rr === undefined ? "-" : formatRatio(item.rr)),
-        tableCell(item.position),
+        positionCell(item.position),
         statusCell(item),
         tableCell(item.lastScanAt ? new Date(item.lastScanAt).toLocaleTimeString() : "-"),
       );
@@ -955,12 +1115,45 @@ function tableCell(value) {
   return cell;
 }
 
+// Conditions arrive as "passed/total" (e.g. "5/7").
+function conditionsCell(conditions) {
+  const match = /^(\d+)\/(\d+)$/.exec(String(conditions ?? ""));
+  if (!match || Number(match[2]) === 0) return tableCell(conditions === undefined || conditions === null ? "—" : conditions);
+  const ratio = Number(match[1]) / Number(match[2]);
+  return meterCell(ratio, conditions, ratio >= 1 ? "ok" : "");
+}
+
+function positionCell(position) {
+  const cell = document.createElement("td");
+  if (!position || position === "None") {
+    const none = document.createElement("span");
+    none.className = "muted-value";
+    none.textContent = position ?? "-";
+    cell.append(none);
+    return cell;
+  }
+  const tone = position === "LONG" ? "ok" : position === "SHORT" ? "danger" : "info";
+  cell.append(badge(position, tone));
+  return cell;
+}
+
+function watchlistStatusTone(status) {
+  if (status.startsWith("Blocked")) return "warn";
+  if (status === "Ready") return "ok";
+  if (status === "Active" || status === "Simulated") return "info";
+  if (status === "Invalidated") return "danger";
+  return "";
+}
+
 // Explains why a 7/7 setup did not become an order (risk gate, disabled trading, live price...).
 function statusCell(item) {
-  const cell = tableCell(item.status);
+  const status = String(item.status ?? "-");
+  const cell = document.createElement("td");
+  // "Blocked: CODE" shows as "Blocked"; the reason line below already carries the code.
+  cell.append(badge(item.blockedReason && status.startsWith("Blocked") ? "Blocked" : status, watchlistStatusTone(status)));
   if (item.blockedReason) {
-    cell.title = item.blockedReason;
-    cell.classList.add("status-blocked");
+    cell.title = `${status}\n${item.blockedReason}`;
+    cell.classList.add("cell-wrap");
     const reason = document.createElement("div");
     reason.className = "status-blocked-reason";
     reason.textContent = item.blockedReason;
@@ -1019,7 +1212,7 @@ $("setting-displacement-lookback").addEventListener("input", updateSettingFromIn
 $("setting-ai-min-confidence").addEventListener("input", updateSettingFromInput);
 $("setting-ai-model").addEventListener("input", (event) => {
   settingsState.aiModel = event.target.value;
-  $("settings-status").textContent = "Unsaved changes";
+  setStatus("settings-status", "Unsaved changes");
 });
 document.querySelectorAll("[data-setting-group]").forEach((group) => {
   group.addEventListener("click", (event) => {
@@ -1152,7 +1345,7 @@ async function loadChart() {
     if (activeView !== "chart") return;
     const accountId = accountState.activeAccount?.id;
     if (!accountId) {
-      $("chart-status").textContent = "Select a trading account";
+      setStatus("chart-status", "Select a trading account");
       return;
     }
     const symbol = $("chart-symbol").value.trim().toUpperCase() || DEFAULT_SYMBOL;
@@ -1160,9 +1353,11 @@ async function loadChart() {
     $("chart-symbol").value = symbol;
     rememberChartInputs(symbol, interval);
     await chartState.instance.load({ accountId, symbol, interval, limit: 300 });
+    // load() wrote its own summary; drop any error colour left by a failed poll.
+    if (activeView === "chart") $("chart-status").dataset.tone = "";
   } catch (error) {
     if (activeView !== "chart") return;
-    $("chart-status").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("chart-status", error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -1177,10 +1372,10 @@ async function loadAnalysis() {
   $("analysis-symbol").value = symbol;
   rememberAnalysisSymbol(symbol);
   if (!accountId) {
-    $("analysis-status").textContent = "Select a trading account";
+    setStatus("analysis-status", "Select a trading account");
     return;
   }
-  $("analysis-status").textContent = `Analyzing ${symbol}`;
+  setStatus("analysis-status", `Analyzing ${symbol}`);
   $("analysis-run").disabled = true;
 
   try {
@@ -1188,11 +1383,11 @@ async function loadAnalysis() {
     const response = await apiFetch(path);
     if (sequence !== analysisRequestSequence || accountId !== accountState.activeAccount?.id) return;
     if (handleUnauthorized(response)) return;
-    if (!response.ok) throw new Error(`Analysis request failed: ${response.status}`);
+    if (!response.ok) throw await responseError(response, "Analysis request");
     renderAnalysis(await response.json());
   } catch (error) {
     if (sequence !== analysisRequestSequence || accountId !== accountState.activeAccount?.id) return;
-    $("analysis-status").textContent = error instanceof Error ? error.message : String(error);
+    setStatus("analysis-status", error instanceof Error ? error.message : String(error));
   } finally {
     if (sequence === analysisRequestSequence) $("analysis-run").disabled = false;
   }
@@ -1201,7 +1396,7 @@ async function loadAnalysis() {
 function renderAnalysis(analysis) {
   const conditions = analysis.conditions ?? [];
   const sourceLabel = analysis.analysisSource === "runtime" ? "Runtime setup" : analysis.analysisSource === "active-position" ? "Active position" : "Diagnostic fallback";
-  $("analysis-status").textContent = `${analysis.symbol ?? "-"} · ${sourceLabel} · ${conditions.length} conditions checked`;
+  setStatus("analysis-status", `${analysis.symbol ?? "-"} · ${sourceLabel} · ${conditions.length} conditions checked`);
   $("analysis-symbol-label").textContent = analysis.symbol ?? "-";
   $("analysis-checked-at").textContent = analysis.checkedAt ? new Date(analysis.checkedAt).toLocaleString() : "-";
   $("analysis-trend").textContent = analysis.trend?.direction ?? "-";
@@ -1330,7 +1525,7 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
   const settingsPath = `/api/trading-accounts/${accountId}/settings`;
   const watchlistPath = `/api/trading-accounts/${accountId}/watchlist`;
   const symbolsPath = `/api/market/symbols?accountId=${encodeURIComponent(accountId)}`;
-  $("settings-status").textContent = "Loading";
+  setStatus("settings-status", "Loading");
   try {
     const [response, symbolsResponse, watchlistResponse] = await Promise.all([
       apiFetch(settingsPath),
@@ -1355,12 +1550,12 @@ async function loadSettings(accountId = accountState.activeAccount?.id ?? null) 
     } else {
       Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
     }
-    $("settings-status").textContent = "Loaded";
+    setStatus("settings-status", "Loaded");
   } catch {
     if (sequence !== settingsRequestSequence || accountId !== (accountState.activeAccount?.id ?? null)) return;
     Object.assign(settingsState, defaultSettings);
     marketSymbols = [];
-    $("settings-status").textContent = "Load failed";
+    setStatus("settings-status", "Load failed");
   }
   renderSettings();
 }
@@ -1552,7 +1747,7 @@ async function changeRealExecutionMode(mode) {
     );
     if (!confirmed) return;
   }
-  $("settings-status").textContent = "Saving REAL execution mode";
+  setStatus("settings-status", "Saving REAL execution mode");
   const response = await apiFetch(`/api/trading-accounts/${account.id}/real-execution-mode`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
@@ -1560,7 +1755,7 @@ async function changeRealExecutionMode(mode) {
   });
   if (handleUnauthorized(response)) return;
   if (!response.ok) {
-    $("settings-status").textContent = `Mode save failed: ${response.status}`;
+    setStatus("settings-status", `Mode save failed: ${response.status}`);
     return;
   }
   const body = await response.json();
@@ -1569,7 +1764,7 @@ async function changeRealExecutionMode(mode) {
   settingsState.realExecutionMode = realSafetyState.mode;
   renderRealSafety();
   await loadRealProposals(account.id);
-  $("settings-status").textContent = "REAL execution mode saved";
+  setStatus("settings-status", "REAL execution mode saved");
 }
 
 async function loadRealProposals(accountId = accountState.activeAccount?.id ?? null, sequence = settingsRequestSequence) {
@@ -1664,7 +1859,7 @@ async function transitionProposal(proposalId, action) {
   if (!window.confirm(message)) return;
   const response = await apiFetch(`/api/trading-accounts/${account.id}/real-execution-proposals/${proposalId}/${action}`, { method: "POST" });
   if (handleUnauthorized(response)) return;
-  $("settings-status").textContent = response.ok ? "Proposal updated" : `Proposal update failed: ${response.status}`;
+  setStatus("settings-status", response.ok ? "Proposal updated" : `Proposal update failed: ${response.status}`);
   await loadRealProposals(account.id);
 }
 
@@ -1678,23 +1873,23 @@ function updateSettingFromInput(event) {
   }
   settingsState[field] = value;
   event.target.classList.toggle("invalid", value === "");
-  $("settings-status").textContent = value === "" ? `${rule.label} is required` : "Unsaved changes";
+  setStatus("settings-status", value === "" ? `${rule.label} is required` : "Unsaved changes");
 }
 
 async function saveSettings() {
   const accountId = accountState.activeAccount?.id ?? null;
   if (!accountId) {
-    $("settings-status").textContent = "Select a trading account";
+    setStatus("settings-status", "Select a trading account");
     return;
   }
   const validation = settingsState.settingsMode === "simple" ? validateSimpleSettingsDraft() : validateSettingsDraft();
   if (!validation.ok) {
-    $("settings-status").textContent = validation.message;
+    setStatus("settings-status", validation.message);
     validation.element?.focus();
     return;
   }
   const settingsPath = `/api/trading-accounts/${accountId}/settings`;
-  $("settings-status").textContent = "Saving";
+  setStatus("settings-status", "Saving");
   const payload = settingsState.settingsMode === "simple" ? simpleSettingsPayload() : settingsPayload();
   const response = await apiFetch(settingsPath, {
     method: "PUT",
@@ -1704,12 +1899,12 @@ async function saveSettings() {
   if (accountId !== (accountState.activeAccount?.id ?? null)) return;
   if (handleUnauthorized(response)) return;
   if (!response.ok) {
-    $("settings-status").textContent = `Save failed: ${response.status}`;
+    setStatus("settings-status", `Save failed: ${response.status}`);
     return;
   }
   Object.assign(settingsState, settingsFromApi(await response.json()));
   renderSettings();
-  $("settings-status").textContent = "Saved";
+  setStatus("settings-status", "Saved");
 }
 
 function resetSettings() {

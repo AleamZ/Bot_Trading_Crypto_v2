@@ -5,31 +5,48 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SMC Futures Bot</title>
     <link rel="stylesheet" href="/styles.css" />
+    <script>
+      // Pick the theme before first paint so dark mode does not flash light.
+      (function () {
+        var stored = null;
+        try {
+          stored = localStorage.getItem("smc-futures-bot:theme");
+        } catch (error) {}
+        var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = stored === "light" || stored === "dark" ? stored : prefersDark ? "dark" : "light";
+      })();
+    </script>
     <script src="/config.js"></script>
   </head>
   <body>
     <header class="app-header">
-      <div class="brand">SMC Futures Bot</div>
+      <div class="brand"><span class="brand-mark">SMC</span><span class="brand-name">Futures Bot</span></div>
       <nav class="nav-tabs" aria-label="Main navigation" hidden>
         <button class="nav-tab" id="home-nav" type="button">Home</button>
         <button class="nav-tab" id="chart-nav" type="button">Chart</button>
         <button class="nav-tab" id="analysis-nav" type="button">Analysis</button>
         <button class="nav-tab" id="settings-nav" type="button">Setting</button>
       </nav>
-      <div class="account-selector" id="account-selector" hidden>
-        <button class="user-menu-trigger" id="account-selector-trigger" type="button">Select Account</button>
-        <div class="user-menu-popover account-selector-popover" id="account-selector-popover" hidden>
-          <div id="account-selector-list"></div>
-          <button id="manage-account-button" type="button">Manage Account</button>
-          <button id="add-account-button" type="button">+ Add Account</button>
+      <div class="header-tools">
+        <div class="account-selector" id="account-selector" hidden>
+          <button class="user-menu-trigger" id="account-selector-trigger" type="button">Select Account</button>
+          <div class="user-menu-popover account-selector-popover" id="account-selector-popover" hidden>
+            <div id="account-selector-list"></div>
+            <button id="manage-account-button" type="button">Manage Account</button>
+            <button id="add-account-button" type="button">+ Add Account</button>
+          </div>
         </div>
-      </div>
-      <div class="user-menu" id="user-menu" hidden>
-        <button class="user-menu-trigger" id="user-menu-trigger" type="button">Account</button>
-        <div class="user-menu-popover" id="user-menu-popover" hidden>
-          <button id="account-nav" type="button">Account</button>
-          <button id="logout-button" type="button">Logout</button>
+        <div class="user-menu" id="user-menu" hidden>
+          <button class="user-menu-trigger" id="user-menu-trigger" type="button">Account</button>
+          <div class="user-menu-popover" id="user-menu-popover" hidden>
+            <button id="account-nav" type="button">Account</button>
+            <button id="logout-button" type="button">Logout</button>
+          </div>
         </div>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode">
+          <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>
+        </button>
       </div>
     </header>
 
@@ -85,7 +102,7 @@
           <p id="account-create-environment">Environment</p>
           <label for="account-create-name">Name</label>
           <input id="account-create-name" value="My Testnet" />
-          <button id="account-create-submit" type="button">Continue</button>
+          <button class="primary" id="account-create-submit" type="button">Continue</button>
           <p class="auth-message" id="account-create-message"></p>
         </section>
       </section>
@@ -102,8 +119,8 @@
           <label for="connect-api-secret">Secret Key</label>
           <input id="connect-api-secret" autocomplete="off" type="password" />
           <button id="connect-test-button" type="button">Test Connection</button>
-          <button id="connect-save-button" type="button" disabled>Save & Continue</button>
-          <p id="connect-status">Connection Status: Not connected</p>
+          <button class="primary" id="connect-save-button" type="button" disabled>Save & Continue</button>
+          <p class="status-text" id="connect-status">Connection Status: Not connected</p>
           <p class="auth-message" id="connect-message"></p>
         </section>
       </section>
@@ -112,7 +129,7 @@
         <section class="settings-toolbar">
           <div>
             <h1>Account</h1>
-            <p id="account-view-status">Authenticated</p>
+            <p class="status-text" id="account-view-status">Authenticated</p>
           </div>
         </section>
         <section class="status-grid account-grid">
@@ -138,7 +155,7 @@
         <section class="settings-toolbar">
           <div>
             <h1>Manage Account</h1>
-            <p id="manage-account-status">Selected trading account</p>
+            <p class="status-text" id="manage-account-status">Selected trading account</p>
           </div>
         </section>
         <section class="status-grid account-grid">
@@ -167,24 +184,38 @@
         </section>
       </section>
 
-      <section class="view" id="home-view">
-        <section class="wallet-hero">
+      <section class="view" id="home-view" data-loading="true">
+        <div class="page-alert" id="home-alert" role="alert" hidden>
+          <span class="page-alert-icon" aria-hidden="true">!</span>
           <div>
+            <strong>Dashboard data unavailable</strong>
+            <p id="home-alert-text"></p>
+          </div>
+        </div>
+
+        <section class="wallet-hero">
+          <div class="hero-main">
             <h1>Futures Wallet <span>(Binance)</span></h1>
-            <div class="hero-line">
-              <span>Connection:</span>
-              <strong class="hero-badge" id="account-pill">CHECKING</strong>
+            <div class="hero-badges">
+              <div class="hero-line">
+                <span>Connection</span>
+                <strong class="hero-badge" id="account-pill">CHECKING</strong>
+              </div>
+              <div class="hero-line">
+                <span>Mode</span>
+                <strong class="hero-badge muted" id="network-pill">-</strong>
+              </div>
             </div>
-            <div class="hero-line mode-line">
-              <span>Mode:</span>
-              <strong class="hero-badge muted" id="network-pill">-</strong>
-            </div>
-            <p class="balance-line">
-              Wallet balance:
+          </div>
+          <div class="hero-balances">
+            <div class="hero-stat">
+              <span>Wallet balance</span>
               <strong id="wallet-balance">-</strong>
-              <span>· Available:</span>
+            </div>
+            <div class="hero-stat">
+              <span>Available</span>
               <strong id="available-balance">-</strong>
-            </p>
+            </div>
           </div>
           <div class="hero-actions">
             <button id="connect-binance-button" type="button">Connect Binance</button>
@@ -208,20 +239,20 @@
             <strong id="market-data">-</strong>
             <small id="market-data-detail">-</small>
           </article>
-          <article class="status-card">
+          <article class="status-card engine-card">
             <span>Engine</span>
             <strong id="engine-state">-</strong>
-            <small id="engine-detail">-</small>
+            <small class="detail-lines" id="engine-detail">-</small>
           </article>
           <article class="status-card">
             <span>Daily Protection</span>
             <strong id="daily-entry-status">-</strong>
-            <small id="daily-risk-detail">-</small>
+            <small class="detail-lines" id="daily-risk-detail">-</small>
           </article>
           <article class="status-card">
             <span>Account Protection</span>
             <strong id="account-protection-status">-</strong>
-            <small id="account-protection-detail">-</small>
+            <small class="detail-lines" id="account-protection-detail">-</small>
           </article>
         </section>
 
@@ -258,7 +289,7 @@
               </thead>
               <tbody id="watchlist-body">
                 <tr>
-                  <td colspan="7" class="empty-position">Waiting for scanner</td>
+                  <td colspan="7" class="empty-position">Loading scanner…</td>
                 </tr>
               </tbody>
             </table>
@@ -282,7 +313,7 @@
             <span id="ai-decision-count">0 decisions</span>
           </div>
           <div class="positions-table-wrap">
-            <table class="positions-table">
+            <table class="positions-table ai-decisions-table">
               <thead>
                 <tr>
                   <th>Time</th>
@@ -294,7 +325,7 @@
                 </tr>
               </thead>
               <tbody id="ai-decisions-body">
-                <tr><td colspan="6" class="empty-position">Chưa có quyết định AI</td></tr>
+                <tr><td colspan="6" class="empty-position">Đang tải quyết định AI…</td></tr>
               </tbody>
             </table>
           </div>
@@ -305,7 +336,7 @@
         <section class="chart-toolbar">
           <div>
             <h1>Chart</h1>
-            <p id="chart-status">Waiting for candles</p>
+            <p class="status-text" id="chart-status">Waiting for candles</p>
           </div>
           <div class="chart-controls">
             <input id="chart-symbol" value="BTCUSDT" aria-label="Symbol" />
@@ -340,7 +371,7 @@
             </label>
           </div>
           <div class="positions-table-wrap">
-            <table class="positions-table">
+            <table class="positions-table account-table">
               <thead id="account-table-head">
                 <tr>
                   <th>Symbol</th>
@@ -368,11 +399,11 @@
         <section class="analysis-toolbar">
           <div>
             <h1>Analysis</h1>
-            <p id="analysis-status">Enter a futures symbol to check the SMC workflow</p>
+            <p class="status-text" id="analysis-status">Enter a futures symbol to check the SMC workflow</p>
           </div>
           <form class="analysis-search" id="analysis-form">
             <input id="analysis-symbol" value="BTCUSDT" aria-label="Analysis symbol" placeholder="BTCUSDT" />
-            <button id="analysis-run" type="submit">Analyze</button>
+            <button class="primary" id="analysis-run" type="submit">Analyze</button>
           </form>
         </section>
 
@@ -431,11 +462,11 @@
         <section class="settings-toolbar">
           <div>
             <h1>Setting</h1>
-            <p id="settings-status">Local draft</p>
+            <p class="status-text" id="settings-status">Local draft</p>
           </div>
           <div class="settings-actions">
             <button id="settings-reset" type="button">Reset</button>
-            <button id="settings-save" type="button">Save</button>
+            <button class="primary" id="settings-save" type="button">Save</button>
           </div>
         </section>
 
@@ -740,7 +771,7 @@
             </select>
           </div>
           <div class="positions-table-wrap">
-            <table class="positions-table">
+            <table class="positions-table proposals-table">
               <thead>
                 <tr>
                   <th>Created</th>
@@ -791,7 +822,7 @@
           <div class="settings-grid">
           <article class="setting-card">
             <label>Chế độ AI</label>
-            <div class="segmented-control" data-setting-group="aiTradingMode">
+            <div class="segmented-control three-options" data-setting-group="aiTradingMode">
               <button class="segmented-option" data-setting-value="OFF" type="button">OFF</button>
               <button class="segmented-option" data-setting-value="ADVISORY" type="button">ADVISORY</button>
               <button class="segmented-option" data-setting-value="AUTO" type="button">AUTO</button>

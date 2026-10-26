@@ -1,3 +1,5 @@
+import { DEFAULT_AI_MIN_CALL_INTERVAL_MS } from "./AiCallGate.js";
+
 export interface LlmChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -41,6 +43,8 @@ export interface LocalLlmConfig {
   timeoutMs: number;
   /** Chat answers are longer than trade decisions, so they get their own limit. */
   chatTimeoutMs: number;
+  /** Minimum gap between AI advisor model calls across all accounts (chat is limited per user instead). */
+  minCallIntervalMs: number;
 }
 
 export const DEFAULT_AI_BASE_URL = "http://localhost:20128/v1";
@@ -52,12 +56,15 @@ export const DEFAULT_AI_CHAT_TIMEOUT_MS = 120_000;
 export function loadLocalLlmConfig(env: NodeJS.ProcessEnv = process.env): LocalLlmConfig {
   const timeout = Number(env.AI_TIMEOUT_MS);
   const chatTimeout = Number(env.AI_CHAT_TIMEOUT_MS);
+  const minInterval = env.AI_MIN_CALL_INTERVAL_MS?.trim() ? Number(env.AI_MIN_CALL_INTERVAL_MS) : Number.NaN;
   return {
     baseUrl: (env.AI_BASE_URL?.trim() || DEFAULT_AI_BASE_URL).replace(/\/+$/, ""),
     apiKey: env.AI_API_KEY?.trim() || null,
     defaultModel: env.AI_MODEL?.trim() || DEFAULT_AI_MODEL,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.floor(timeout) : DEFAULT_AI_TIMEOUT_MS,
-    chatTimeoutMs: Number.isFinite(chatTimeout) && chatTimeout > 0 ? Math.floor(chatTimeout) : DEFAULT_AI_CHAT_TIMEOUT_MS
+    chatTimeoutMs: Number.isFinite(chatTimeout) && chatTimeout > 0 ? Math.floor(chatTimeout) : DEFAULT_AI_CHAT_TIMEOUT_MS,
+    // 0 turns the spacing off; anything unparseable keeps the default.
+    minCallIntervalMs: Number.isFinite(minInterval) && minInterval >= 0 ? Math.floor(minInterval) : DEFAULT_AI_MIN_CALL_INTERVAL_MS
   };
 }
 

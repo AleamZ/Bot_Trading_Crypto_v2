@@ -7,7 +7,8 @@ import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 
 export const AI_CHAT_RATE_WINDOW_MS = 60_000;
 export const AI_CHAT_RATE_MAX = 10;
-const HEARTBEAT_MS = 15_000;
+// Same cadence as the live stream: under the 60 s proxy idle limit.
+const HEARTBEAT_MS = 30_000;
 const SYMBOL_PATTERN = /^[A-Z0-9]{2,20}USDT$/;
 
 const recentChats = new Map<string, number[]>();

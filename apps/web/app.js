@@ -1058,7 +1058,7 @@ function setLiveStatus(status) {
 }
 
 const AI_SCREEN_TEXT = {
-  IN_FLIGHT: "đang chờ model trả lời lần trước",
+  IN_FLIGHT: "lần hỏi trước của symbol này đang chờ lượt (giãn cách 30 giây) hoặc chờ model trả lời",
   ALREADY_CONSULTED: "đã phân tích nến M5 này rồi",
   HAS_POSITION: "symbol đang có vị thế hoặc lệnh chờ",
   SETUP_ARCHIVED: "setup đã bị huỷ",
@@ -1122,10 +1122,12 @@ function aiStepView(step) {
     };
   }
   if (step.stage === "analyze") {
+    // Model calls are spaced (AI_MIN_CALL_INTERVAL_MS), so a call may have waited for its turn.
+    const queued = Number(step.queuedMs) > 0 ? ` (đã chờ ${Math.round(Number(step.queuedMs) / 1000)}s tới lượt)` : "";
     return {
       label: "Đang phân tích",
       tone: "info",
-      text: `Gửi cho ${step.model} (${step.mode}): trend ${step.trend}, ${step.setupState}, ${step.evidence}/7 điều kiện, giá ${step.livePrice === null ? "-" : formatPrice(step.livePrice)}`,
+      text: `Gửi cho ${step.model} (${step.mode}): trend ${step.trend}, ${step.setupState}, ${step.evidence}/7 điều kiện, giá ${step.livePrice === null ? "-" : formatPrice(step.livePrice)}${queued}`,
     };
   }
   if (step.stage === "answer") {

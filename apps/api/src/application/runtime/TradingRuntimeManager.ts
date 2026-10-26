@@ -46,6 +46,7 @@ import { resolveEffectiveExecutionPolicy, type EffectiveExecutionPolicy } from "
 import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor } from "../ai/AiTradeAdvisor.js";
 import type { LlmClient } from "../ai/LocalLlmClient.js";
 import { LiveUpdateHub } from "./LiveUpdateHub.js";
+import { AiCallGate, DEFAULT_AI_MIN_CALL_INTERVAL_MS } from "../ai/AiCallGate.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -194,10 +195,14 @@ export class TradingRuntimeManager {
     private readonly realProposalRepository: RealExecutionProposalRepository = new MemoryRealExecutionProposalRepository(),
     private readonly runtimeMarketDataFactory: RuntimeMarketDataFactory = (testnet) => new BinanceFuturesMarketData(testnet),
     /** Local LLM for the AI advisor; null disables AI decisions for every account. */
-    private readonly aiLlm: { client: LlmClient; defaultModel: string } | null = null
+    private readonly aiLlm: { client: LlmClient; defaultModel: string; minCallIntervalMs?: number } | null = null
   ) {
     this.processReadOnlySoak = baseConfig.readOnlySoak;
+    this.aiCallGate = new AiCallGate(aiLlm?.minCallIntervalMs ?? DEFAULT_AI_MIN_CALL_INTERVAL_MS);
   }
+
+  /** One gate for every account's advisor, so model calls never burst against the provider. */
+  private readonly aiCallGate: AiCallGate;
 
   async start(): Promise<void> {
     if (this.shuttingDown) return;
@@ -284,7 +289,8 @@ export class TradingRuntimeManager {
           repository: this.executionIntentRepository,
           execution,
           logger: this.logger,
-          onProgress: (step) => this.live.recordAiStep(account.id, step)
+          onProgress: (step) => this.live.recordAiStep(account.id, step),
+          callGate: this.aiCallGate
         })
       : null;
     const scanner = new MarketScanner(

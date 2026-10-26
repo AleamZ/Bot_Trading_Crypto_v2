@@ -9,6 +9,7 @@ import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 import { buildAiDecisionMessages, buildBotAnalysisSnapshot, type BotAnalysisSnapshot } from "./BotAnalysisSkill.js";
 import { extractJsonObject, LlmRequestError, type LlmClient } from "./LocalLlmClient.js";
+import type { AiCallGate } from "./AiCallGate.js";
 
 export const AI_DECISION_AUDIT_TYPE = "AI_DECISION";
 /** Setups below this evidence count are not worth a model call unless already ReadyToEnter. */
@@ -72,7 +73,7 @@ export type AiScreenSkip = "IN_FLIGHT" | "ALREADY_CONSULTED" | "HAS_POSITION" | 
 
 type AiStepBody =
   | { stage: "screen"; skip: AiScreenSkip; setupState: string; evidence: number; trend: string }
-  | { stage: "analyze"; model: string; mode: "AUTO" | "ADVISORY"; setupState: string; evidence: number; trend: string; livePrice: number | null }
+  | { stage: "analyze"; model: string; mode: "AUTO" | "ADVISORY"; setupState: string; evidence: number; trend: string; livePrice: number | null; queuedMs: number }
   | { stage: "answer"; latencyMs: number; decision: AiDecision }
   | { stage: "check"; gate: "rules" | "duplicate" | "risk"; ok: boolean; code: string | null; reason: string | null; riskReward: number | null }
   | { stage: "result"; outcome: AiDecisionOutcome; rejectCode: string | null; rejectReason: string | null; executionIntentId: string | null; latencyMs: number };
@@ -115,6 +116,8 @@ export interface AiTradeAdvisorOptions {
   now?: () => number;
   /** Receives every step as it happens; must not throw (errors are logged and ignored). */
   onProgress?: (step: AiProgressStep) => void;
+  /** Shared spacing between model calls (all symbols and accounts); absent = no spacing. */
+  callGate?: AiCallGate;
 }
 
 /**
@@ -177,6 +180,17 @@ export class AiTradeAdvisor implements AiScanHook {
   }
 
   private async consult(context: AiScanContext): Promise<void> {
+    const queuedMs = this.options.callGate ? await this.options.callGate.acquire() : 0;
+    if (queuedMs > 0) {
+      // The setup may have moved on while this call waited for its turn.
+      if (context.config().aiTradingMode === "OFF") return;
+      const skip = context.engine.getState().openPositions > 0 || context.hasActiveEntry() ? "HAS_POSITION" : setupSkipReason(context.engine.getSetupDiagnostic());
+      if (skip) {
+        const current = context.engine.getSetupDiagnostic();
+        this.progress(context.symbol, { stage: "screen", skip, setupState: current.state, evidence: current.evidenceCount, trend: current.trend });
+        return;
+      }
+    }
     const startedAt = this.now();
     const config = context.config();
     const diagnostic = context.engine.getSetupDiagnostic();
@@ -233,7 +247,8 @@ export class AiTradeAdvisor implements AiScanHook {
       setupState: diagnostic.state,
       evidence: diagnostic.evidenceCount,
       trend: diagnostic.trend,
-      livePrice: snapshot.livePrice
+      livePrice: snapshot.livePrice,
+      queuedMs
     });
 
     let content: string;

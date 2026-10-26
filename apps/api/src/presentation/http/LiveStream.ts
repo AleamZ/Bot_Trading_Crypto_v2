@@ -2,8 +2,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DecisionLogger } from "../../application/ports/Logger.js";
 import type { LiveMonitorState, TradingRuntimeManager } from "../../application/runtime/TradingRuntimeManager.js";
 
-/** Below Cloudflare's 100 s and nginx's 60 s idle limits. */
-export const LIVE_HEARTBEAT_MS = 15_000;
+/** Every 30 s: rare enough not to be noise, still below Cloudflare's 100 s and nginx's 60 s idle limits. */
+export const LIVE_HEARTBEAT_MS = 30_000;
 /** Scans of a watchlist arrive in bursts; one push per burst is enough. */
 export const LIVE_FLUSH_DELAY_MS = 250;
 const AI_DECISION_LIMIT = 20;

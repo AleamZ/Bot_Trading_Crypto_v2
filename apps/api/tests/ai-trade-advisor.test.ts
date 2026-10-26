@@ -9,7 +9,8 @@ import { defaultTradingSettings, validateTradingSettings, type AppConfig } from 
 import { resolveSettingsInput } from "../src/application/config/TradingPresets.js";
 import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor, validateAiDecision, type AiDecision, type AiProgressStep } from "../src/application/ai/AiTradeAdvisor.js";
 import { AI_DECISION_SYSTEM_PROMPT, buildAiDecisionMessages, buildBotAnalysisSnapshot, renderBotAnalysisSkillMarkdown } from "../src/application/ai/BotAnalysisSkill.js";
-import { LlmRequestError, LocalLlmClient, extractJsonObject, type LlmChatRequest, type LlmChatResponse, type LlmClient } from "../src/application/ai/LocalLlmClient.js";
+import { LlmRequestError, LocalLlmClient, extractJsonObject, loadLocalLlmConfig, type LlmChatRequest, type LlmChatResponse, type LlmClient } from "../src/application/ai/LocalLlmClient.js";
+import { AiCallGate, DEFAULT_AI_MIN_CALL_INTERVAL_MS } from "../src/application/ai/AiCallGate.js";
 import type { ExecutionGateway, ExecutionOrderContext, SubmittedOrder } from "../src/application/ports/ExecutionGateway.js";
 import type { DecisionLogger } from "../src/application/ports/Logger.js";
 import type { EntryPlan } from "../src/domain/entry/EntryCalculator.js";
@@ -362,6 +363,57 @@ describe("AI advisor progress steps", () => {
   });
 });
 
+describe("AI call spacing", () => {
+  it("starts each call at least the interval after the previous one, in order", async () => {
+    let clock = 0;
+    const waits: number[] = [];
+    const gate = new AiCallGate(30_000, () => clock, async (ms) => {
+      waits.push(ms);
+    });
+
+    expect(await Promise.all([gate.acquire(), gate.acquire(), gate.acquire()])).toEqual([0, 30_000, 60_000]);
+    expect(waits).toEqual([30_000, 60_000]);
+    clock = 200_000;
+    expect(await gate.acquire()).toBe(0);
+  });
+
+  it("an advisor waits for its turn and reports how long it queued", async () => {
+    let clock = 1_000;
+    const gate = new AiCallGate(30_000, () => clock, async (ms) => {
+      clock += ms;
+    });
+    await gate.acquire(); // another symbol's call just took the slot
+    const h = harness({ candles: solCandles(true), mode: "ADVISORY", reply: skip, callGate: gate });
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+
+    expect(h.llm.calls).toHaveLength(1);
+    expect(h.steps.find((step) => step.stage === "analyze")).toMatchObject({ queuedMs: 30_000 });
+  });
+
+  it("drops the call when a position appeared while it waited", async () => {
+    let scanner: MarketScanner | null = null;
+    const gate = new AiCallGate(30_000, () => 0, async () => {
+      scanner?.markEntryPlaced("SOLUSDT");
+    });
+    await gate.acquire();
+    const h = harness({ candles: solCandles(true), mode: "ADVISORY", reply: skip, callGate: gate });
+    scanner = h.scanner;
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+
+    expect(h.llm.calls).toHaveLength(0);
+    expect(h.steps).toEqual([expect.objectContaining({ stage: "screen", skip: "HAS_POSITION" })]);
+  });
+
+  it("reads AI_MIN_CALL_INTERVAL_MS, where 0 turns the spacing off", () => {
+    expect(loadLocalLlmConfig({}).minCallIntervalMs).toBe(DEFAULT_AI_MIN_CALL_INTERVAL_MS);
+    expect(loadLocalLlmConfig({ AI_MIN_CALL_INTERVAL_MS: "45000" }).minCallIntervalMs).toBe(45_000);
+    expect(loadLocalLlmConfig({ AI_MIN_CALL_INTERVAL_MS: "0" }).minCallIntervalMs).toBe(0);
+    expect(loadLocalLlmConfig({ AI_MIN_CALL_INTERVAL_MS: "soon" }).minCallIntervalMs).toBe(DEFAULT_AI_MIN_CALL_INTERVAL_MS);
+  });
+});
+
 describe("Execution origin", () => {
   it("round-trips the intent source in the memory repository", async () => {
     const repository = new MemoryExecutionIntentRepository();
@@ -460,6 +512,7 @@ function harness(options: {
   reply: Reply;
   tradingEnabled?: boolean;
   accountMode?: "DEMO" | "REAL";
+  callGate?: AiCallGate;
 }) {
   const data = options.data ?? new StaticMarketData(options.candles ?? []);
   data.livePrice = 82.62;
@@ -486,7 +539,8 @@ function harness(options: {
     repository,
     execution,
     logger: fakeLogger(),
-    onProgress: (step) => steps.push(step)
+    onProgress: (step) => steps.push(step),
+    ...(options.callGate ? { callGate: options.callGate } : {})
   });
   scanner = new MarketScanner(
     config({ aiTradingMode: options.mode, tradingEnabled: options.tradingEnabled ?? false }),

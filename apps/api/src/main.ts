@@ -64,7 +64,7 @@ const marketData = new BinanceFuturesMarketData(config.binanceTestnet);
 // Process-level LLM settings come from env (AI_BASE_URL, AI_API_KEY, AI_MODEL, AI_TIMEOUT_MS);
 // each account opts in with its aiTradingMode setting.
 const llmConfig = loadLocalLlmConfig();
-logger.info("AI advisor configuration", { baseUrl: llmConfig.baseUrl, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.timeoutMs, chatTimeoutMs: llmConfig.chatTimeoutMs, apiKey: llmConfig.apiKey ? "configured" : "not_configured" });
+logger.info("AI advisor configuration", { baseUrl: llmConfig.baseUrl, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.timeoutMs, chatTimeoutMs: llmConfig.chatTimeoutMs, minCallIntervalMs: llmConfig.minCallIntervalMs, apiKey: llmConfig.apiKey ? "configured" : "not_configured" });
 const llmClient = new LocalLlmClient(llmConfig);
 const aiChat = new AiChatService({ llm: llmClient, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.chatTimeoutMs });
 const runtimeManager = new TradingRuntimeManager(
@@ -80,7 +80,7 @@ const runtimeManager = new TradingRuntimeManager(
   undefined,
   realExecutionProposalRepository,
   undefined,
-  { client: llmClient, defaultModel: llmConfig.defaultModel }
+  { client: llmClient, defaultModel: llmConfig.defaultModel, minCallIntervalMs: llmConfig.minCallIntervalMs }
 );
 const scanner = new MarketScanner(config, repository, execution, logger, marketData, availableBalanceProvider);
 const engine = scanner.getPrimaryEngine();

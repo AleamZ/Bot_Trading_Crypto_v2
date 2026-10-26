@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { readFile, writeFile } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative } from "node:path";
 import { dirname } from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -54,6 +55,8 @@ const server = createServer(async (request, response) => {
     response.writeHead(200, { "content-type": contentTypes[extname(file)] ?? "application/octet-stream" });
     response.end(body);
   } catch {
+    // A proxied stream the browser already closed has nothing left to answer.
+    if (response.headersSent || response.destroyed) return;
     response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     response.end("Not found");
   }
@@ -69,16 +72,27 @@ async function proxyApiRequest(request, response, requestUrl) {
   const target = new URL(`${requestUrl.pathname}${requestUrl.search}`, proxyTarget);
   const headers = proxyRequestHeaders(request.headers);
   const body = await readRequestBody(request);
+  // Abort the upstream call when the browser goes away (long-lived event streams).
+  const upstreamAbort = new AbortController();
+  response.on("close", () => upstreamAbort.abort());
   const upstream = await fetch(target, {
     method: request.method,
     headers,
-    body: body.length > 0 && request.method !== "GET" && request.method !== "HEAD" ? body : undefined
+    body: body.length > 0 && request.method !== "GET" && request.method !== "HEAD" ? body : undefined,
+    signal: upstreamAbort.signal
   });
   const responseHeaders = proxyResponseHeaders(upstream.headers);
   const setCookies = readSetCookies(upstream.headers).map(rewriteDevSetCookie);
   if (setCookies.length > 0) responseHeaders["set-cookie"] = setCookies;
   response.writeHead(upstream.status, responseHeaders);
-  response.end(Buffer.from(await upstream.arrayBuffer()));
+  if (!upstream.body) {
+    response.end();
+    return;
+  }
+  // Pipe instead of buffering so Server-Sent Events reach the browser as they are written.
+  Readable.fromWeb(upstream.body)
+    .on("error", () => response.destroy())
+    .pipe(response);
 }
 
 function proxyRequestHeaders(headers) {

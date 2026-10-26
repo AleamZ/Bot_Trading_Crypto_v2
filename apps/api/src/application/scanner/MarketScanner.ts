@@ -30,6 +30,7 @@ export class MarketScanner {
   private scanning = false;
   private activePositions = new Map<string, BinanceFuturesPositionStatus>();
   private pendingEntrySymbols = new Set<string>();
+  private scanListener: ((symbol: string) => void) | null = null;
 
   constructor(
     private config: AppConfig,
@@ -118,6 +119,20 @@ export class MarketScanner {
   async bootstrap(): Promise<void> {
     for (const symbol of this.config.watchlist) {
       await this.scanSymbol(symbol, true);
+      this.notifyScanned(symbol);
+    }
+  }
+
+  /** Called after each symbol scan (bootstrap or live, failed or not), e.g. to push the new state to dashboards. */
+  onSymbolScanned(listener: ((symbol: string) => void) | null): void {
+    this.scanListener = listener;
+  }
+
+  private notifyScanned(symbol: string): void {
+    try {
+      this.scanListener?.(symbol);
+    } catch (error) {
+      this.logger.warn("[SCANNER] scan listener failed", { symbol, error: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -156,6 +171,7 @@ export class MarketScanner {
         } catch (error) {
           this.logger.error("[SCANNER] symbol scan failed", { symbol, error: error instanceof Error ? error.message : String(error) });
         }
+        this.notifyScanned(symbol);
       }
     } finally {
       this.scanning = false;

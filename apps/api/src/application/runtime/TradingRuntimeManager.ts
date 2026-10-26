@@ -45,6 +45,7 @@ import { withPostgresMigrationLock, withPostgresStartupRetry } from "../../infra
 import { resolveEffectiveExecutionPolicy, type EffectiveExecutionPolicy } from "./ExecutionPolicy.js";
 import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor } from "../ai/AiTradeAdvisor.js";
 import type { LlmClient } from "../ai/LocalLlmClient.js";
+import { LiveUpdateHub } from "./LiveUpdateHub.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -57,6 +58,9 @@ export interface AccountSnapshot {
   accountProtection: AccountProtectionStatus | null;
   funnelMetrics: Record<string, import("../engine/TradingEngine.js").FunnelMetrics>;
 }
+
+/** The part of a snapshot that lives in memory (plus stored bot events): cheap enough to push on every change. */
+export type LiveMonitorState = Pick<AccountSnapshot, "engine" | "store" | "watchlistStatus" | "runtimeHealth" | "execution">;
 
 export interface RuntimeHealth {
   state: "RECOVERING" | "READY" | "DEGRADED" | "DISCONNECTED" | "ERROR" | "SHUTTING_DOWN";
@@ -167,6 +171,8 @@ interface RuntimeConfigRef {
 }
 
 export class TradingRuntimeManager {
+  /** Change notifications for live dashboard streams (scans, reconciliation, settings, AI steps). */
+  readonly live = new LiveUpdateHub();
   private readonly runtimes = new Map<string, AccountRuntime>();
   private readonly runtimeLoads = new Map<string, Promise<AccountRuntime>>();
   private readonly realAuditThrottle = new Map<string, number>();
@@ -277,7 +283,8 @@ export class TradingRuntimeManager {
           defaultModel: this.aiLlm.defaultModel,
           repository: this.executionIntentRepository,
           execution,
-          logger: this.logger
+          logger: this.logger,
+          onProgress: (step) => this.live.recordAiStep(account.id, step)
         })
       : null;
     const scanner = new MarketScanner(
@@ -304,6 +311,7 @@ export class TradingRuntimeManager {
       { accountId: account.id, runtimeId: account.id },
       aiAdvisor
     );
+    scanner.onSymbolScanned((symbol) => this.live.publish(account.id, { topic: "scan", symbol }));
     const reconciliation = new TradingReconciliationService(this.executionIntentRepository, this.logger);
     const runtime = new AccountRuntime(account, scanner, repository, health, reconciliation, rawExecution, configRef, reconciliationGateway);
     this.runtimes.set(account.id, runtime);
@@ -379,6 +387,7 @@ export class TradingRuntimeManager {
     await runtime.repository.saveTradingSettings(config);
     runtime.scanner.updateConfig(config);
     this.updateExecutionHealth(runtime);
+    this.live.publish(accountId, { topic: "config" });
   }
 
   async disableExecution(accountId: string): Promise<void> {
@@ -390,6 +399,7 @@ export class TradingRuntimeManager {
     }
     this.runtimes.delete(accountId);
     this.runtimeLoads.delete(accountId);
+    this.live.closeAccount(accountId);
   }
 
   async prepareAccountDeletion(accountId: string): Promise<void> {
@@ -420,6 +430,7 @@ export class TradingRuntimeManager {
     this.runtimes.delete(accountId);
     this.runtimeLoads.delete(accountId);
     this.deletingAccounts.delete(accountId);
+    this.live.closeAccount(accountId);
   }
 
   cancelAccountDeletion(accountId: string): void {
@@ -428,6 +439,8 @@ export class TradingRuntimeManager {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    // Open streams would otherwise keep server.close() waiting.
+    this.live.closeAll();
     for (const runtime of this.runtimes.values()) {
       runtime.health.state = "SHUTTING_DOWN";
       runtime.health.execution = { enabled: false, reason: "SHUTTING_DOWN" };
@@ -459,6 +472,19 @@ export class TradingRuntimeManager {
       dailyRisk,
       accountProtection,
       funnelMetrics: runtime.scanner.getFunnelMetrics()
+    };
+  }
+
+  /** Monitor state for live streams: no Binance calls, unlike getSnapshot (daily risk, protection, readiness). */
+  async getLiveState(accountId: string): Promise<LiveMonitorState> {
+    const runtime = await this.ensureRuntime(accountId);
+    const execution = this.updateExecutionHealth(runtime);
+    return {
+      engine: runtime.scanner.getPrimaryEngine().getDashboardState(),
+      store: await this.retryDatabaseRead("runtime live snapshot", () => runtime.repository.getDashboardSnapshot()),
+      watchlistStatus: reconcileWatchlistStatus(runtime.scanner.getWatchlistStatus(), runtime.lastPositions, runtime.configRef.current.executionMode),
+      runtimeHealth: { ...runtime.health },
+      execution
     };
   }
 
@@ -886,6 +912,8 @@ export class TradingRuntimeManager {
     if (runtime.reconciliationInFlight) return runtime.reconciliationInFlight;
     const reconciliation = this.performReconcileRuntime(runtime).finally(() => {
       if (runtime.reconciliationInFlight === reconciliation) runtime.reconciliationInFlight = null;
+      // Positions, protection and health may have changed either way.
+      this.live.publish(runtime.account.id, { topic: "reconcile" });
     });
     runtime.reconciliationInFlight = reconciliation;
     return reconciliation;

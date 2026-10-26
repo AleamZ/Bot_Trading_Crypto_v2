@@ -187,6 +187,48 @@ body {
   box-shadow: 0 1px 2px var(--shadow);
 }
 
+.live-indicator {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: default;
+}
+
+.live-indicator .live-label {
+  color: inherit;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.live-indicator[data-state="live"] {
+  border-color: var(--success-line);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.live-indicator[data-state="live"] .live-dot {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.live-indicator[data-state="connecting"] {
+  border-color: var(--warning-line);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
 .theme-toggle {
   width: 36px;
   flex: 0 0 auto;
@@ -2255,6 +2297,98 @@ code {
   overflow-wrap: anywhere;
 }
 
+/* "AI đang làm gì": live timeline of the AI advisor, newest first. */
+.ai-steps {
+  max-height: 420px;
+  overflow-y: auto;
+  gap: 0;
+}
+
+.ai-steps li {
+  border-top: 0;
+}
+
+.ai-step {
+  position: relative;
+  gap: 4px;
+  padding: 8px 0 10px 16px;
+  border-left: 2px solid var(--line);
+}
+
+.ai-step::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: 13px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.ai-step[data-stage="analyze"]::before {
+  background: var(--info);
+}
+
+.ai-step[data-stage="answer"]::before {
+  background: var(--accent);
+}
+
+.ai-step[data-stage="result"]::before {
+  background: var(--ink);
+}
+
+.ai-step-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ai-step-head time {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-step-head strong {
+  font-size: 13px;
+}
+
+.ai-step-text {
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ai-step[data-stage="screen"] .ai-step-text {
+  color: var(--muted);
+}
+
+.ai-step[data-stage="result"] .ai-step-text {
+  font-weight: 800;
+}
+
+.ai-step blockquote {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ai-steps-empty {
+  padding: 12px 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 /* Status lines (toolbar subtitles, form messages) are coloured by app.js setStatus(). */
 .status-text[data-tone="error"],
 .auth-message[data-tone="error"] {
@@ -2401,13 +2535,24 @@ code {
   }
 
   .header-tools .user-menu-trigger {
-    max-width: 112px;
+    max-width: 104px;
     padding: 0 10px;
     font-size: 13px;
   }
 
   #user-menu-trigger {
-    max-width: 96px;
+    max-width: 88px;
+  }
+
+  /* Only the coloured dot fits on a phone header; the title still explains the state. */
+  .live-indicator {
+    width: 28px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .live-indicator .live-label {
+    display: none;
   }
 
   .nav-tab {

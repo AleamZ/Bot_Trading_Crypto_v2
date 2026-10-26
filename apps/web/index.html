@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SMC Futures Bot</title>
     <!-- Cloudflare caches .css/.js for 4h: bump ?v= here and in app.js whenever styles.css, app.js or chart/ change. -->
-    <link rel="stylesheet" href="/styles.css?v=20261026-2" />
+    <link rel="stylesheet" href="/styles.css?v=20261026-3" />
     <link rel="modulepreload" href="./apiClient.js" />
     <script>
       // Pick the theme before first paint so dark mode does not flash light.
@@ -45,6 +45,10 @@
             <button id="logout-button" type="button">Logout</button>
           </div>
         </div>
+        <span class="live-indicator" id="live-indicator" data-state="off" role="status" hidden>
+          <span class="live-dot" aria-hidden="true"></span>
+          <span class="live-label" id="live-label">Live</span>
+        </span>
         <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode">
           <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
           <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>
@@ -312,6 +316,16 @@
             </div>
           </div>
           <ol id="events"></ol>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>AI đang làm gì</h2>
+            <span id="ai-steps-count">Realtime</span>
+          </div>
+          <ol class="ai-steps" id="ai-steps">
+            <li class="ai-steps-empty">Đang kết nối realtime…</li>
+          </ol>
         </section>
 
         <section class="panel">
@@ -885,6 +899,6 @@
       </section>
     </div>
     <script src="./app-config.js"></script>
-    <script type="module" src="./app.js?v=20261026-2"></script>
+    <script type="module" src="./app.js?v=20261026-3"></script>
   </body>
 </html>

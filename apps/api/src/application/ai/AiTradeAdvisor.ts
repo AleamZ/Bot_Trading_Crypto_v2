@@ -67,6 +67,19 @@ export interface AiDecisionRecord {
   latencyMs: number;
 }
 
+/** Why the advisor did not ask the model on a scan. */
+export type AiScreenSkip = "IN_FLIGHT" | "ALREADY_CONSULTED" | "HAS_POSITION" | "SETUP_ARCHIVED" | "TREND_NEUTRAL" | "LOW_EVIDENCE";
+
+type AiStepBody =
+  | { stage: "screen"; skip: AiScreenSkip; setupState: string; evidence: number; trend: string }
+  | { stage: "analyze"; model: string; mode: "AUTO" | "ADVISORY"; setupState: string; evidence: number; trend: string; livePrice: number | null }
+  | { stage: "answer"; latencyMs: number; decision: AiDecision }
+  | { stage: "check"; gate: "rules" | "duplicate" | "risk"; ok: boolean; code: string | null; reason: string | null; riskReward: number | null }
+  | { stage: "result"; outcome: AiDecisionOutcome; rejectCode: string | null; rejectReason: string | null; executionIntentId: string | null; latencyMs: number };
+
+/** One observable step of the advisor (what it checked, asked, got back and decided), for the live dashboard. */
+export type AiProgressStep = { id: string; symbol: string; at: number } & AiStepBody;
+
 /** What the scanner hands the advisor for one symbol after it processed that symbol's candles. */
 export interface AiScanContext {
   symbol: string;
@@ -100,6 +113,8 @@ export interface AiTradeAdvisorOptions {
   execution: ExecutionGateway;
   logger: DecisionLogger;
   now?: () => number;
+  /** Receives every step as it happens; must not throw (errors are logged and ignored). */
+  onProgress?: (step: AiProgressStep) => void;
 }
 
 /**
@@ -118,7 +133,13 @@ export class AiTradeAdvisor implements AiScanHook {
 
   onScan(context: AiScanContext): void {
     try {
-      if (!this.shouldConsult(context)) return;
+      const skip = this.screen(context);
+      if (skip === "AI_OFF") return;
+      if (skip) {
+        const diagnostic = context.engine.getSetupDiagnostic();
+        this.progress(context.symbol, { stage: "screen", skip, setupState: diagnostic.state, evidence: diagnostic.evidenceCount, trend: diagnostic.trend });
+        return;
+      }
       this.consultedCandle.set(context.symbol, context.m5CloseTime);
       const task = this.consult(context)
         .catch((error: unknown) => {
@@ -137,12 +158,22 @@ export class AiTradeAdvisor implements AiScanHook {
     while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight.values()]);
   }
 
-  private shouldConsult(context: AiScanContext): boolean {
-    if (context.config().aiTradingMode === "OFF") return false;
-    if (this.inFlight.has(context.symbol)) return false;
-    if (this.consultedCandle.get(context.symbol) === context.m5CloseTime) return false;
-    if (context.engine.getState().openPositions > 0 || context.hasActiveEntry()) return false;
-    return isEligibleSetup(context.engine.getSetupDiagnostic());
+  /** null = ask the model now; otherwise why not ("AI_OFF" is silent). */
+  private screen(context: AiScanContext): AiScreenSkip | "AI_OFF" | null {
+    if (context.config().aiTradingMode === "OFF") return "AI_OFF";
+    if (this.inFlight.has(context.symbol)) return "IN_FLIGHT";
+    if (this.consultedCandle.get(context.symbol) === context.m5CloseTime) return "ALREADY_CONSULTED";
+    if (context.engine.getState().openPositions > 0 || context.hasActiveEntry()) return "HAS_POSITION";
+    return setupSkipReason(context.engine.getSetupDiagnostic());
+  }
+
+  private progress(symbol: string, body: AiStepBody): void {
+    if (!this.options.onProgress) return;
+    try {
+      this.options.onProgress({ id: crypto.randomUUID(), symbol, at: this.now(), ...body });
+    } catch (error) {
+      this.options.logger.warn("[AI] progress listener failed", { symbol, error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   private async consult(context: AiScanContext): Promise<void> {
@@ -186,7 +217,24 @@ export class AiTradeAdvisor implements AiScanHook {
     const finish = async (patch: Partial<AiDecisionRecord>): Promise<void> => {
       Object.assign(record, patch, { latencyMs: this.now() - startedAt });
       await this.saveDecision(record);
+      this.progress(context.symbol, {
+        stage: "result",
+        outcome: record.outcome,
+        rejectCode: record.rejectCode,
+        rejectReason: record.rejectReason,
+        executionIntentId: record.executionIntentId,
+        latencyMs: record.latencyMs
+      });
     };
+    this.progress(context.symbol, {
+      stage: "analyze",
+      model,
+      mode: effectiveMode,
+      setupState: diagnostic.state,
+      evidence: diagnostic.evidenceCount,
+      trend: diagnostic.trend,
+      livePrice: snapshot.livePrice
+    });
 
     let content: string;
     try {
@@ -207,6 +255,7 @@ export class AiTradeAdvisor implements AiScanHook {
       return;
     }
     record.decision = decision;
+    this.progress(context.symbol, { stage: "answer", latencyMs: this.now() - startedAt, decision });
     if (decision.action === "SKIP") {
       await finish({ outcome: "SKIPPED", rejectReason: decision.reason || null });
       return;
@@ -225,6 +274,14 @@ export class AiTradeAdvisor implements AiScanHook {
       minimumRiskReward: currentConfig.minimumRiskReward,
       aiMinConfidence: currentConfig.aiMinConfidence,
       entryMode: currentConfig.entryMode
+    });
+    this.progress(context.symbol, {
+      stage: "check",
+      gate: "rules",
+      ok: validation.ok,
+      code: validation.ok ? null : validation.code,
+      reason: validation.ok ? null : validation.reason,
+      riskReward: validation.ok ? validation.riskReward : null
     });
     if (!validation.ok) {
       await finish({ outcome: "REJECTED", rejectCode: validation.code, rejectReason: validation.reason });
@@ -245,12 +302,21 @@ export class AiTradeAdvisor implements AiScanHook {
     }
 
     const duplicate = await this.duplicateEntryReason(context);
+    this.progress(context.symbol, { stage: "check", gate: "duplicate", ok: !duplicate, code: duplicate ? "DUPLICATE_ENTRY_GUARD" : null, reason: duplicate, riskReward: null });
     if (duplicate) {
       await finish({ outcome: "REJECTED", accepted: false, rejectCode: "DUPLICATE_ENTRY_GUARD", rejectReason: duplicate });
       return;
     }
 
     const risk = await context.engine.assessRisk(validation.plan, this.now());
+    this.progress(context.symbol, {
+      stage: "check",
+      gate: "risk",
+      ok: risk.accepted,
+      code: risk.accepted ? null : `RISK_${risk.rejectCode ?? "REJECTED"}`,
+      reason: risk.accepted ? null : risk.reason,
+      riskReward: validation.riskReward
+    });
     if (!risk.accepted) {
       await finish({ outcome: "REJECTED", accepted: false, rejectCode: `RISK_${risk.rejectCode ?? "REJECTED"}`, rejectReason: risk.reason });
       return;
@@ -314,8 +380,13 @@ export class AiTradeAdvisor implements AiScanHook {
 }
 
 export function isEligibleSetup(diagnostic: ReturnType<TradingEngine["getSetupDiagnostic"]>): boolean {
-  if (diagnostic.state === "Archived" || diagnostic.trend === "neutral") return false;
-  return diagnostic.state === "ReadyToEnter" || diagnostic.evidenceCount >= AI_MIN_EVIDENCE;
+  return setupSkipReason(diagnostic) === null;
+}
+
+function setupSkipReason(diagnostic: ReturnType<TradingEngine["getSetupDiagnostic"]>): AiScreenSkip | null {
+  if (diagnostic.state === "Archived") return "SETUP_ARCHIVED";
+  if (diagnostic.trend === "neutral") return "TREND_NEUTRAL";
+  return diagnostic.state === "ReadyToEnter" || diagnostic.evidenceCount >= AI_MIN_EVIDENCE ? null : "LOW_EVIDENCE";
 }
 
 /** Normalizes the model's JSON. Returns null when there is no usable action at all. */

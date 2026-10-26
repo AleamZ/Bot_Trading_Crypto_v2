@@ -7,7 +7,7 @@ import { toExecutionSource } from "../src/infrastructure/execution/PostgresExecu
 import { MemoryTradingRepository } from "../src/infrastructure/persistence/MemoryTradingRepository.js";
 import { defaultTradingSettings, validateTradingSettings, type AppConfig } from "../src/application/config/AppConfig.js";
 import { resolveSettingsInput } from "../src/application/config/TradingPresets.js";
-import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor, validateAiDecision, type AiDecision } from "../src/application/ai/AiTradeAdvisor.js";
+import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor, validateAiDecision, type AiDecision, type AiProgressStep } from "../src/application/ai/AiTradeAdvisor.js";
 import { AI_DECISION_SYSTEM_PROMPT, buildAiDecisionMessages, buildBotAnalysisSnapshot, renderBotAnalysisSkillMarkdown } from "../src/application/ai/BotAnalysisSkill.js";
 import { LlmRequestError, LocalLlmClient, extractJsonObject, type LlmChatRequest, type LlmChatResponse, type LlmClient } from "../src/application/ai/LocalLlmClient.js";
 import type { ExecutionGateway, ExecutionOrderContext, SubmittedOrder } from "../src/application/ports/ExecutionGateway.js";
@@ -293,6 +293,75 @@ describe("AI trade advisor in the scan flow", () => {
   });
 });
 
+describe("AI advisor progress steps", () => {
+  it("reports analyze, answer, rule check and result for an ADVISORY consultation", async () => {
+    const h = harness({ candles: solCandles(true), mode: "ADVISORY", reply: enterFromPlan });
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+
+    expect(h.steps.map((step) => step.stage)).toEqual(["analyze", "answer", "check", "result"]);
+    expect(h.steps[0]).toMatchObject({ symbol: "SOLUSDT", model: "cx/gpt-5.6-sol", mode: "ADVISORY", setupState: "ReadyToEnter", evidence: 7, trend: "bullish", livePrice: 82.62 });
+    expect(h.steps[1]).toMatchObject({ stage: "answer", decision: expect.objectContaining({ action: "ENTER", direction: "bullish" }) });
+    expect(h.steps[2]).toMatchObject({ stage: "check", gate: "rules", ok: true, code: null });
+    expect(h.steps[3]).toMatchObject({ stage: "result", outcome: "ADVISORY", rejectCode: null });
+    expect(new Set(h.steps.map((step) => step.id)).size).toBe(4);
+  });
+
+  it("reports the failed gate and the rejected result in AUTO", async () => {
+    const h = harness({ candles: solCandles(true), mode: "OFF", reply: (snapshotPlan) => enterFromPlan(snapshotPlan, undefined, { confidence: 0.2 }) });
+    await h.scanner.scan();
+    expect(h.steps).toHaveLength(0);
+
+    h.scanner.updateConfig(config({ aiTradingMode: "AUTO", tradingEnabled: true }));
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+
+    expect(h.steps.find((step) => step.stage === "analyze")).toMatchObject({ mode: "AUTO" });
+    expect(h.steps.find((step) => step.stage === "check")).toMatchObject({ gate: "rules", ok: false, code: "LOW_CONFIDENCE" });
+    expect(h.steps.at(-1)).toMatchObject({ stage: "result", outcome: "REJECTED", rejectCode: "LOW_CONFIDENCE" });
+  });
+
+  it("reports the duplicate and risk gates before submitting in AUTO", async () => {
+    const h = harness({ candles: solCandles(true), mode: "OFF", reply: enterFromPlan });
+    await h.scanner.scan();
+    h.scanner.updateConfig(config({ aiTradingMode: "AUTO", tradingEnabled: true }));
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+
+    const gates = h.steps.filter((step) => step.stage === "check");
+    expect(gates).toEqual([
+      expect.objectContaining({ gate: "rules", ok: true }),
+      expect.objectContaining({ gate: "duplicate", ok: true }),
+      expect.objectContaining({ gate: "risk", ok: true })
+    ]);
+    expect(h.steps.at(-1)).toMatchObject({ stage: "result", outcome: "SUBMITTED" });
+  });
+
+  it("explains why it did not ask the model, and stays silent when OFF", async () => {
+    const early = harness({ candles: solCandles(false).slice(0, 5), mode: "ADVISORY", reply: skip });
+    await early.scanner.scan();
+    expect(early.steps).toEqual([expect.objectContaining({ stage: "screen", symbol: "SOLUSDT", skip: expect.stringMatching(/^(LOW_EVIDENCE|TREND_NEUTRAL)$/) })]);
+
+    const again = harness({ candles: solCandles(true), mode: "ADVISORY", reply: skip });
+    await again.scanner.scan();
+    await again.scanner.whenAiIdle();
+    await again.scanner.scan();
+    expect(again.steps.at(-1)).toMatchObject({ stage: "screen", skip: "ALREADY_CONSULTED", evidence: 7 });
+
+    const off = harness({ candles: solCandles(true), mode: "OFF", reply: skip });
+    await off.scanner.scan();
+    expect(off.steps).toHaveLength(0);
+  });
+
+  it("reports an LLM failure as an LLM_ERROR result without an answer step", async () => {
+    const h = harness({ candles: solCandles(true), mode: "ADVISORY", reply: () => Promise.reject(new LlmRequestError("LLM_TIMEOUT", "timed out")) });
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+    expect(h.steps.map((step) => step.stage)).toEqual(["analyze", "result"]);
+    expect(h.steps[1]).toMatchObject({ outcome: "LLM_ERROR", rejectCode: "LLM_TIMEOUT" });
+  });
+});
+
 describe("Execution origin", () => {
   it("round-trips the intent source in the memory repository", async () => {
     const repository = new MemoryExecutionIntentRepository();
@@ -408,6 +477,7 @@ function harness(options: {
   });
   let scanner: MarketScanner | null = null;
   const llm = new FakeLlm((request) => options.reply(scanner?.getSetupDiagnostic("SOLUSDT")?.entryPlan ?? null, request));
+  const steps: AiProgressStep[] = [];
   const advisor = new AiTradeAdvisor({
     tradingAccountId: ACCOUNT,
     accountMode: options.accountMode ?? "DEMO",
@@ -415,7 +485,8 @@ function harness(options: {
     defaultModel: "cx/gpt-5.6-sol",
     repository,
     execution,
-    logger: fakeLogger()
+    logger: fakeLogger(),
+    onProgress: (step) => steps.push(step)
   });
   scanner = new MarketScanner(
     config({ aiTradingMode: options.mode, tradingEnabled: options.tradingEnabled ?? false }),
@@ -434,6 +505,7 @@ function harness(options: {
     llm,
     delegate,
     repository,
+    steps,
     decisions: async () => (await repository.listAuditEvents(ACCOUNT, undefined, 100, AI_DECISION_AUDIT_TYPE)).map((event) => ({ ...event.metadata, executionIntentId: event.executionIntentId }))
   };
 }

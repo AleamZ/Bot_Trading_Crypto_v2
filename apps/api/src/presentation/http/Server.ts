@@ -37,6 +37,7 @@ import type { MarketStructureSignal } from "../../domain/market-structure/Market
 import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 import { getPostgresPoolObservability } from "../../infrastructure/persistence/PgPoolFactory.js";
+import { streamAccountLiveUpdates } from "./LiveStream.js";
 
 export interface HttpServerParams {
   port: number;
@@ -153,6 +154,7 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
           service: params.tradingAccounts,
           config: runtimeConfig,
           marketData,
+          logger: params.logger,
           ...(params.runtimeManager ? { runtimeManager: params.runtimeManager } : {})
         });
         return;
@@ -547,8 +549,9 @@ async function handleTradingAccountRoute(params: {
   runtimeManager?: TradingRuntimeManager;
   config: AppConfig;
   marketData: BinanceFuturesMarketData;
+  logger: DecisionLogger;
 }): Promise<void> {
-  const { request, response, requestUrl, corsHeaders, userId, service, runtimeManager, config, marketData } = params;
+  const { request, response, requestUrl, corsHeaders, userId, service, runtimeManager, config, marketData, logger } = params;
   const parts = requestUrl.pathname.split("/").filter(Boolean);
   const accountId = parts[2] ?? null;
   const child = parts[3] ?? null;
@@ -823,6 +826,16 @@ async function handleTradingAccountRoute(params: {
     }
     await service.getOwnedAccount(userId, accountId);
     sendJson(response, 200, { events: await runtimeManager.listExecutionAuditEvents(accountId, parts[4], 200) }, corsHeaders);
+    return;
+  }
+
+  if (child === "stream" && parts.length === 4 && request.method === "GET") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    await streamAccountLiveUpdates({ request, response, corsHeaders, accountId, runtimeManager, logger });
     return;
   }
 

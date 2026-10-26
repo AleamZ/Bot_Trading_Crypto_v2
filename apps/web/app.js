@@ -1,8 +1,13 @@
-import { apiFetch } from "./apiClient.js";
+import { apiFetch, apiUrl } from "./apiClient.js";
 
 const $ = (id) => document.getElementById(id);
 const HOME_POLL_INTERVAL_MS = 10_000;
 const CHART_POLL_INTERVAL_MS = 10_000;
+// While the live stream is up it carries the monitor data; the snapshot only refreshes balances and daily risk.
+const LIVE_SNAPSHOT_INTERVAL_MS = 60_000;
+// After the server refuses the stream (e.g. runtime unavailable), poll and try the stream again this much later.
+const LIVE_RETRY_MS = 30_000;
+const AI_STEPS_KEPT = 60;
 const LAST_MAIN_VIEW_STORAGE_KEY = "smc-futures-bot:last-main-view";
 const THEME_STORAGE_KEY = "smc-futures-bot:theme";
 const MAIN_VIEWS = new Set(["home", "chart", "analysis", "settings"]);
@@ -30,6 +35,20 @@ const activityState = {
   events: [],
   symbolFilter: "all",
   typeFilter: "all",
+};
+const homeState = {
+  snapshot: null,
+  snapshotAt: 0,
+};
+// Server-Sent Events from /api/trading-accounts/:id/stream; status off | connecting | live | polling.
+const liveState = {
+  source: null,
+  accountId: null,
+  status: "off",
+  retryTimer: null,
+  monitor: null,
+  store: null,
+  aiSteps: [],
 };
 const defaultSettings = {
   watchlist: "",
@@ -289,6 +308,8 @@ function showLoggedOut() {
   authState.user = null;
   stopHomePolling();
   stopChartPolling();
+  closeLiveStream();
+  Object.assign(homeState, { snapshot: null, snapshotAt: 0 });
   settingsRequestSequence += 1;
   analysisRequestSequence += 1;
   dashboardRequestSequence += 1;
@@ -395,6 +416,8 @@ function setActiveTradingAccount(account) {
   // The home cards still show the previous account until its first snapshot arrives.
   $("home-view").dataset.loading = "true";
   setHomeAlert(null);
+  Object.assign(homeState, { snapshot: null, snapshotAt: 0 });
+  openLiveStream(account.id);
   Object.assign(settingsState, defaultSettings);
   Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
   renderAccountSelector();
@@ -595,6 +618,7 @@ async function deleteActiveAccount() {
 }
 
 async function handleDeletedAccount(deletedAccountId) {
+  closeLiveStream();
   accountState.activeAccount = null;
   accountState.lastConnection = null;
   accountState.lastBinanceAccount = null;
@@ -632,14 +656,75 @@ async function load() {
   if (!snapshotResponse.ok) throw await responseError(snapshotResponse, "Snapshot request");
   const snapshot = await snapshotResponse.json();
   if (sequence !== dashboardRequestSequence || accountId !== accountState.activeAccount?.id || activeView !== "home") return;
+  homeState.snapshot = snapshot;
+  homeState.snapshotAt = Date.now();
   delete $("home-view").dataset.loading;
   setHomeAlert(null);
+  renderHome();
+}
+
+// Home = the last full snapshot (balances and daily risk, polled) overlaid with the live stream's monitor and store.
+function renderHome() {
+  const base = homeState.snapshot;
+  if (!base && !liveState.monitor && !liveState.store) return;
+  const snapshot = { ...(base ?? {}), ...(liveState.monitor ?? {}), ...(liveState.store ?? {}) };
   const engine = snapshot.engine ?? {};
   const runtime = snapshot.runtime ?? {};
   const store = snapshot.store ?? {};
+  const runtimeHealth = snapshot.runtimeHealth ?? {};
+  // Account cards wait for a real snapshot instead of showing "DISCONNECTED" from missing data.
+  if (base) renderAccountCards(base);
+
+  $("engine-state").textContent = engine.setupState ?? "-";
+  const execution = snapshot.execution ?? runtimeHealth.execution ?? {
+    enabled: Boolean(runtimeHealth.executionEnabled),
+    reason: runtimeHealth.executionEnabled ? "READY" : "RECONCILIATION_REQUIRED",
+  };
+  const executionLabel = execution.enabled ? "ENABLED" : "DISABLED";
+  const executionReason = execution.reason ? ` · ${execution.reason}` : "";
+  const realReadiness = snapshot.realReadiness ?? null;
+  const protectionLine = runtimeHealth.protectionStatus && runtimeHealth.protectionStatus !== "OK"
+    ? `Protection ${runtimeHealth.protectionStatus} · Repair attempts ${runtimeHealth.protectionRepairAttempts ?? 0}${runtimeHealth.protectionLastError ? ` · ${runtimeHealth.protectionLastError}` : ""}`
+    : "Protection PROTECTED/VERIFIED";
+  // One fact per line: the Engine card renders these with white-space: pre-line.
+  $("engine-detail").textContent = [
+    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"}`,
+    `Execution ${executionLabel}${executionReason}`,
+    ...(realReadiness
+      ? [
+          `Mode ${realReadiness.realExecutionMode} · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"}`,
+          `Master Live Execution ${realReadiness.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER"} · Execution LOCKED · ${realReadiness.executionReason}`,
+        ]
+      : []),
+    ...(runtimeHealth.lastReconciliationError ? [`Error ${runtimeHealth.lastReconciliationError}`] : []),
+    protectionLine,
+    `Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`,
+  ].join("\n");
+
+  $("trend").textContent = engine.trend ?? "-";
+  $("symbol").textContent = runtime.symbol ?? "-";
+  const htfFvg = store.currentHtfFvg ?? store.currentFvg;
+  $("fvg").textContent = htfFvg
+    ? `${htfFvg.direction} ${htfFvg.status}`
+    : "-";
+  $("fvg-detail").textContent = htfFvg
+    ? `${formatPrice(htfFvg.lower)} - ${formatPrice(htfFvg.upper)} · ${String(htfFvg.status ?? "-").toUpperCase()}`
+    : "No active HTF FVG";
+
+  activityState.events = Array.isArray(store.events) ? store.events : [];
+  renderRecentActivities();
+  if (!$("decision-log-modal").hidden) {
+    renderDecisionLogFilters();
+    renderDecisionLogModal();
+  }
+
+  renderWatchlist(snapshot.watchlistRows ?? []);
+}
+
+function renderAccountCards(snapshot) {
+  const runtime = snapshot.runtime ?? {};
   const account = snapshot.binanceAccount ?? runtime.account ?? {};
   const connection = snapshot.connection ?? {};
-  const runtimeHealth = snapshot.runtimeHealth ?? {};
   const dailyRisk = snapshot.dailyRisk ?? null;
   const accountProtection = snapshot.accountProtection ?? null;
   accountState.lastConnection = connection;
@@ -667,31 +752,6 @@ async function load() {
   $("market-data").textContent = marketData.connected ? "Connected" : "Offline";
   $("market-data-detail").textContent = marketData.label ?? "-";
 
-  $("engine-state").textContent = engine.setupState ?? "-";
-  const execution = snapshot.execution ?? runtimeHealth.execution ?? {
-    enabled: Boolean(runtimeHealth.executionEnabled),
-    reason: runtimeHealth.executionEnabled ? "READY" : "RECONCILIATION_REQUIRED",
-  };
-  const executionLabel = execution.enabled ? "ENABLED" : "DISABLED";
-  const executionReason = execution.reason ? ` · ${execution.reason}` : "";
-  const realReadiness = snapshot.realReadiness ?? null;
-  const protectionLine = runtimeHealth.protectionStatus && runtimeHealth.protectionStatus !== "OK"
-    ? `Protection ${runtimeHealth.protectionStatus} · Repair attempts ${runtimeHealth.protectionRepairAttempts ?? 0}${runtimeHealth.protectionLastError ? ` · ${runtimeHealth.protectionLastError}` : ""}`
-    : "Protection PROTECTED/VERIFIED";
-  // One fact per line: the Engine card renders these with white-space: pre-line.
-  $("engine-detail").textContent = [
-    `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"}`,
-    `Execution ${executionLabel}${executionReason}`,
-    ...(realReadiness
-      ? [
-          `Mode ${realReadiness.realExecutionMode} · Account readiness ${realReadiness.accountReady ? "READY" : "NOT READY"}`,
-          `Master Live Execution ${realReadiness.masterLiveExecutionEnabled ? "UNLOCKED" : "LOCKED BY SERVER"} · Execution LOCKED · ${realReadiness.executionReason}`,
-        ]
-      : []),
-    ...(runtimeHealth.lastReconciliationError ? [`Error ${runtimeHealth.lastReconciliationError}`] : []),
-    protectionLine,
-    `Risk 1R ${formatUsdt(runtime.risk?.riskPerTradeUsdt)} · Max leverage ${runtime.risk?.maxLeverage ?? "-"}x`,
-  ].join("\n");
   $("daily-entry-status").textContent = dailyRisk ? dailyEntryStatusLabel(dailyRisk) : "-";
   $("daily-risk-detail").textContent = dailyRisk
     ? `Today Realized PnL: ${formatSignedNumber(dailyRisk.realizedR)}R (${formatSignedUsdt(dailyRisk.realizedPnlUsdt)})\nDaily Range: -${dailyRisk.dailyLossLimitR}R → +${dailyRisk.dailyProfitLimitR}R`
@@ -700,25 +760,6 @@ async function load() {
   $("account-protection-detail").textContent = accountProtection
     ? `Current Drawdown: ${formatSignedNumber(accountProtection.drawdownPercent)}%\nMax Drawdown: ${accountProtection.maxDrawdownPercent}%`
     : "Account protection unavailable";
-
-  $("trend").textContent = engine.trend ?? "-";
-  $("symbol").textContent = runtime.symbol ?? "-";
-  const htfFvg = store.currentHtfFvg ?? store.currentFvg;
-  $("fvg").textContent = htfFvg
-    ? `${htfFvg.direction} ${htfFvg.status}`
-    : "-";
-  $("fvg-detail").textContent = htfFvg
-    ? `${formatPrice(htfFvg.lower)} - ${formatPrice(htfFvg.upper)} · ${String(htfFvg.status ?? "-").toUpperCase()}`
-    : "No active HTF FVG";
-
-  activityState.events = Array.isArray(store.events) ? store.events : [];
-  renderRecentActivities();
-  if (!$("decision-log-modal").hidden) {
-    renderDecisionLogFilters();
-    renderDecisionLogModal();
-  }
-
-  renderWatchlist(snapshot.watchlistRows ?? []);
 }
 
 function renderRecentActivities() {
@@ -859,21 +900,223 @@ function pollHomeOnce() {
   if (document.hidden) return;
   const accountId = accountState.activeAccount?.id;
   const stillCurrent = () => activeView === "home" && accountId === accountState.activeAccount?.id;
-  load().catch((error) => {
-    if (!stillCurrent()) return;
-    // Nothing loaded yet for this account: stop the placeholders and say the connection state is unknown.
-    if ($("home-view").dataset.loading) {
-      setHeroBadge("account-pill", "UNAVAILABLE", false);
-      $("watchlist-body").replaceChildren(emptyTableRow("Scanner data unavailable", 7));
-    }
-    delete $("home-view").dataset.loading;
-    setHomeAlert(userFacingApiError(error));
-  });
+  const live = liveState.status === "live";
+  if (!live || Date.now() - homeState.snapshotAt >= LIVE_SNAPSHOT_INTERVAL_MS) {
+    load().catch((error) => {
+      if (!stillCurrent()) return;
+      // Nothing loaded yet for this account: stop the placeholders and say the connection state is unknown.
+      if ($("home-view").dataset.loading) {
+        setHeroBadge("account-pill", "UNAVAILABLE", false);
+        if (!liveState.monitor) $("watchlist-body").replaceChildren(emptyTableRow("Scanner data unavailable", 7));
+      }
+      delete $("home-view").dataset.loading;
+      setHomeAlert(userFacingApiError(error));
+    });
+  }
+  // The live stream pushes AI decisions itself.
+  if (live) return;
   loadAiDecisions().catch((error) => {
     if (!stillCurrent()) return;
     $("ai-decision-count").textContent = "Không tải được";
     $("ai-decisions-body").replaceChildren(emptyTableRow(`Không tải được quyết định AI · ${userFacingApiError(error)}`, 6, "error"));
   });
+}
+
+function openLiveStream(accountId) {
+  closeLiveStream();
+  if (!accountId || typeof EventSource === "undefined") {
+    setLiveStatus("polling");
+    return;
+  }
+  const source = new EventSource(apiUrl(`/api/trading-accounts/${accountId}/stream`), { withCredentials: true });
+  liveState.source = source;
+  liveState.accountId = accountId;
+  setLiveStatus("connecting");
+  const isCurrent = () => liveState.source === source;
+  const on = (event, handler) => {
+    source.addEventListener(event, (message) => {
+      if (!isCurrent()) return;
+      let data;
+      try {
+        data = JSON.parse(message.data);
+      } catch {
+        return;
+      }
+      handler(data);
+    });
+  };
+
+  source.addEventListener("open", () => {
+    if (isCurrent()) setLiveStatus("live");
+  });
+  source.addEventListener("error", () => {
+    if (!isCurrent()) return;
+    // Old live data must not cover fresher polled data while the stream is down.
+    liveState.monitor = null;
+    liveState.store = null;
+    if (source.readyState === EventSource.CLOSED) {
+      // The server refused the stream (runtime unavailable, signed out...): poll, and retry later.
+      liveState.source = null;
+      setLiveStatus("polling");
+      liveState.retryTimer = setTimeout(() => {
+        if (liveState.accountId === accountId && !liveState.source) openLiveStream(accountId);
+      }, LIVE_RETRY_MS);
+    } else {
+      setLiveStatus("connecting");
+    }
+    if (activeView === "home") pollHomeOnce();
+  });
+  on("monitor", (data) => {
+    liveState.monitor = data;
+    renderHome();
+  });
+  on("store", (data) => {
+    liveState.store = data;
+    renderHome();
+  });
+  on("ai-decisions", (data) => renderAiDecisions(Array.isArray(data.decisions) ? data.decisions : []));
+  on("ai-steps", (data) => {
+    liveState.aiSteps = Array.isArray(data.steps) ? data.steps.slice(-AI_STEPS_KEPT) : [];
+    renderAiSteps();
+  });
+  on("ai-step", (step) => {
+    liveState.aiSteps = [...liveState.aiSteps, step].slice(-AI_STEPS_KEPT);
+    renderAiSteps();
+  });
+  // A fresh scan changes Analysis and the chart overlays of that symbol.
+  on("scanned", (data) => {
+    const symbols = Array.isArray(data.symbols) ? data.symbols : [];
+    if (activeView === "analysis" && symbols.includes(currentAnalysisSymbol())) loadAnalysis({ quiet: true });
+    if (activeView === "chart" && symbols.includes(($("chart-symbol").value || DEFAULT_SYMBOL).trim().toUpperCase())) pollChartOnce();
+  });
+}
+
+function closeLiveStream() {
+  liveState.source?.close();
+  if (liveState.retryTimer) clearTimeout(liveState.retryTimer);
+  Object.assign(liveState, { source: null, accountId: null, retryTimer: null, monitor: null, store: null, aiSteps: [] });
+  setLiveStatus("off");
+  renderAiSteps();
+}
+
+function setLiveStatus(status) {
+  liveState.status = status;
+  const indicator = $("live-indicator");
+  indicator.hidden = status === "off";
+  indicator.dataset.state = status;
+  $("live-label").textContent = status === "live" ? "Live" : status === "connecting" ? "Connecting" : "Polling";
+  indicator.title =
+    status === "live"
+      ? "Realtime: dữ liệu được đẩy ngay khi bot quét xong"
+      : status === "connecting"
+        ? "Đang kết nối realtime…"
+        : "Không có kết nối realtime, đang cập nhật mỗi 10 giây";
+  if (status !== "live") renderAiSteps();
+}
+
+const AI_SCREEN_TEXT = {
+  IN_FLIGHT: "đang chờ model trả lời lần trước",
+  ALREADY_CONSULTED: "đã phân tích nến M5 này rồi",
+  HAS_POSITION: "symbol đang có vị thế hoặc lệnh chờ",
+  SETUP_ARCHIVED: "setup đã bị huỷ",
+  TREND_NEUTRAL: "trend H1 trung tính",
+  LOW_EVIDENCE: "setup chưa đủ điều kiện (cần ≥ 5/7 hoặc ReadyToEnter)",
+};
+const AI_GATE_TEXT = { rules: "quy tắc chiến lược", duplicate: "chống trùng lệnh", risk: "quản lý rủi ro" };
+
+// What the AI advisor checked, asked, got back and decided, newest first.
+function renderAiSteps() {
+  const list = $("ai-steps");
+  const steps = liveState.aiSteps;
+  $("ai-steps-count").textContent = steps.length > 0 ? `${steps.length} bước gần nhất` : "Realtime";
+  if (steps.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "ai-steps-empty";
+    empty.textContent =
+      liveState.status === "live"
+        ? "Chưa có hoạt động AI. Bật Chế độ AI (ADVISORY hoặc AUTO) trong Setting: mỗi lần bot quét, AI sẽ báo đang kiểm tra gì và quyết định gì."
+        : liveState.status === "connecting"
+          ? "Đang kết nối realtime…"
+          : "Cần kết nối realtime để xem AI đang làm gì.";
+    list.replaceChildren(empty);
+    return;
+  }
+  list.replaceChildren(...[...steps].reverse().map(aiStepItem));
+}
+
+function aiStepItem(step) {
+  const view = aiStepView(step);
+  const item = document.createElement("li");
+  const head = document.createElement("div");
+  const time = document.createElement("time");
+  const symbol = document.createElement("strong");
+  const text = document.createElement("p");
+  item.className = "ai-step";
+  item.dataset.stage = step.stage;
+  head.className = "ai-step-head";
+  time.textContent = new Date(step.at).toLocaleTimeString();
+  symbol.textContent = step.symbol;
+  text.className = "ai-step-text";
+  text.textContent = view.text;
+  head.append(time, symbol, badge(view.label, view.tone));
+  item.append(head, text);
+  if (view.quote) {
+    const quote = document.createElement("blockquote");
+    quote.textContent = view.quote;
+    item.append(quote);
+  }
+  return item;
+}
+
+function aiStepView(step) {
+  if (step.stage === "screen") {
+    // An archived setup has no live evidence (Bot Monitor shows 0/7), so its count is left out.
+    const evidence = step.skip === "SETUP_ARCHIVED" ? "" : ` · ${step.evidence}/7 điều kiện`;
+    return {
+      label: "Kiểm tra",
+      tone: "",
+      text: `${step.setupState}${evidence} · trend ${step.trend} → chưa hỏi AI: ${AI_SCREEN_TEXT[step.skip] ?? step.skip}`,
+    };
+  }
+  if (step.stage === "analyze") {
+    return {
+      label: "Đang phân tích",
+      tone: "info",
+      text: `Gửi cho ${step.model} (${step.mode}): trend ${step.trend}, ${step.setupState}, ${step.evidence}/7 điều kiện, giá ${step.livePrice === null ? "-" : formatPrice(step.livePrice)}`,
+    };
+  }
+  if (step.stage === "answer") {
+    const decision = step.decision ?? {};
+    const confidence = Number.isFinite(Number(decision.confidence)) ? `${Math.round(Number(decision.confidence) * 100)}%` : "-";
+    const side = decision.direction === "bullish" ? "LONG" : decision.direction === "bearish" ? "SHORT" : "";
+    const seconds = `${(Number(step.latencyMs ?? 0) / 1000).toFixed(1)}s`;
+    return {
+      label: "AI trả lời",
+      tone: "accent",
+      text:
+        decision.action === "ENTER"
+          ? `Đề xuất VÀO LỆNH ${side} · tin cậy ${confidence} · Entry ${formatPrice(decision.entry)} · SL ${formatPrice(decision.stopLoss)} · TP ${formatPrice(decision.takeProfit)} (${seconds})`
+          : `Đề xuất KHÔNG vào lệnh · tin cậy ${confidence} (${seconds})`,
+      quote: decision.reason || "",
+    };
+  }
+  if (step.stage === "check") {
+    const gate = AI_GATE_TEXT[step.gate] ?? step.gate;
+    return step.ok
+      ? { label: "Đạt", tone: "ok", text: `Kiểm tra ${gate}: đạt${step.riskReward ? ` · R/R ${formatRatio(step.riskReward)}` : ""}` }
+      : { label: "Bị chặn", tone: "danger", text: `Kiểm tra ${gate}: không đạt (${step.code ?? "-"})${step.reason ? ` · ${step.reason}` : ""}` };
+  }
+  return aiResultView(step);
+}
+
+function aiResultView(step) {
+  const reason = step.rejectReason ? ` · ${step.rejectReason}` : "";
+  if (step.outcome === "SUBMITTED") return { label: "Quyết định", tone: "ok", text: `VÀO LỆNH: đã đặt lệnh${step.executionIntentId ? ` (${step.executionIntentId})` : ""}` };
+  if (step.outcome === "ADVISORY") return { label: "Quyết định", tone: "ok", text: `Nên vào lệnh: chỉ ghi lại vì đang ở chế độ ADVISORY${reason}` };
+  if (step.outcome === "SKIPPED") return { label: "Quyết định", tone: "", text: "Không vào lệnh" };
+  if (step.outcome === "REJECTED") return { label: "Quyết định", tone: "danger", text: `Không vào lệnh: bị chặn bởi ${step.rejectCode ?? "-"}${reason}` };
+  if (step.outcome === "EXECUTION_FAILED") return { label: "Quyết định", tone: "danger", text: `Đặt lệnh lỗi${reason}` };
+  return { label: "Lỗi AI", tone: "warn", text: `Không có quyết định (${step.rejectCode ?? "LLM_ERROR"})${reason}` };
 }
 
 function setHomeAlert(message) {
@@ -1364,7 +1607,7 @@ function whenIdle(callback) {
 async function ensureChart() {
   if (chartState.instance) return;
   // Same ?v= as index.html so a cached chart module never pairs with a newer app.js.
-  chartState.module ??= import("./chart/Chart.js?v=20261026-2");
+  chartState.module ??= import("./chart/Chart.js?v=20261026-3");
   const [{ TradingChart }] = await Promise.all([chartState.module, loadChartLibrary()]);
   if (chartState.instance) return;
 
@@ -1409,18 +1652,25 @@ function resizeChart() {
   chartState.instance?.resize();
 }
 
-async function loadAnalysis() {
+function currentAnalysisSymbol() {
+  return $("analysis-symbol").value.trim().toUpperCase() || DEFAULT_SYMBOL;
+}
+
+// quiet: a live refresh after the symbol was scanned, so no "Analyzing" flash or disabled button.
+async function loadAnalysis({ quiet = false } = {}) {
   const accountId = accountState.activeAccount?.id;
   const sequence = ++analysisRequestSequence;
-  const symbol = $("analysis-symbol").value.trim().toUpperCase() || DEFAULT_SYMBOL;
+  const symbol = currentAnalysisSymbol();
   $("analysis-symbol").value = symbol;
   rememberAnalysisSymbol(symbol);
   if (!accountId) {
     setStatus("analysis-status", "Select a trading account");
     return;
   }
-  setStatus("analysis-status", `Analyzing ${symbol}`);
-  $("analysis-run").disabled = true;
+  if (!quiet) {
+    setStatus("analysis-status", `Analyzing ${symbol}`);
+    $("analysis-run").disabled = true;
+  }
 
   try {
     const path = `/api/trading-accounts/${accountId}/analysis?symbol=${encodeURIComponent(symbol)}`;

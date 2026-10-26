@@ -1649,8 +1649,8 @@ function whenIdle(callback) {
 
 async function ensureChart() {
   if (chartState.instance) return;
-  // Same ?v= as index.html so a cached chart module never pairs with a newer app.js.
-  chartState.module ??= import("./chart/Chart.js?v=20261026-4");
+  // The build stamps the same ?v= content hash as index.html, so a cached chart module never pairs with a newer app.js.
+  chartState.module ??= import("./chart/Chart.js?v=dev");
   const [{ TradingChart }] = await Promise.all([chartState.module, loadChartLibrary()]);
   if (chartState.instance) return;
 

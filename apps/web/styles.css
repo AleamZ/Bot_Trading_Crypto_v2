@@ -2390,6 +2390,49 @@ code {
   font-weight: 700;
 }
 
+/* Startup history replay in Bot Monitor: shown until the first live scan. */
+.scan-progress {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--info-line);
+  border-radius: 8px;
+  background: var(--info-soft);
+}
+
+.scan-progress[data-phase="BOOTSTRAP_FAILED"] {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+}
+
+.scan-progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line-soft);
+}
+
+.scan-progress-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--info);
+  transition: width 0.3s ease;
+}
+
+.scan-progress[data-phase="BOOTSTRAP_FAILED"] .scan-progress-fill {
+  background: var(--danger);
+}
+
+.scan-progress small {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
 /* Floating read-only AI chat. */
 .chat-fab {
   position: fixed;

@@ -21,6 +21,21 @@ export interface WatchlistStatus {
   positionSource?: "binance" | "paper" | "engine";
 }
 
+export type ScannerPhase = "NOT_STARTED" | "BOOTSTRAPPING" | "BOOTSTRAP_FAILED" | "WAITING_FIRST_SCAN" | "LIVE";
+
+/** Where the scanner is after a (re)start. AI checks only run on live scans, never during the history replay. */
+export interface ScannerProgress {
+  phase: ScannerPhase;
+  /** Symbols whose history replay finished (successfully or not) in the current bootstrap. */
+  bootstrapped: number;
+  total: number;
+  startedAt: string | null;
+  liveSince: string | null;
+}
+
+/** Symbols replayed at once: hides network/DB latency without flooding the DB pool or Binance. */
+export const BOOTSTRAP_CONCURRENCY = 3;
+
 export class MarketScanner {
   private readonly engines = new Map<string, TradingEngine>();
   private readonly lastCloseTime = new Map<string, number>();
@@ -31,6 +46,7 @@ export class MarketScanner {
   private activePositions = new Map<string, BinanceFuturesPositionStatus>();
   private pendingEntrySymbols = new Set<string>();
   private scanListener: ((symbol: string) => void) | null = null;
+  private progress: ScannerProgress = { phase: "NOT_STARTED", bootstrapped: 0, total: 0, startedAt: null, liveSince: null };
 
   constructor(
     private config: AppConfig,
@@ -116,11 +132,40 @@ export class MarketScanner {
     }
   }
 
-  async bootstrap(): Promise<void> {
-    for (const symbol of this.config.watchlist) {
-      await this.scanSymbol(symbol, true);
-      this.notifyScanned(symbol);
+  /**
+   * Replays each watchlist symbol's history, `concurrency` symbols at a time (engines are per symbol,
+   * so their replays are independent). A failing symbol does not stop the others; the first error is
+   * rethrown at the end so the runtime retries the bootstrap as before.
+   */
+  async bootstrap(concurrency = BOOTSTRAP_CONCURRENCY): Promise<void> {
+    const symbols = [...this.config.watchlist];
+    this.progress = { phase: "BOOTSTRAPPING", bootstrapped: 0, total: symbols.length, startedAt: new Date().toISOString(), liveSince: null };
+    let nextIndex = 0;
+    const failures: unknown[] = [];
+    const worker = async (): Promise<void> => {
+      while (nextIndex < symbols.length) {
+        const symbol = symbols[nextIndex++]!;
+        try {
+          await this.scanSymbol(symbol, true);
+        } catch (error) {
+          failures.push(error);
+          this.logger.error("[SCANNER] symbol bootstrap failed", { symbol, error: error instanceof Error ? error.message : String(error) });
+        }
+        this.progress.bootstrapped += 1;
+        this.notifyScanned(symbol);
+      }
+    };
+    const workers = Math.max(1, Math.min(Math.floor(concurrency), symbols.length));
+    await Promise.all(Array.from({ length: workers }, () => worker()));
+    if (failures.length > 0) {
+      this.progress.phase = "BOOTSTRAP_FAILED";
+      throw failures[0];
     }
+    this.progress.phase = "WAITING_FIRST_SCAN";
+  }
+
+  getProgress(): ScannerProgress {
+    return { ...this.progress };
   }
 
   /** Called after each symbol scan (bootstrap or live, failed or not), e.g. to push the new state to dashboards. */
@@ -171,6 +216,7 @@ export class MarketScanner {
         } catch (error) {
           this.logger.error("[SCANNER] symbol scan failed", { symbol, error: error instanceof Error ? error.message : String(error) });
         }
+        if (this.progress.phase !== "LIVE") this.progress = { ...this.progress, phase: "LIVE", liveSince: new Date().toISOString() };
         this.notifyScanned(symbol);
       }
     } finally {

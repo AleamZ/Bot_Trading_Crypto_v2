@@ -5,6 +5,8 @@ export type LiveChange =
   | { topic: "scan"; symbol: string }
   | { topic: "reconcile" }
   | { topic: "config" }
+  /** The scanner's startup phase changed (bootstrap started, finished or failed). */
+  | { topic: "scanner" }
   | { topic: "ai-step"; step: AiProgressStep }
   /** The runtime is going away (account deleted, execution disabled, shutdown): close streams. */
   | { topic: "closed" };

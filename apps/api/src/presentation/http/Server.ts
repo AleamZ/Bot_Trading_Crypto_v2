@@ -695,6 +695,7 @@ async function handleTradingAccountRoute(params: {
         }),
         store: snapshot.store,
         watchlistRows: snapshot.watchlistStatus,
+        scannerProgress: snapshot.scannerProgress,
         runtimeHealth: snapshot.runtimeHealth,
         execution: snapshot.execution,
         realReadiness: snapshot.realReadiness,

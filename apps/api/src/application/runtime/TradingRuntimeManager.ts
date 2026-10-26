@@ -4,7 +4,7 @@ import type { TradingAccountRepository } from "../trading-account/TradingAccount
 import type { TradingRuntimeConfigRepository } from "../trading-account/TradingRuntimeConfigRepository.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { TradingRepository } from "../ports/Repositories.js";
-import { MarketScanner, type WatchlistStatus } from "../scanner/MarketScanner.js";
+import { MarketScanner, type ScannerProgress, type WatchlistStatus } from "../scanner/MarketScanner.js";
 import { PostgresTradingRepository } from "../../infrastructure/persistence/PostgresTradingRepository.js";
 import { MemoryTradingRepository } from "../../infrastructure/persistence/MemoryTradingRepository.js";
 import { BinanceFuturesMarketData } from "../../infrastructure/market-data/BinanceFuturesMarketData.js";
@@ -52,6 +52,8 @@ export interface AccountSnapshot {
   engine: unknown;
   store: unknown;
   watchlistStatus: WatchlistStatus[];
+  /** Startup history replay, then live scans: AI only runs once the scanner is LIVE. */
+  scannerProgress: ScannerProgress;
   runtimeHealth: RuntimeHealth;
   execution: ExecutionGateState;
   realReadiness: RealTradingReadinessResult | null;
@@ -61,7 +63,7 @@ export interface AccountSnapshot {
 }
 
 /** The part of a snapshot that lives in memory (plus stored bot events): cheap enough to push on every change. */
-export type LiveMonitorState = Pick<AccountSnapshot, "engine" | "store" | "watchlistStatus" | "runtimeHealth" | "execution">;
+export type LiveMonitorState = Pick<AccountSnapshot, "engine" | "store" | "watchlistStatus" | "scannerProgress" | "runtimeHealth" | "execution">;
 
 export interface RuntimeHealth {
   state: "RECOVERING" | "READY" | "DEGRADED" | "DISCONNECTED" | "ERROR" | "SHUTTING_DOWN";
@@ -363,6 +365,7 @@ export class TradingRuntimeManager {
           runtime.scanner.start();
         }
         runtime.scannerBootstrapInFlight = null;
+        this.live.publish(runtime.account.id, { topic: "scanner" });
         // A failed bootstrap used to leave the scanner stopped forever; retry until it succeeds.
         if (!bootstrapSucceeded && !this.shuttingDown) {
           setTimeout(() => {
@@ -372,6 +375,7 @@ export class TradingRuntimeManager {
           }, SCANNER_BOOTSTRAP_RETRY_MS).unref?.();
         }
       });
+    this.live.publish(runtime.account.id, { topic: "scanner" });
   }
 
   async refreshRuntime(accountId: string): Promise<void> {
@@ -472,6 +476,7 @@ export class TradingRuntimeManager {
       engine: runtime.scanner.getPrimaryEngine().getDashboardState(),
       store: await this.retryDatabaseRead("runtime dashboard snapshot", () => runtime.repository.getDashboardSnapshot()),
       watchlistStatus: reconcileWatchlistStatus(runtime.scanner.getWatchlistStatus(), runtime.lastPositions, runtime.configRef.current.executionMode),
+      scannerProgress: runtime.scanner.getProgress(),
       runtimeHealth: { ...runtime.health },
       execution,
       realReadiness,
@@ -489,6 +494,7 @@ export class TradingRuntimeManager {
       engine: runtime.scanner.getPrimaryEngine().getDashboardState(),
       store: await this.retryDatabaseRead("runtime live snapshot", () => runtime.repository.getDashboardSnapshot()),
       watchlistStatus: reconcileWatchlistStatus(runtime.scanner.getWatchlistStatus(), runtime.lastPositions, runtime.configRef.current.executionMode),
+      scannerProgress: runtime.scanner.getProgress(),
       runtimeHealth: { ...runtime.health },
       execution
     };

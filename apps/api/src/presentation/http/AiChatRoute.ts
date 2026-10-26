@@ -160,7 +160,7 @@ export async function buildAiChatContext(params: Pick<AiChatRouteParams, "accoun
       "aiTradingMode",
       "aiMinConfidence"
     ]),
-    runtime: live ? { engine: live.engine, health: live.runtimeHealth, execution: live.execution } : null,
+    runtime: live ? { engine: live.engine, scanner: live.scannerProgress, health: live.runtimeHealth, execution: live.execution } : null,
     watchlist: live?.watchlistStatus ?? [],
     recentEvents: (Array.isArray(store.events) ? store.events : []).slice(-15).map(compactEvent),
     aiDecisions: (decisions ?? []).map((decision) =>

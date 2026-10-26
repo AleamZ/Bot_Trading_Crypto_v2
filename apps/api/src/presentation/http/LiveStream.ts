@@ -53,7 +53,7 @@ export async function streamAccountLiveUpdates(params: {
     response.write(`event: ${event}\ndata: ${payload}\n\n`);
   };
   const sendMonitor = (state: LiveMonitorState): void => {
-    send("monitor", { engine: state.engine, watchlistRows: state.watchlistStatus, runtimeHealth: state.runtimeHealth, execution: state.execution }, true);
+    send("monitor", { engine: state.engine, watchlistRows: state.watchlistStatus, scannerProgress: state.scannerProgress, runtimeHealth: state.runtimeHealth, execution: state.execution }, true);
     send("store", { store: state.store }, true);
   };
 

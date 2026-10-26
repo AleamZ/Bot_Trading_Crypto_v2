@@ -53,20 +53,20 @@ export class PostgresTradingRepository implements TradingRepository {
     await this.saveFvg(fvg);
   }
 
+  // Runs on many replayed M5 candles: filter and pick the newest usable FVG in the database
+  // instead of shipping every FVG ever saved for the symbol.
   async getActiveOrWaitingFvg(symbol: string, timeframe?: Fvg["timeframe"]): Promise<Fvg | null> {
     const result = await this.pool.query(
       `select payload from trading_records
        where kind = 'fvg' and symbol = $1 and ($2::text is null or payload->>'timeframe' = $2)
          and (($3::uuid is null and trading_account_id is null) or trading_account_id = $3::uuid)
-       order by (payload->>'createdAt')::numeric desc`,
-      [symbol, timeframe ?? null, this.tradingAccountId]
+         and payload->>'status' = any($4::text[])
+       order by (payload->>'createdAt')::numeric desc
+       limit 1`,
+      [symbol, timeframe ?? null, this.tradingAccountId, USABLE_FVG_STATUSES]
     );
-    for (const row of result.rows as Array<{ payload: Fvg }>) {
-      if (isUsableFvgStatus(row.payload.status)) {
-        return row.payload;
-      }
-    }
-    return null;
+    const row = result.rows[0] as { payload: Fvg } | undefined;
+    return row?.payload ?? null;
   }
 
   async saveSignal(signal: MarketStructureSignal): Promise<void> {
@@ -142,9 +142,8 @@ export class PostgresTradingRepository implements TradingRepository {
   }
 }
 
-function isUsableFvgStatus(status: Fvg["status"]): boolean {
-  return status === "untouched" || status === "touched" || status === "active" || status === "waiting-mitigation";
-}
+// Same set as MemoryTradingRepository's isUsableFvgStatus.
+const USABLE_FVG_STATUSES: readonly Fvg["status"][] = ["untouched", "touched", "active", "waiting-mitigation"];
 
 export async function createRepository(databaseUrl?: string): Promise<TradingRepository> {
   if (!databaseUrl) {

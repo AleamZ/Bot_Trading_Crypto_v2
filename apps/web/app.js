@@ -729,9 +729,11 @@ function renderHome() {
   const protectionLine = runtimeHealth.protectionStatus && runtimeHealth.protectionStatus !== "OK"
     ? `Protection ${runtimeHealth.protectionStatus} · Repair attempts ${runtimeHealth.protectionRepairAttempts ?? 0}${runtimeHealth.protectionLastError ? ` · ${runtimeHealth.protectionLastError}` : ""}`
     : "Protection PROTECTED/VERIFIED";
+  const scanner = scannerProgressView(snapshot.scannerProgress);
   // One fact per line: the Engine card renders these with white-space: pre-line.
   $("engine-detail").textContent = [
     `Runtime ${runtimeHealth.state ?? "-"} · Reconciliation ${runtimeHealth.reconciliationStatus ?? "-"}`,
+    ...(scanner ? [scanner.line] : []),
     `Execution ${executionLabel}${executionReason}`,
     ...(realReadiness
       ? [
@@ -762,6 +764,56 @@ function renderHome() {
   }
 
   renderWatchlist(snapshot.watchlistRows ?? []);
+  renderScanProgress(snapshot.scannerProgress, scanner);
+  if (liveState.aiSteps.length === 0) renderAiSteps();
+}
+
+// Startup history replay, then live scans. AI checks and new entries only happen on live scans.
+function scannerProgressView(progress) {
+  if (!progress || !progress.phase) return null;
+  const count = `${progress.bootstrapped ?? 0}/${progress.total ?? 0}`;
+  switch (progress.phase) {
+    case "BOOTSTRAPPING":
+      return {
+        line: `Scanner quét khởi động ${count} symbol`,
+        bar: `Đang quét khởi động ${count} symbol (dựng lại setup từ lịch sử nến). AI và lệnh mới bắt đầu sau khi quét xong.`,
+        ai: `Bot đang quét khởi động (${count} symbol). AI bắt đầu kiểm tra sau khi quét xong, ở lượt quét live đầu tiên.`,
+      };
+    case "WAITING_FIRST_SCAN":
+      return {
+        line: `Scanner khởi động xong ${count} · chờ lượt quét live đầu tiên`,
+        bar: `Quét khởi động xong ${count} symbol. Lượt quét live đầu tiên chạy ở đầu phút tới.`,
+        ai: "Quét khởi động đã xong. AI bắt đầu kiểm tra ở lượt quét live đầu tiên (trong vòng 1 phút).",
+      };
+    case "BOOTSTRAP_FAILED":
+      return {
+        line: `Scanner khởi động lỗi (${count}) · tự thử lại sau 1 phút`,
+        bar: `Quét khởi động bị lỗi (${count} symbol đã chạy). Bot tự thử lại sau 1 phút.`,
+        ai: "Quét khởi động bị lỗi, bot tự thử lại sau 1 phút. AI chưa chạy cho tới khi quét xong.",
+      };
+    case "LIVE":
+      return { line: `Scanner LIVE${progress.liveSince ? ` từ ${new Date(progress.liveSince).toLocaleTimeString()}` : ""}`, bar: null, ai: null };
+    default:
+      return { line: "Scanner chưa chạy", bar: "Scanner chưa chạy.", ai: "Scanner chưa chạy nên AI chưa có gì để kiểm tra." };
+  }
+}
+
+function currentScannerProgress() {
+  return liveState.monitor?.scannerProgress ?? homeState.snapshot?.scannerProgress ?? null;
+}
+
+function renderScanProgress(progress, view) {
+  const box = $("scan-progress");
+  box.hidden = !view?.bar;
+  if (box.hidden) return;
+  const total = Math.max(0, progress.total ?? 0);
+  const done = Math.min(total, Math.max(0, progress.bootstrapped ?? 0));
+  box.dataset.phase = progress.phase;
+  box.setAttribute("aria-valuemax", String(total));
+  box.setAttribute("aria-valuenow", String(done));
+  $("scan-progress-fill").style.width = total > 0 ? `${(done / total) * 100}%` : "0%";
+  $("scan-progress-text").textContent = view.bar;
+  if (progress.phase !== "LIVE") $("watchlist-count").textContent = `${total} symbols · khởi động ${done}/${total}`;
 }
 
 function renderAccountCards(snapshot) {
@@ -1075,9 +1127,10 @@ function renderAiSteps() {
   if (steps.length === 0) {
     const empty = document.createElement("li");
     empty.className = "ai-steps-empty";
+    const scannerWait = scannerProgressView(currentScannerProgress())?.ai;
     empty.textContent =
       liveState.status === "live"
-        ? "Chưa có hoạt động AI. Bật Chế độ AI (ADVISORY hoặc AUTO) trong Setting: mỗi lần bot quét, AI sẽ báo đang kiểm tra gì và quyết định gì."
+        ? scannerWait ?? "Chưa có hoạt động AI. Bật Chế độ AI (ADVISORY hoặc AUTO) trong Setting: mỗi lần bot quét, AI sẽ báo đang kiểm tra gì và quyết định gì."
         : liveState.status === "connecting"
           ? "Đang kết nối realtime…"
           : "Cần kết nối realtime để xem AI đang làm gì.";

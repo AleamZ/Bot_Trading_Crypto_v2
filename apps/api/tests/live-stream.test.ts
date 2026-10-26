@@ -84,6 +84,7 @@ describe("account live stream (SSE)", () => {
     expect(h.last("monitor")).toEqual({
       engine: { setupState: "WaitingLtfFvg" },
       watchlistRows: [{ symbol: "BTCUSDT", status: "Monitoring" }],
+      scannerProgress: { phase: "BOOTSTRAPPING", bootstrapped: 2, total: 9, startedAt: "2026-10-26T00:00:00.000Z", liveSince: null },
       runtimeHealth: { state: "READY" },
       execution: { enabled: true, reason: "READY" }
     });
@@ -107,6 +108,17 @@ describe("account live stream (SSE)", () => {
     expect(h.last("scanned")).toMatchObject({ symbols: ["BTCUSDT", "ETHUSDT"] });
     // Both scans arrived in one burst and were read once.
     expect(h.runtime.getLiveState).toHaveBeenCalledTimes(2);
+  });
+
+  it("pushes the scanner phase when the bootstrap finishes", async () => {
+    const h = streamHarness();
+    await h.open();
+
+    h.state.scannerProgress = { ...h.state.scannerProgress, phase: "WAITING_FIRST_SCAN", bootstrapped: 9 };
+    h.runtime.live.publish(ACCOUNT, { topic: "scanner" });
+    await vi.waitFor(() => expect(h.events().filter((event) => event.event === "monitor")).toHaveLength(2));
+
+    expect(h.last("monitor")).toMatchObject({ scannerProgress: { phase: "WAITING_FIRST_SCAN", bootstrapped: 9, total: 9 } });
   });
 
   it("streams AI steps immediately and refreshes the decisions after a result", async () => {
@@ -215,6 +227,7 @@ function streamHarness() {
     engine: { setupState: "WaitingLtfFvg" },
     store: { events: [] },
     watchlistStatus: [{ symbol: "BTCUSDT", status: "Monitoring" }] as never,
+    scannerProgress: { phase: "BOOTSTRAPPING", bootstrapped: 2, total: 9, startedAt: "2026-10-26T00:00:00.000Z", liveSince: null },
     runtimeHealth: { state: "READY" } as never,
     execution: { enabled: true, reason: "READY" } as never
   };

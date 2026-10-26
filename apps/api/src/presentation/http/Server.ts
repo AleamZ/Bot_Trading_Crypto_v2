@@ -38,6 +38,8 @@ import type { Candle, Timeframe } from "../../domain/market-data/Candle.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 import { getPostgresPoolObservability } from "../../infrastructure/persistence/PgPoolFactory.js";
 import { streamAccountLiveUpdates } from "./LiveStream.js";
+import { parseAiChatTurns, type AiChatService } from "../../application/ai/AiChatService.js";
+import { acquireAiChatSlot, AI_CHAT_RATE_MAX, streamAiChatReply } from "./AiChatRoute.js";
 
 export interface HttpServerParams {
   port: number;
@@ -50,6 +52,8 @@ export interface HttpServerParams {
   tradingAccounts?: TradingAccountService;
   runtimeManager?: TradingRuntimeManager;
   marketData?: BinanceFuturesMarketData;
+  /** Read-only dashboard chat with the local LLM; absent = POST .../ai-chat answers 503. */
+  aiChat?: AiChatService;
   appState?: OperationalAppState;
   readinessCheck?: () => Promise<boolean>;
   buildInfo?: BuildInfo;
@@ -155,7 +159,8 @@ export function createHttpHandler(params: HttpServerParams): (request: IncomingM
           config: runtimeConfig,
           marketData,
           logger: params.logger,
-          ...(params.runtimeManager ? { runtimeManager: params.runtimeManager } : {})
+          ...(params.runtimeManager ? { runtimeManager: params.runtimeManager } : {}),
+          ...(params.aiChat ? { aiChat: params.aiChat } : {})
         });
         return;
       }
@@ -550,8 +555,9 @@ async function handleTradingAccountRoute(params: {
   config: AppConfig;
   marketData: BinanceFuturesMarketData;
   logger: DecisionLogger;
+  aiChat?: AiChatService;
 }): Promise<void> {
-  const { request, response, requestUrl, corsHeaders, userId, service, runtimeManager, config, marketData, logger } = params;
+  const { request, response, requestUrl, corsHeaders, userId, service, runtimeManager, config, marketData, logger, aiChat } = params;
   const parts = requestUrl.pathname.split("/").filter(Boolean);
   const accountId = parts[2] ?? null;
   const child = parts[3] ?? null;
@@ -836,6 +842,43 @@ async function handleTradingAccountRoute(params: {
     }
     await service.getOwnedAccount(userId, accountId);
     await streamAccountLiveUpdates({ request, response, corsHeaders, accountId, runtimeManager, logger });
+    return;
+  }
+
+  if (child === "ai-chat" && parts.length === 4 && request.method === "POST") {
+    if (!aiChat) {
+      sendJson(response, 503, { error: "AI_CHAT_UNAVAILABLE", message: "AI chat is not configured" }, corsHeaders);
+      return;
+    }
+    const account = await service.getOwnedAccount(userId, accountId);
+    const turns = parseAiChatTurns(await readJsonBody(request));
+    const release = acquireAiChatSlot(userId);
+    if (!release) {
+      sendJson(response, 429, { error: "AI_CHAT_RATE_LIMITED", message: `Wait for the current answer; at most ${AI_CHAT_RATE_MAX} questions per minute.` }, corsHeaders);
+      return;
+    }
+    try {
+      const settings = await service.getSettings(userId, accountId);
+      const accountMarketData = marketDataForAccount(account, marketData);
+      await streamAiChatReply({
+        request,
+        response,
+        corsHeaders,
+        account,
+        settings: settings as unknown as Record<string, unknown>,
+        turns,
+        aiChat,
+        runtimeManager,
+        analyzeSymbol: async (symbol) => {
+          const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol).catch(() => null) : null;
+          return buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, accountMarketData, diagnostic);
+        },
+        closedCandles: (symbol, timeframe, limit) => accountMarketData.getClosedCandles(symbol, timeframe, limit),
+        logger
+      });
+    } finally {
+      release();
+    }
     return;
   }
 

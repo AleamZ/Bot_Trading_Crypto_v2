@@ -40,6 +40,16 @@ const homeState = {
   snapshot: null,
   snapshotAt: 0,
 };
+// Read-only AI chat; history lives in this browser, per trading account.
+const CHAT_HISTORY_KEPT = 40;
+const CHAT_TURNS_SENT = 16;
+const chatState = {
+  accountId: null,
+  open: false,
+  messages: [],
+  abort: null,
+  renderQueued: false,
+};
 // Server-Sent Events from /api/trading-accounts/:id/stream; status off | connecting | live | polling.
 const liveState = {
   source: null,
@@ -172,6 +182,31 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (ev
 document.querySelectorAll(".positions-table").forEach((table) => {
   labelTableCells(table);
   new MutationObserver(() => labelTableCells(table)).observe(table, { childList: true, subtree: true });
+});
+$("chat-fab").addEventListener("click", () => toggleChat(!chatState.open));
+$("chat-close").addEventListener("click", () => toggleChat(false));
+$("chat-clear").addEventListener("click", clearChat);
+$("chat-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (chatState.abort) {
+    chatState.abort.abort();
+    return;
+  }
+  sendChat($("chat-input").value);
+});
+$("chat-input").addEventListener("keydown", (event) => {
+  // Enter sends, Shift+Enter adds a line.
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    $("chat-form").requestSubmit();
+  }
+});
+$("chat-suggestions").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-chat-prompt]");
+  if (button) sendChat(button.dataset.chatPrompt);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && chatState.open) toggleChat(false);
 });
 // Polls skip while the tab is hidden; refresh at once when it comes back.
 document.addEventListener("visibilitychange", () => {
@@ -309,6 +344,7 @@ function showLoggedOut() {
   stopHomePolling();
   stopChartPolling();
   closeLiveStream();
+  setChatAccount(null);
   Object.assign(homeState, { snapshot: null, snapshotAt: 0 });
   settingsRequestSequence += 1;
   analysisRequestSequence += 1;
@@ -418,6 +454,7 @@ function setActiveTradingAccount(account) {
   setHomeAlert(null);
   Object.assign(homeState, { snapshot: null, snapshotAt: 0 });
   openLiveStream(account.id);
+  setChatAccount(account.id);
   Object.assign(settingsState, defaultSettings);
   Object.assign(realSafetyState, { mode: "LOCKED", masterLiveExecutionEnabled: false, proposals: [] });
   renderAccountSelector();
@@ -619,6 +656,12 @@ async function deleteActiveAccount() {
 
 async function handleDeletedAccount(deletedAccountId) {
   closeLiveStream();
+  setChatAccount(null);
+  try {
+    localStorage.removeItem(accountStorageKey("ai-chat", deletedAccountId));
+  } catch {
+    // Storage may be unavailable; nothing to clean then.
+  }
   accountState.activeAccount = null;
   accountState.lastConnection = null;
   accountState.lastBinanceAccount = null;
@@ -1607,7 +1650,7 @@ function whenIdle(callback) {
 async function ensureChart() {
   if (chartState.instance) return;
   // Same ?v= as index.html so a cached chart module never pairs with a newer app.js.
-  chartState.module ??= import("./chart/Chart.js?v=20261026-3");
+  chartState.module ??= import("./chart/Chart.js?v=20261026-4");
   const [{ TradingChart }] = await Promise.all([chartState.module, loadChartLibrary()]);
   if (chartState.instance) return;
 
@@ -2513,4 +2556,243 @@ function toggleWatchlistSymbol(symbol, enabled) {
   const next = enabled ? [...selected, normalized] : selected.filter((item) => item !== normalized);
   setSelectedWatchlist(next);
   renderWatchlistSettings();
+}
+
+function setChatAccount(accountId) {
+  chatState.abort?.abort();
+  chatState.abort = null;
+  chatState.accountId = accountId;
+  chatState.messages = accountId ? loadChatHistory(accountId) : [];
+  $("chat-fab").hidden = !accountId;
+  if (!accountId) toggleChat(false);
+  renderChat();
+}
+
+function loadChatHistory(accountId) {
+  try {
+    const stored = JSON.parse(localStorage.getItem(accountStorageKey("ai-chat", accountId)) ?? "[]");
+    return Array.isArray(stored)
+      ? stored.filter((message) => (message?.role === "user" || message?.role === "assistant") && typeof message.content === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveChatHistory() {
+  if (!chatState.accountId) return;
+  // Unfinished or failed answers are not worth keeping.
+  const finished = chatState.messages.filter((message) => !message.pending && !message.error).slice(-CHAT_HISTORY_KEPT);
+  try {
+    localStorage.setItem(accountStorageKey("ai-chat", chatState.accountId), JSON.stringify(finished.map(({ role, content, model, stopped }) => ({ role, content, model, stopped }))));
+  } catch {
+    // Private mode or full storage: the chat still works for this page.
+  }
+}
+
+function toggleChat(open) {
+  chatState.open = open;
+  $("chat-panel").hidden = !open;
+  $("chat-fab").setAttribute("aria-expanded", String(open));
+  if (!open) return;
+  const symbol = currentAnalysisSymbol();
+  $("chat-analyze-prompt").textContent = `Phân tích ${symbol}`;
+  $("chat-analyze-prompt").dataset.chatPrompt = `Phân tích ${symbol} theo chiến lược của bot.`;
+  renderChat();
+  $("chat-input").focus();
+}
+
+function clearChat() {
+  chatState.abort?.abort();
+  chatState.messages = [];
+  saveChatHistory();
+  renderChat();
+}
+
+async function sendChat(text) {
+  const question = String(text ?? "").trim();
+  const accountId = chatState.accountId;
+  if (!question || !accountId || chatState.abort) return;
+  // Only finished turns go to the model; the server keeps the last 16 as well.
+  const turns = chatState.messages
+    .filter((message) => !message.pending && !message.error)
+    .map(({ role, content }) => ({ role, content }))
+    .concat({ role: "user", content: question })
+    .slice(-CHAT_TURNS_SENT);
+  const answer = { role: "assistant", content: "", pending: true, model: null, error: null };
+  chatState.messages.push({ role: "user", content: question }, answer);
+  $("chat-input").value = "";
+  const abort = new AbortController();
+  chatState.abort = abort;
+  renderChat();
+
+  try {
+    const response = await apiFetch(`/api/trading-accounts/${accountId}/ai-chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({ messages: turns }),
+      signal: abort.signal,
+    });
+    if (!response.ok || !response.body) throw await responseError(response, "AI chat");
+    await readChatStream(response.body, answer);
+  } catch (error) {
+    if (abort.signal.aborted) {
+      if (answer.content) answer.stopped = true;
+      else answer.error = "Đã dừng.";
+    } else {
+      // Show the server's own reason (rate limit, AI not configured...) rather than the dashboard's 503 wording.
+      const message = error instanceof Error ? error.message : String(error);
+      answer.error = message.includes("Failed to fetch") ? "Không kết nối được API." : message;
+    }
+  } finally {
+    answer.pending = false;
+    if (chatState.abort === abort) chatState.abort = null;
+    if (chatState.accountId === accountId) {
+      saveChatHistory();
+      renderChat();
+    }
+  }
+}
+
+// The answer arrives as Server-Sent Events over the POST response: meta, delta..., done | error.
+async function readChatStream(body, answer) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() ?? "";
+    for (const block of blocks) {
+      const event = /^event: (.+)$/m.exec(block)?.[1];
+      const data = /^data: (.+)$/m.exec(block)?.[1];
+      if (!event || !data) continue;
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (event === "meta") answer.model = payload.model ?? null;
+      if (event === "delta") answer.content += payload.text ?? "";
+      if (event === "done") answer.model = payload.model ?? answer.model;
+      if (event === "error") answer.error = `${payload.message ?? "AI không trả lời được"} (${payload.code ?? "AI_CHAT_FAILED"})`;
+      queueChatRender();
+    }
+  }
+}
+
+// Deltas arrive faster than the screen refreshes; render at most once per frame.
+function queueChatRender() {
+  if (chatState.renderQueued) return;
+  chatState.renderQueued = true;
+  requestAnimationFrame(() => {
+    chatState.renderQueued = false;
+    renderChat();
+  });
+}
+
+function renderChat() {
+  const list = $("chat-messages");
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+  const busy = Boolean(chatState.abort);
+  $("chat-send").textContent = busy ? "Dừng" : "Gửi";
+  $("chat-send").classList.toggle("primary", !busy);
+  $("chat-suggestions").hidden = chatState.messages.length > 0;
+  const lastModel = [...chatState.messages].reverse().find((message) => message.model)?.model;
+  $("chat-meta").textContent = `${lastModel ? `${lastModel} · ` : ""}Chỉ đọc · không đặt lệnh, không đổi setting`;
+  if (chatState.messages.length === 0) {
+    const intro = document.createElement("li");
+    intro.className = "chat-intro";
+    intro.textContent =
+      "Hỏi về trạng thái bot, một symbol (ví dụ “Phân tích ETHUSDT”), hay vì sao bot chưa vào lệnh. AI dùng dữ liệu realtime của tài khoản này và chỉ đọc: không đặt lệnh, không đổi setting.";
+    list.replaceChildren(intro);
+    return;
+  }
+  list.replaceChildren(...chatState.messages.map(chatMessageItem));
+  if (nearBottom || busy) list.scrollTop = list.scrollHeight;
+}
+
+function chatMessageItem(message) {
+  const item = document.createElement("li");
+  item.className = "chat-msg";
+  item.dataset.role = message.role;
+  const bubble = document.createElement("div");
+  bubble.className = "chat-bubble";
+  if (message.role === "user") {
+    bubble.textContent = message.content;
+  } else {
+    const visible = visibleChatText(message.content);
+    if (visible) bubble.append(renderChatMarkdown(visible));
+    if (message.pending && !visible) bubble.append(typingDots());
+    if (message.stopped) {
+      const note = document.createElement("p");
+      note.className = "chat-note";
+      note.textContent = "Đã dừng giữa chừng.";
+      bubble.append(note);
+    }
+    if (message.error) {
+      const error = document.createElement("p");
+      error.className = "chat-error";
+      error.textContent = `Không trả lời được: ${message.error}`;
+      bubble.append(error);
+    }
+  }
+  item.append(bubble);
+  return item;
+}
+
+// Reasoning models may emit <think> blocks; they are not part of the answer.
+function visibleChatText(text) {
+  return String(text ?? "").replace(/<think>[\s\S]*?(<\/think>|$)/gi, "").trim();
+}
+
+function typingDots() {
+  const dots = document.createElement("span");
+  dots.className = "typing";
+  dots.setAttribute("aria-label", "AI đang trả lời");
+  dots.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
+  return dots;
+}
+
+// Small, safe markdown: paragraphs, #-headings, bullet/numbered lists, **bold** and `code`. Built as DOM, never innerHTML.
+function renderChatMarkdown(text) {
+  const fragment = document.createDocumentFragment();
+  let list = null;
+  for (const line of text.split("\n")) {
+    const bullet = /^\s*[-*•]\s+(.*)$/.exec(line);
+    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    if (bullet || numbered) {
+      const tag = bullet ? "ul" : "ol";
+      if (!list || list.tagName.toLowerCase() !== tag) {
+        list = document.createElement(tag);
+        fragment.append(list);
+      }
+      const entry = document.createElement("li");
+      appendChatInline(entry, (bullet ?? numbered)[1]);
+      list.append(entry);
+      continue;
+    }
+    list = null;
+    if (!line.trim()) continue;
+    const heading = /^#{1,4}\s+(.*)$/.exec(line);
+    const block = document.createElement(heading ? "h4" : "p");
+    appendChatInline(block, heading ? heading[1] : line);
+    fragment.append(block);
+  }
+  return fragment;
+}
+
+function appendChatInline(parent, text) {
+  let last = 0;
+  for (const match of text.matchAll(/\*\*([^*]+)\*\*|`([^`]+)`/g)) {
+    if (match.index > last) parent.append(text.slice(last, match.index));
+    const element = document.createElement(match[1] !== undefined ? "strong" : "code");
+    element.textContent = match[1] ?? match[2];
+    parent.append(element);
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parent.append(text.slice(last));
 }

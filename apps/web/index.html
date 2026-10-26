@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SMC Futures Bot</title>
     <!-- Cloudflare caches .css/.js for 4h: bump ?v= here and in app.js whenever styles.css, app.js or chart/ change. -->
-    <link rel="stylesheet" href="/styles.css?v=20261026-3" />
+    <link rel="stylesheet" href="/styles.css?v=20261026-4" />
     <link rel="modulepreload" href="./apiClient.js" />
     <script>
       // Pick the theme before first paint so dark mode does not flash light.
@@ -898,7 +898,34 @@
         <ol class="decision-log-list" id="all-events"></ol>
       </section>
     </div>
+    <button class="chat-fab" id="chat-fab" type="button" aria-controls="chat-panel" aria-expanded="false" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /><path d="M8 9.5h8M8 12.5h5" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>
+      <span>Hỏi AI</span>
+    </button>
+    <section class="chat-panel" id="chat-panel" role="dialog" aria-labelledby="chat-title" hidden>
+      <header class="chat-head">
+        <div>
+          <strong id="chat-title">Hỏi AI</strong>
+          <small id="chat-meta">Chỉ đọc · không đặt lệnh, không đổi setting</small>
+        </div>
+        <div class="chat-head-actions">
+          <button id="chat-clear" type="button" title="Xoá lịch sử chat của tài khoản này">Xoá</button>
+          <button class="chat-close" id="chat-close" type="button" aria-label="Đóng">×</button>
+        </div>
+      </header>
+      <ol class="chat-messages" id="chat-messages" aria-live="polite"></ol>
+      <div class="chat-suggestions" id="chat-suggestions">
+        <button type="button" data-chat-prompt="Tóm tắt tình hình bot hiện tại: các symbol, setup, vị thế và AI.">Tóm tắt tình hình bot</button>
+        <button type="button" id="chat-analyze-prompt" data-chat-prompt="Phân tích BTCUSDT theo chiến lược của bot.">Phân tích BTCUSDT</button>
+        <button type="button" data-chat-prompt="Vì sao bot chưa vào lệnh? Symbol nào đang bị chặn và vì sao?">Vì sao chưa vào lệnh?</button>
+        <button type="button" data-chat-prompt="AI vừa kiểm tra và quyết định những gì? Giải thích lý do.">AI vừa quyết định gì?</button>
+      </div>
+      <form class="chat-form" id="chat-form">
+        <textarea id="chat-input" rows="2" maxlength="4000" placeholder="Hỏi về bot, thị trường hoặc một symbol…" aria-label="Câu hỏi cho AI"></textarea>
+        <button class="primary" id="chat-send" type="submit">Gửi</button>
+      </form>
+    </section>
     <script src="./app-config.js"></script>
-    <script type="module" src="./app.js?v=20261026-3"></script>
+    <script type="module" src="./app.js?v=20261026-4"></script>
   </body>
 </html>

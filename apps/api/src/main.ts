@@ -18,6 +18,7 @@ import { createRealExecutionProposalRepository } from "./infrastructure/executio
 import { closeAllPostgresPools, verifyPostgresConnection } from "./infrastructure/persistence/PgPoolFactory.js";
 import { startHttpServer } from "./presentation/http/Server.js";
 import { LocalLlmClient, loadLocalLlmConfig } from "./application/ai/LocalLlmClient.js";
+import { AiChatService } from "./application/ai/AiChatService.js";
 
 let config = loadConfig();
 const logger = new ConsoleDecisionLogger();
@@ -63,7 +64,9 @@ const marketData = new BinanceFuturesMarketData(config.binanceTestnet);
 // Process-level LLM settings come from env (AI_BASE_URL, AI_API_KEY, AI_MODEL, AI_TIMEOUT_MS);
 // each account opts in with its aiTradingMode setting.
 const llmConfig = loadLocalLlmConfig();
-logger.info("AI advisor configuration", { baseUrl: llmConfig.baseUrl, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.timeoutMs, apiKey: llmConfig.apiKey ? "configured" : "not_configured" });
+logger.info("AI advisor configuration", { baseUrl: llmConfig.baseUrl, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.timeoutMs, chatTimeoutMs: llmConfig.chatTimeoutMs, apiKey: llmConfig.apiKey ? "configured" : "not_configured" });
+const llmClient = new LocalLlmClient(llmConfig);
+const aiChat = new AiChatService({ llm: llmClient, defaultModel: llmConfig.defaultModel, timeoutMs: llmConfig.chatTimeoutMs });
 const runtimeManager = new TradingRuntimeManager(
   config,
   config.databaseUrl,
@@ -77,7 +80,7 @@ const runtimeManager = new TradingRuntimeManager(
   undefined,
   realExecutionProposalRepository,
   undefined,
-  { client: new LocalLlmClient(llmConfig), defaultModel: llmConfig.defaultModel }
+  { client: llmClient, defaultModel: llmConfig.defaultModel }
 );
 const scanner = new MarketScanner(config, repository, execution, logger, marketData, availableBalanceProvider);
 const engine = scanner.getPrimaryEngine();
@@ -98,6 +101,7 @@ const server = startHttpServer({
   auth,
   tradingAccounts,
   runtimeManager,
+  aiChat,
   appState,
   buildInfo,
   readinessCheck: async () => {

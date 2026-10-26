@@ -11,6 +11,27 @@ for (const envFile of [resolve(process.cwd(), ".env"), resolve(process.cwd(), ".
   }
 }
 
+const TRUE_FLAGS = new Set(["true", "1", "yes", "on"]);
+const FALSE_FLAGS = new Set(["false", "0", "no", "off"]);
+
+/**
+ * A boolean from env vars, stored settings or API input. z.coerce.boolean() read every non-empty
+ * string as true ("false" and "0" included), so READ_ONLY_SOAK=false switched read-only ON.
+ * Empty or missing means the default; any other text is rejected instead of guessed.
+ */
+export function parseFlag(value: unknown): unknown {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number") return value === 1 ? true : value === 0 ? false : value;
+  if (typeof value !== "string") return value;
+  const text = value.trim().toLowerCase();
+  if (text === "") return undefined;
+  if (TRUE_FLAGS.has(text)) return true;
+  if (FALSE_FLAGS.has(text)) return false;
+  return value;
+}
+
+const flag = (fallback: boolean) => z.preprocess(parseFlag, z.boolean().default(fallback));
+
 const schema = z.object({
   nodeEnv: z.enum(["development", "test", "production"]).default("development"),
   port: z.coerce.number().int().positive().default(8787),
@@ -41,8 +62,8 @@ const schema = z.object({
   maxConsecutiveLosses: z.coerce.number().int().positive().default(3),
   cooldownAfterTradeMinutes: z.coerce.number().int().nonnegative().default(30),
   maxDrawdownPercent: z.coerce.number().positive().default(10),
-  tradingEnabled: z.coerce.boolean().default(false),
-  killSwitch: z.coerce.boolean().default(false),
+  tradingEnabled: flag(false),
+  killSwitch: flag(false),
   realExecutionMode: z.enum(["LOCKED", "DRY_RUN", "APPROVAL_REQUIRED"]).default("LOCKED"),
   emaPeriod: z.coerce.number().int().positive().default(50),
   swingLeft: z.coerce.number().int().positive().default(2),
@@ -55,7 +76,7 @@ const schema = z.object({
   stopLossAtrPeriod: z.coerce.number().int().positive().default(14),
   stopLossAtrMultiplier: z.coerce.number().nonnegative().default(1),
   priceTickSize: z.coerce.number().positive().default(0.1),
-  requireDisplacement: z.coerce.boolean().default(false),
+  requireDisplacement: flag(false),
   displacementBodyMultiplier: z.coerce.number().positive().default(1.5),
   displacementLookback: z.coerce.number().int().positive().default(20),
   takeProfitMode: z.enum(["external-liquidity", "fixed-rr"]).default("external-liquidity"),
@@ -65,14 +86,14 @@ const schema = z.object({
   binanceCredentialEncryptionKey: z.string().optional(),
   binanceApiKey: z.string().optional(),
   binanceApiSecret: z.string().optional(),
-  binanceTestnet: z.coerce.boolean().default(true),
+  binanceTestnet: flag(true),
   reconciliationIntervalMs: z.coerce.number().int().positive().default(30_000),
   binanceRetryMaxAttempts: z.coerce.number().int().positive().default(3),
   binanceRetryBaseDelayMs: z.coerce.number().int().nonnegative().default(500),
   postgresPoolMax: z.coerce.number().int().positive().max(10).default(8),
-  readOnlySoak: z.coerce.boolean().default(false),
-  realLiveExecutionEnabled: z.coerce.boolean().default(false),
-  localTradingRuntimeEnabled: z.coerce.boolean().default(false),
+  readOnlySoak: flag(false),
+  realLiveExecutionEnabled: flag(false),
+  localTradingRuntimeEnabled: flag(false),
   // AI advisor (local OpenAI-compatible LLM). OFF never calls the model, ADVISORY only records
   // decisions, AUTO may place orders on DEMO accounts through the normal risk/execution path.
   aiTradingMode: z.enum(["OFF", "ADVISORY", "AUTO"]).default("OFF"),

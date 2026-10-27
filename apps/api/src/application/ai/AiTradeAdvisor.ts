@@ -4,7 +4,7 @@ import type { TradingEngine } from "../engine/TradingEngine.js";
 import type { ExecutionGateway } from "../ports/ExecutionGateway.js";
 import type { DecisionLogger } from "../ports/Logger.js";
 import type { ExecutionIntentRepository } from "../execution/ExecutionIntentRepository.js";
-import { buildSetupKey } from "../execution/ExecutionIntent.js";
+import { buildSetupKey, type ExecutionIntent } from "../execution/ExecutionIntent.js";
 import type { EntryPlan } from "../../domain/entry/EntryCalculator.js";
 import type { Direction } from "../../domain/trade/Direction.js";
 import { buildAiDecisionMessages, buildBotAnalysisSnapshot, type BotAnalysisSnapshot } from "./BotAnalysisSkill.js";
@@ -340,13 +340,16 @@ export class AiTradeAdvisor implements AiScanHook {
     try {
       await this.options.execution.submitBracketOrder(validation.plan, risk);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      // The coordinator rethrows only the error class (INVALID_ORDER, ...); Binance's own code and
+      // message are kept on the intent, so record those to tell the user why the order failed.
+      const intent = await this.findIntent(validation.plan, risk);
+      const message = intent?.lastError || (error instanceof Error ? error.message : String(error));
       this.options.logger.warn("[AI] order submission failed", { symbol: context.symbol, error: message });
-      await finish({ outcome: "EXECUTION_FAILED", rejectCode: "EXECUTION_FAILED", rejectReason: message, executionIntentId: await this.findIntentId(validation.plan, risk) });
+      await finish({ outcome: "EXECUTION_FAILED", rejectCode: "EXECUTION_FAILED", rejectReason: message, executionIntentId: intent?.id ?? null });
       return;
     }
     context.markEntryPlaced();
-    const executionIntentId = await this.findIntentId(validation.plan, risk);
+    const executionIntentId = (await this.findIntent(validation.plan, risk))?.id ?? null;
     this.options.logger.info("[AI] order submitted", { symbol: context.symbol, executionIntentId, direction: validation.plan.direction });
     await finish({ outcome: "SUBMITTED", executionIntentId });
   }
@@ -359,10 +362,9 @@ export class AiTradeAdvisor implements AiScanHook {
     return null;
   }
 
-  private async findIntentId(plan: EntryPlan, risk: Parameters<ExecutionGateway["submitBracketOrder"]>[1]): Promise<string | null> {
+  private async findIntent(plan: EntryPlan, risk: Parameters<ExecutionGateway["submitBracketOrder"]>[1]): Promise<ExecutionIntent | null> {
     try {
-      const intent = await this.options.repository.findBySetupKey(this.options.tradingAccountId, buildSetupKey(this.options.tradingAccountId, plan, risk));
-      return intent?.id ?? null;
+      return await this.options.repository.findBySetupKey(this.options.tradingAccountId, buildSetupKey(this.options.tradingAccountId, plan, risk));
     } catch {
       return null;
     }

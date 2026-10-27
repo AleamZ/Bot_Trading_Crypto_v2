@@ -210,7 +210,7 @@ export class TradingReconciliationService {
   }
 
   // A LIMIT entry that has not filled within the timeout is stale: the setup moment has passed.
-  // Any partially filled size stays open and is protected by the closePosition SL/TP.
+  // Any partially filled size stays open and is protected by the reduce-only SL/TP.
   private async cancelExpiredLimitEntry(
     intent: ExecutionIntent,
     activity: AccountActivitySnapshot,
@@ -269,7 +269,9 @@ export class TradingReconciliationService {
       return this.handleRepairFailure(current, position, gateway, "PROTECTION_REPAIR_REQUIRES_MANUAL_RECONCILIATION", allowFailSafeClose);
     }
 
-    const quantity = position.quantity || current.quantity;
+    // Reduce-only exits sized to the whole planned entry keep covering a LIMIT entry that fills
+    // in parts after the repair; Binance never fills them past the open position.
+    const quantity = Math.max(position.quantity, current.quantity ?? 0) || null;
     const requestedStopLoss = current.requestedStopLoss;
     const requestedTakeProfit = current.requestedTakeProfit;
     if (quantity === null || requestedStopLoss === null || requestedTakeProfit === null) {
@@ -394,7 +396,7 @@ export class TradingReconciliationService {
     for (const order of activity.openOrders) {
       if (!order.clientOrderId?.startsWith("smc_") || !["STOP_MARKET", "TAKE_PROFIT_MARKET"].includes(order.type)) continue;
       if (openSymbols.has(order.symbol)) continue;
-      // Bot exits are closePosition orders: one left over from a finished intent would close the
+      // Bot exits are reduce-only orders: one left over from a finished intent would close the
       // next position opened on this symbol, so it is removed once the symbol is flat.
       const owner = intents.find((intent) => intent.clientStopOrderId === order.clientOrderId || intent.clientTakeProfitOrderId === order.clientOrderId);
       if (owner && isTerminalIntent(owner)) {

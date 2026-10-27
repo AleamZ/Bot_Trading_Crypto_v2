@@ -163,6 +163,24 @@ describe("AI trade advisor in the scan flow", () => {
     expect(h.scanner.getEngine("SOLUSDT")?.getState().openPositions).toBe(1);
   });
 
+  it("records Binance's own error when an AI order is rejected", async () => {
+    const h = harness({ candles: solCandles(true), mode: "OFF", reply: enterFromPlan });
+    await h.scanner.scan();
+    h.delegate.failWith = 'Binance entry order failed 400: {"code":-2019,"msg":"Margin is insufficient."}';
+
+    h.scanner.updateConfig(config({ aiTradingMode: "AUTO", tradingEnabled: true }));
+    await h.scanner.scan();
+    await h.scanner.whenAiIdle();
+
+    const [intent] = await h.repository.listByAccount(ACCOUNT);
+    expect(intent?.status).toBe("FAILED");
+    // The coordinator only rethrows INVALID_ORDER; the decision keeps the Binance code and message.
+    expect(await h.decisions()).toEqual([
+      expect.objectContaining({ outcome: "EXECUTION_FAILED", executionIntentId: intent?.id, rejectReason: expect.stringContaining('"code":-2019,"msg":"Margin is insufficient."') })
+    ]);
+    expect(h.steps.find((step) => step.stage === "result")).toMatchObject({ outcome: "EXECUTION_FAILED", rejectReason: expect.stringContaining("-2019") });
+  });
+
   it("AUTO still goes through the engine risk manager (trading disabled blocks it)", async () => {
     const h = harness({ candles: solCandles(true), mode: "AUTO", reply: enterFromPlan });
     await h.scanner.scan();
@@ -597,8 +615,10 @@ class FakeLlm implements LlmClient {
 
 class SpyDelegate implements ExecutionGateway {
   calls: Array<{ plan: EntryPlan; risk: RiskDecision; context: ExecutionOrderContext | undefined }> = [];
+  failWith: string | null = null;
   async submitBracketOrder(plan: EntryPlan, risk: RiskDecision, context?: ExecutionOrderContext): Promise<SubmittedOrder> {
     this.calls.push({ plan, risk, context });
+    if (this.failWith) throw new Error(this.failWith);
     return {
       orderId: `entry-${this.calls.length}`,
       stopLossOrderId: "sl",

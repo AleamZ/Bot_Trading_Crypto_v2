@@ -995,6 +995,26 @@ describe("TradingReconciliationService", () => {
     expect(saved?.binanceTakeProfitOrderId).toBe("tp-existing");
   });
 
+  it("sizes repaired reduce-only protection to the whole entry while a LIMIT entry is only partly filled", async () => {
+    const repository = new MemoryExecutionIntentRepository();
+    const intent = await seedFilledIntent(repository, "account-a");
+    const gateway = new RecoverableRecordingGateway();
+    const service = new TradingReconciliationService(repository, fakeLogger());
+    const filled = (intent.quantity ?? 0) / 4;
+    const full = positionActivity(intent, [], [entryHistory(intent, intent.requestedEntry ?? 100, filled)]);
+    const partlyFilled = async () => {
+      const activity = await full();
+      return { ...activity, positions: activity.positions.map((position) => ({ ...position, quantity: filled })) };
+    };
+
+    await service.reconcile("account-a", partlyFilled, gateway);
+
+    expect(gateway.protectionRequests.map((request) => [request.type, request.quantity])).toEqual([
+      ["STOP_MARKET", intent.quantity],
+      ["TAKE_PROFIT_MARKET", intent.quantity]
+    ]);
+  });
+
   it("does not duplicate protection orders when both already exist", async () => {
     const repository = new MemoryExecutionIntentRepository();
     const intent = await seedFilledIntent(repository, "account-a");

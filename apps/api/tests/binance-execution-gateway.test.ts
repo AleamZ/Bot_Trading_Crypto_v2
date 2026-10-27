@@ -106,21 +106,24 @@ describe("BinanceFuturesExecutionGateway", () => {
       algoType: "CONDITIONAL",
       type: "STOP_MARKET",
       triggerPrice: "1.7088",
-      closePosition: "true",
+      quantity: "100",
+      reduceOnly: "true",
       workingType: "CONTRACT_PRICE",
       clientAlgoId: "smc_intent_SL"
     });
-    // closePosition exits the real position size, so no fixed quantity / reduceOnly is sent.
-    expect(algoOrders[0]?.params.quantity).toBeUndefined();
-    expect(algoOrders[0]?.params.reduceOnly).toBeUndefined();
+    // Binance allows one closePosition order per side and symbol; a leftover one would reject this stop.
+    expect(algoOrders[0]?.params.closePosition).toBeUndefined();
     expect(algoOrders[0]?.params.stopPrice).toBeUndefined();
     expect(algoOrders[0]?.params.newClientOrderId).toBeUndefined();
     expect(algoOrders[1]?.params).toMatchObject({
       algoType: "CONDITIONAL",
       type: "TAKE_PROFIT_MARKET",
       triggerPrice: "1.1088",
+      quantity: "100",
+      reduceOnly: "true",
       clientAlgoId: "smc_intent_TP"
     });
+    expect(algoOrders[1]?.params.closePosition).toBeUndefined();
   });
 
   it("checks an existing deterministic Algo order before repairing protection", async () => {

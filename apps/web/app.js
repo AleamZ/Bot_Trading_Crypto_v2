@@ -1213,7 +1213,7 @@ function aiResultView(step) {
   if (step.outcome === "ADVISORY") return { label: "Quyết định", tone: "ok", text: `Nên vào lệnh: chỉ ghi lại vì đang ở chế độ ADVISORY${reason}` };
   if (step.outcome === "SKIPPED") return { label: "Quyết định", tone: "", text: "Không vào lệnh" };
   if (step.outcome === "REJECTED") return { label: "Quyết định", tone: "danger", text: `Không vào lệnh: bị chặn bởi ${step.rejectCode ?? "-"}${reason}` };
-  if (step.outcome === "EXECUTION_FAILED") return { label: "Quyết định", tone: "danger", text: `Đặt lệnh lỗi${reason}` };
+  if (step.outcome === "EXECUTION_FAILED") return { label: "Quyết định", tone: "danger", text: `Đặt lệnh lỗi · ${executionErrorText(step.rejectReason) || "-"}` };
   return { label: "Lỗi AI", tone: "warn", text: `Không có quyết định (${step.rejectCode ?? "LLM_ERROR"})${reason}` };
 }
 
@@ -1272,8 +1272,16 @@ function aiDecisionResult(decision) {
   if (decision.outcome === "ADVISORY") return { label: "Chấp nhận (advisory)", tone: "ok", note: code, title: reason };
   if (decision.outcome === "SKIPPED") return { label: "AI bỏ qua", tone: "", note: "", title: "" };
   if (decision.outcome === "LLM_ERROR") return { label: "Lỗi AI", tone: "warn", note: code, title: reason };
-  if (decision.outcome === "EXECUTION_FAILED") return { label: "Đặt lệnh lỗi", tone: "danger", note: "", title: reason };
+  if (decision.outcome === "EXECUTION_FAILED") return { label: "Đặt lệnh lỗi", tone: "danger", note: executionErrorText(reason), noteTone: "danger", title: reason };
   return { label: "Từ chối", tone: "danger", note: code, title: reason };
+}
+
+// "INVALID_ORDER: Binance entry order failed 400: {"code":-2019,"msg":"Margin is insufficient."}"
+// reads as "-2019 Margin is insufficient."; anything else is shown as recorded.
+function executionErrorText(reason) {
+  if (!reason) return "";
+  const binance = /"code"\s*:\s*(-?\d+)\s*,\s*"msg"\s*:\s*"([^"]*)"/.exec(reason);
+  return binance ? `${binance[1]} ${binance[2]}` : reason;
 }
 
 function aiActionCell(action, direction) {
@@ -1295,7 +1303,7 @@ function aiActionCell(action, direction) {
 function aiResultCell(result) {
   const cell = document.createElement("td");
   cell.append(badge(result.label, result.tone));
-  if (result.note) cell.append(cellNote(result.note));
+  if (result.note) cell.append(cellNote(result.note, result.noteTone));
   if (result.title) cell.title = result.title;
   return cell;
 }
@@ -1357,9 +1365,9 @@ function badge(text, tone = "") {
   return element;
 }
 
-function cellNote(text) {
+function cellNote(text, tone = "") {
   const note = document.createElement("small");
-  note.className = "cell-note";
+  note.className = tone ? `cell-note ${tone}` : "cell-note";
   note.textContent = text;
   return note;
 }

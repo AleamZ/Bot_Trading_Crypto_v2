@@ -110,7 +110,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     let stopLossError: unknown = null;
     for (let attempt = 1; attempt <= STOP_LOSS_SUBMIT_ATTEMPTS && !stopLoss; attempt += 1) {
       try {
-        stopLoss = await this.submitAlgoTriggerOrder(symbol, "STOP_MARKET", exitSide, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
+        stopLoss = await this.submitAlgoTriggerOrder(symbol, "STOP_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.stopLoss, rules.tickSize)), context?.clientStopOrderId);
       } catch (error) {
         stopLossError = error;
         if (isImmediateTriggerError(error)) break;
@@ -130,7 +130,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
         const closeMessage = closeError instanceof Error ? closeError.message : String(closeError);
         throw new PostEntryProtectionError(`STOP_LOSS_FAILED_AND_CLOSE_FAILED: ${message}; close: ${closeMessage}`, partialOrder());
       }
-      // An ambiguous failure may still have created the closePosition stop; left behind it would
+      // An ambiguous failure may still have created the reduce-only stop; left behind it would
       // close the next position on this symbol, so remove it best-effort.
       if (context?.clientStopOrderId) await this.cancelOrderByClientOrderId(symbol, context.clientStopOrderId).catch(() => undefined);
       throw new Error(`PROTECTION_FAILED_POSITION_CLOSED: ${message}`);
@@ -138,7 +138,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
 
     let takeProfit: BinanceAlgoOrderResponse;
     try {
-      takeProfit = await this.submitAlgoTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
+      takeProfit = await this.submitAlgoTriggerOrder(symbol, "TAKE_PROFIT_MARKET", exitSide, quantity, formatRuleNumber(normalizePrice(plan.takeProfit, rules.tickSize)), context?.clientTakeProfitOrderId);
     } catch (error) {
       // The stop loss is live, so the position is protected; reconciliation repairs the TP.
       throw new PostEntryProtectionError(error instanceof Error ? error.message : String(error), {
@@ -256,6 +256,7 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       request.symbol,
       request.type,
       request.side,
+      formatRuleNumber(validation.normalized.quantity),
       formatRuleNumber(validation.normalized.stopPrice ?? normalizePrice(request.stopPrice, rules.tickSize)),
       request.clientOrderId
     );
@@ -342,12 +343,14 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
     return this.signedPost("/fapi/v1/order", params, "Binance entry order failed");
   }
 
-  // closePosition=true exits whatever size is actually open (partial fills, later fills),
-  // instead of a fixed quantity that can drift from the real position.
+  // Exits carry the entry's quantity with reduceOnly instead of closePosition=true: Binance allows
+  // only one closePosition order per side and symbol, so a leftover one rejects the next stop.
+  // The quantity is the full entry size; reduceOnly caps the fill at the size actually open.
   private async submitAlgoTriggerOrder(
     symbol: string,
     type: "STOP_MARKET" | "TAKE_PROFIT_MARKET",
     side: BinanceOrderSide,
+    quantity: string,
     triggerPrice: string,
     clientOrderId?: string
   ): Promise<BinanceAlgoOrderResponse> {
@@ -356,8 +359,9 @@ export class BinanceFuturesExecutionGateway implements RecoverableExecutionGatew
       symbol,
       side,
       type,
+      quantity,
       triggerPrice,
-      closePosition: "true",
+      reduceOnly: "true",
       workingType: "CONTRACT_PRICE",
       timestamp: String(Date.now())
     });

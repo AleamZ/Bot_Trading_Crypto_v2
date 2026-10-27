@@ -1798,6 +1798,13 @@ input {
   text-overflow: ellipsis;
 }
 
+.cell-note.danger {
+  max-width: 260px;
+  color: var(--danger);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .direction {
   margin-left: 6px;
   font-size: 12px;

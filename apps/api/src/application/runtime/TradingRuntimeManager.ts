@@ -776,8 +776,11 @@ export class TradingRuntimeManager {
     ]);
     if (runtime.account.mode === "DEMO" && !inputs) throw new Error("BINANCE_DISCONNECTED: balance, positions or symbol rules are unavailable");
     const open = (inputs?.positions ?? []).filter((position) => position.quantity > 0);
+    // Same gate the chat coordinator uses, so a blocked account is reported before the card exists.
+    const gate = this.resolveRuntimeExecutionGate(runtime.account, runtime.health, { ...config, tradingEnabled: true }, runtime.rawExecution);
     return {
       mode: runtime.account.mode,
+      executionBlocked: gate.enabled ? null : gate.reason,
       config,
       livePrice,
       availableBalance: inputs?.availableBalance ?? 0,

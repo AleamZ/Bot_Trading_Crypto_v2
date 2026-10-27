@@ -1126,7 +1126,13 @@ describe("trading account HTTP flow", () => {
       await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: false, killSwitch: true, watchlist: ["XRPUSDT"], symbol: "XRPUSDT" }, cookie);
       expect(await runtimeManager.chatOrders.propose(account.id, "user-chat", { symbol: "XRPUSDT", side: "LONG", stopLoss: 590, takeProfit: 630, quantity: 1, reason: "blocked" })).toMatchObject({
         ok: false,
-        code: "RISK_KILL_SWITCH"
+        code: "KILL_SWITCH"
+      });
+      await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: false, killSwitch: false, readOnlySoak: true, watchlist: ["XRPUSDT"], symbol: "XRPUSDT" }, cookie);
+      expect(await runtimeManager.chatOrders.propose(account.id, "user-chat", { symbol: "XRPUSDT", side: "LONG", stopLoss: 590, takeProfit: 630, quantity: 1, reason: "soak" })).toMatchObject({
+        ok: false,
+        code: "READ_ONLY_SOAK_EXECUTION_BLOCKED",
+        reason: expect.stringContaining("read-only soak")
       });
     } finally {
       binance.restore();

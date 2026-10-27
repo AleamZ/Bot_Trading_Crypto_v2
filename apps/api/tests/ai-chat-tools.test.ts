@@ -150,6 +150,7 @@ describe("Chat orders", () => {
     expect(assessChatOrder(order({ takeProfit: 101_000 }), market(), 1)).toMatchObject({ ok: false, code: "RISK_RR_BELOW_MINIMUM" });
     expect(assessChatOrder(order(), market({ mode: "REAL" }), 1)).toMatchObject({ ok: false, code: "REAL_EXECUTION_LOCKED" });
     expect(assessChatOrder(order(), market({ livePrice: null }), 1)).toMatchObject({ ok: false, code: "LIVE_PRICE_UNAVAILABLE" });
+    expect(assessChatOrder(order(), market({ executionBlocked: "READ_ONLY_SOAK_EXECUTION_BLOCKED" }), 1)).toMatchObject({ ok: false, code: "READ_ONLY_SOAK_EXECUTION_BLOCKED", reason: expect.stringContaining("read-only soak") });
   });
 
   it("places a confirmed proposal once, at the live price, with the size shown on the card", async () => {

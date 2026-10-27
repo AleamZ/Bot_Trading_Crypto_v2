@@ -859,8 +859,9 @@ async function handleTradingAccountRoute(params: {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.warn("[AI CHAT] order confirmation failed", { tradingAccountId: accountId, error: message });
+      // Not 5xx: Cloudflare replaces a 502 body with its own page and the card would lose Binance's message.
       if (error instanceof ChatOrderError) sendJson(response, 409, { error: error.code, message }, corsHeaders);
-      else sendJson(response, 502, { error: "CHAT_ORDER_FAILED", message }, corsHeaders);
+      else sendJson(response, 422, { error: "CHAT_ORDER_FAILED", message }, corsHeaders);
     }
     return;
   }

@@ -23,6 +23,8 @@ export interface ChatOrderRequest {
 /** Account state the risk manager needs, read fresh for every proposal and confirmation. */
 export interface ChatOrderMarket {
   mode: "DEMO" | "REAL";
+  /** Execution gate reason when orders cannot be placed right now (automatic trading switch excluded). */
+  executionBlocked?: string | null;
   config: AppConfig;
   livePrice: number | null;
   availableBalance: number;
@@ -68,6 +70,16 @@ export interface ChatOrderConfirmation {
   stopLoss: number;
   takeProfit: number;
 }
+
+/** Why the execution gate refuses orders, worded for the chat model and the card. */
+const EXECUTION_BLOCKED_REASONS: Record<string, string> = {
+  READ_ONLY_SOAK_EXECUTION_BLOCKED: "The account is in read-only soak mode, which blocks every order: turn off readOnlySoak for this account and READ_ONLY_SOAK in the server .env",
+  KILL_SWITCH: "The kill switch is on: turn it off in Settings to place orders",
+  RUNTIME_NOT_READY: "The trading runtime is still starting or recovering; try again in a moment",
+  BINANCE_DISCONNECTED: "Binance is not connected for this account",
+  RECONCILIATION_REQUIRED: "Positions and orders must be reconciled with Binance first; try again in a moment",
+  SHUTTING_DOWN: "The server is restarting; try again in a moment"
+};
 
 export class ChatOrderError extends Error {
   constructor(
@@ -195,6 +207,7 @@ export function assessChatOrder(
   at: number
 ): { ok: true; plan: EntryPlan; risk: RiskDecision } | { ok: false; code: string; reason: string } {
   if (market.mode !== "DEMO") return { ok: false, code: "REAL_EXECUTION_LOCKED", reason: "Chat orders are DEMO-only; REAL accounts stay locked" };
+  if (market.executionBlocked) return { ok: false, code: market.executionBlocked, reason: EXECUTION_BLOCKED_REASONS[market.executionBlocked] ?? `Order execution is blocked (${market.executionBlocked})` };
   const price = market.livePrice;
   if (price === null || !Number.isFinite(price) || price <= 0) return { ok: false, code: "LIVE_PRICE_UNAVAILABLE", reason: `No live price for ${request.symbol}` };
   if (![request.stopLoss, request.takeProfit].every((value) => Number.isFinite(value) && value > 0)) {

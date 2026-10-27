@@ -1097,6 +1097,42 @@ describe("trading account HTTP flow", () => {
     expect(runtimeManager.getEngineForTest(accountA.id, "BTCUSDT")).not.toBe(runtimeManager.getEngineForTest(accountB.id, "BTCUSDT"));
   });
 
+  it("places a confirmed chat order while automatic trading is off, with reduce-only SL/TP, and the kill switch still blocks it", async () => {
+    const cookie = await register("chat-order@example.com");
+    const account = (await (await postJson("/api/trading-accounts", { name: "Chat", mode: "DEMO" }, cookie)).json()).account;
+    await putJson(`/api/trading-accounts/${account.id}/binance-connection`, { apiKey: "CHAT_KEY", apiSecret: "CHAT_SECRET" }, cookie);
+    await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: false, killSwitch: false, watchlist: ["XRPUSDT"], symbol: "XRPUSDT" }, cookie);
+    FakeAccountClient.walletBalanceByApiKey.set("CHAT_KEY", 10_000);
+    const binance = stubDemoBinance("XRPUSDT", 600);
+    try {
+      const proposed = await runtimeManager.chatOrders.propose(account.id, "user-chat", { symbol: "XRPUSDT", side: "LONG", stopLoss: 590, takeProfit: 630, quantity: 1, reason: "chat test" });
+      expect(proposed).toMatchObject({ ok: true, proposal: { symbol: "XRPUSDT", side: "LONG", quantity: 1, sizing: "USER", entry: 600 } });
+      if (!proposed.ok) return;
+      await expect(runtimeManager.chatOrders.confirm(account.id, "someone-else", proposed.proposal.id)).rejects.toMatchObject({ code: "CHAT_ORDER_NOT_FOUND" });
+
+      const confirmed = await runtimeManager.chatOrders.confirm(account.id, "user-chat", proposed.proposal.id);
+
+      expect(confirmed).toMatchObject({ status: "SUBMITTED", symbol: "XRPUSDT", quantity: 1 });
+      const entry = binance.posts.find((request) => request.path === "/fapi/v1/order");
+      expect(entry?.params).toMatchObject({ symbol: "XRPUSDT", side: "BUY", type: "MARKET", quantity: "1" });
+      const exits = binance.posts.filter((request) => request.path === "/fapi/v1/algoOrder");
+      expect(exits.map((request) => [request.params.type, request.params.quantity, request.params.reduceOnly, request.params.closePosition])).toEqual([
+        ["STOP_MARKET", "1", "true", undefined],
+        ["TAKE_PROFIT_MARKET", "1", "true", undefined]
+      ]);
+      const intent = (await executionIntentRepository.listByAccount(account.id)).find((item) => item.id === confirmed.executionIntentId);
+      expect(intent).toMatchObject({ source: "AI", symbol: "XRPUSDT", entryType: "market", status: "PROTECTED" });
+
+      await putJson(`/api/trading-accounts/${account.id}/settings`, { ...testConfig(), tradingEnabled: false, killSwitch: true, watchlist: ["XRPUSDT"], symbol: "XRPUSDT" }, cookie);
+      expect(await runtimeManager.chatOrders.propose(account.id, "user-chat", { symbol: "XRPUSDT", side: "LONG", stopLoss: 590, takeProfit: 630, quantity: 1, reason: "blocked" })).toMatchObject({
+        ok: false,
+        code: "RISK_KILL_SWITCH"
+      });
+    } finally {
+      binance.restore();
+    }
+  });
+
   it("uses the same strategy engine implementation for DEMO and REAL runtimes while REAL execution stays locked", async () => {
     const cookie = await register("same-strategy@example.com");
     const demo = (await (await postJson("/api/trading-accounts", { name: "Demo", mode: "DEMO" }, cookie)).json()).account;
@@ -1215,7 +1251,63 @@ class MockVerifier implements BinanceAccountVerifier {
   }
 }
 
+/**
+ * Answers the DEMO order endpoints the execution gateway calls (demo-fapi) and passes every other
+ * request (the test's own HTTP calls) through to the real fetch.
+ */
+function stubDemoBinance(symbol: string, price: number) {
+  const original = globalThis.fetch;
+  const posts: Array<{ path: string; params: Record<string, string> }> = [];
+  let leverage = 1;
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input instanceof Request ? input.url : input));
+    if (url.hostname !== "demo-fapi.binance.com") return original(input as string, init);
+    const params = Object.fromEntries(new URLSearchParams(init?.body ? String(init.body) : url.search));
+    if (init?.method === "POST") posts.push({ path: url.pathname, params });
+    if (url.pathname === "/fapi/v1/exchangeInfo") {
+      return json({
+        symbols: [
+          {
+            symbol,
+            status: "TRADING",
+            contractType: "PERPETUAL",
+            quoteAsset: "USDT",
+            marginAsset: "USDT",
+            pricePrecision: 1,
+            quantityPrecision: 3,
+            orderTypes: ["LIMIT", "MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
+            filters: [
+              { filterType: "PRICE_FILTER", minPrice: "0.1", maxPrice: "100000", tickSize: "0.1" },
+              { filterType: "LOT_SIZE", minQty: "0.001", maxQty: "1000", stepSize: "0.001" },
+              { filterType: "MIN_NOTIONAL", notional: "5" }
+            ]
+          }
+        ]
+      });
+    }
+    if (url.pathname === "/fapi/v1/ticker/price") return json({ symbol, price: String(price) });
+    if (url.pathname === "/fapi/v2/positionRisk") return json([{ symbol, positionAmt: "0", marginType: "isolated", leverage: String(leverage) }]);
+    if (url.pathname === "/fapi/v1/leverage") {
+      leverage = Number(params.leverage);
+      return json({ symbol, leverage });
+    }
+    if (url.pathname === "/fapi/v1/order" && init?.method === "POST") {
+      return json({ orderId: 11, clientOrderId: params.newClientOrderId, symbol, side: params.side, type: params.type, status: "FILLED", origQty: params.quantity, executedQty: params.quantity, avgPrice: String(price) });
+    }
+    if (url.pathname === "/fapi/v1/algoOrder" && init?.method === "POST") {
+      return json({ algoId: params.type === "STOP_MARKET" ? 21 : 22, clientAlgoId: params.clientAlgoId, symbol, side: params.side, orderType: params.type, algoStatus: "NEW", quantity: params.quantity, triggerPrice: params.triggerPrice, reduceOnly: true });
+    }
+    return json({ code: -2013, msg: "Order does not exist." }, 400);
+  }) as typeof fetch;
+  return { posts, restore: () => void (globalThis.fetch = original) };
+}
+
 class FakeMarketData {
+  async getLastPrice(_symbol: string): Promise<number> {
+    return 600;
+  }
+
   async getKlines(symbol: string, interval: string, limit: number) {
     return Array.from({ length: Math.min(limit, 5) }, (_, index) => ({
       openTime: 1_000 + index * 60_000,
@@ -1406,7 +1498,9 @@ function testConfig(): AppConfig {
     binanceCredentialEncryptionKey: encryptionKey,
     binanceApiKey: undefined,
     binanceApiSecret: undefined,
-    binanceTestnet: true
+    binanceTestnet: true,
+    binanceRetryMaxAttempts: 1,
+    binanceRetryBaseDelayMs: 0
   };
 }
 

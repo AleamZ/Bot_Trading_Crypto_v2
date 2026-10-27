@@ -39,7 +39,9 @@ import type { Direction } from "../../domain/trade/Direction.js";
 import { getPostgresPoolObservability } from "../../infrastructure/persistence/PgPoolFactory.js";
 import { streamAccountLiveUpdates } from "./LiveStream.js";
 import { parseAiChatTurns, type AiChatService } from "../../application/ai/AiChatService.js";
-import { acquireAiChatSlot, AI_CHAT_RATE_MAX, streamAiChatReply } from "./AiChatRoute.js";
+import { acquireAiChatSlot, AI_CHAT_RATE_MAX, createAiChatToolbox, streamAiChatReply } from "./AiChatRoute.js";
+import { ChatOrderError } from "../../application/ai/AiChatOrders.js";
+import { CryptoNewsService } from "../../application/ai/CryptoNewsService.js";
 
 export interface HttpServerParams {
   port: number;
@@ -846,6 +848,23 @@ async function handleTradingAccountRoute(params: {
     return;
   }
 
+  if (child === "ai-chat" && parts.length === 7 && parts[4] === "orders" && parts[6] === "confirm" && request.method === "POST") {
+    if (!runtimeManager) {
+      sendJson(response, 503, { error: "Trading runtime manager is unavailable" }, corsHeaders);
+      return;
+    }
+    await service.getOwnedAccount(userId, accountId);
+    try {
+      sendJson(response, 200, { order: await runtimeManager.chatOrders.confirm(accountId, userId, parts[5] ?? "") }, corsHeaders);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn("[AI CHAT] order confirmation failed", { tradingAccountId: accountId, error: message });
+      if (error instanceof ChatOrderError) sendJson(response, 409, { error: error.code, message }, corsHeaders);
+      else sendJson(response, 502, { error: "CHAT_ORDER_FAILED", message }, corsHeaders);
+    }
+    return;
+  }
+
   if (child === "ai-chat" && parts.length === 4 && request.method === "POST") {
     if (!aiChat) {
       sendJson(response, 503, { error: "AI_CHAT_UNAVAILABLE", message: "AI chat is not configured" }, corsHeaders);
@@ -861,6 +880,11 @@ async function handleTradingAccountRoute(params: {
     try {
       const settings = await service.getSettings(userId, accountId);
       const accountMarketData = marketDataForAccount(account, marketData);
+      const analyzeSymbol = async (symbol: string) => {
+        const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol).catch(() => null) : null;
+        return buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, accountMarketData, diagnostic);
+      };
+      const closedCandles = (symbol: string, timeframe: Timeframe, limit: number) => accountMarketData.getClosedCandles(symbol, timeframe, limit);
       await streamAiChatReply({
         request,
         response,
@@ -870,12 +894,19 @@ async function handleTradingAccountRoute(params: {
         turns,
         aiChat,
         runtimeManager,
-        analyzeSymbol: async (symbol) => {
-          const diagnostic = runtimeManager ? await runtimeManager.getSetupDiagnostic(accountId, symbol).catch(() => null) : null;
-          return buildSymbolAnalysis(symbol, { ...config, ...settings, symbol }, accountMarketData, diagnostic);
-        },
-        closedCandles: (symbol, timeframe, limit) => accountMarketData.getClosedCandles(symbol, timeframe, limit),
-        logger
+        analyzeSymbol,
+        closedCandles,
+        logger,
+        tools: createAiChatToolbox({
+          analyzeSymbol,
+          closedCandles,
+          livePrice: (symbol) => accountMarketData.getLastPrice(symbol),
+          news: (query) => cryptoNews.latest(query),
+          proposeOrder: (orderRequest) =>
+            runtimeManager
+              ? runtimeManager.chatOrders.propose(accountId, userId, orderRequest)
+              : Promise.resolve({ ok: false as const, code: "RUNTIME_UNAVAILABLE", reason: "The trading runtime is not running" })
+        })
       });
     } finally {
       release();
@@ -980,6 +1011,9 @@ function binanceErrorStatus(error: BinanceVerificationError): number {
   if (error.code === "INVALID_ACCOUNT_MODE") return 400;
   return 422;
 }
+
+/** Shared by every account's chat so the RSS feeds are fetched at most once per cache window. */
+const cryptoNews = new CryptoNewsService();
 
 function marketDataForAccount(account: { mode: "DEMO" | "REAL" } | null, fallback: BinanceFuturesMarketData): BinanceFuturesMarketData {
   if (!account) return fallback;

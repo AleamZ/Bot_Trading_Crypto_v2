@@ -47,6 +47,8 @@ import { AI_DECISION_AUDIT_TYPE, AiTradeAdvisor } from "../ai/AiTradeAdvisor.js"
 import type { LlmClient } from "../ai/LocalLlmClient.js";
 import { LiveUpdateHub } from "./LiveUpdateHub.js";
 import { AiCallGate, DEFAULT_AI_MIN_CALL_INTERVAL_MS } from "../ai/AiCallGate.js";
+import { AiChatOrderDesk, type ChatOrderMarket } from "../ai/AiChatOrders.js";
+import { buildSetupKey } from "../execution/ExecutionIntent.js";
 
 export interface AccountSnapshot {
   engine: unknown;
@@ -201,7 +203,14 @@ export class TradingRuntimeManager {
   ) {
     this.processReadOnlySoak = baseConfig.readOnlySoak;
     this.aiCallGate = new AiCallGate(aiLlm?.minCallIntervalMs ?? DEFAULT_AI_MIN_CALL_INTERVAL_MS);
+    this.chatOrders = new AiChatOrderDesk({
+      loadMarket: (accountId, symbol) => this.loadChatOrderMarket(accountId, symbol),
+      submit: (accountId, plan, risk) => this.submitChatOrder(accountId, plan, risk)
+    });
   }
+
+  /** Orders the dashboard chat proposes; placed only when the user confirms the card. */
+  readonly chatOrders: AiChatOrderDesk;
 
   /** One gate for every account's advisor, so model calls never burst against the provider. */
   private readonly aiCallGate: AiCallGate;
@@ -280,7 +289,10 @@ export class TradingRuntimeManager {
             auditRepository: this.executionIntentRepository,
             logger: this.logger
           });
-    const reconciliationGateway = account.mode === "DEMO" && isRecoverableExecutionGateway(rawExecution) ? new GatedRecoverableExecutionGateway(rawExecution, executionGate) : undefined;
+    // Repairing or fail-safe closing an open position must not wait for new entries to be allowed:
+    // the automatic-trading switch only stops new entries (chat orders may exist while it is off).
+    const protectionGate = () => this.resolveRuntimeExecutionGate(account, health, { ...configRef.current, tradingEnabled: true }, rawExecution);
+    const reconciliationGateway = account.mode === "DEMO" && isRecoverableExecutionGateway(rawExecution) ? new GatedRecoverableExecutionGateway(rawExecution, protectionGate) : undefined;
     // AI orders go through the same gateway as the engine; on REAL accounts the advisor is advisory-only.
     const aiAdvisor = this.aiLlm
       ? new AiTradeAdvisor({
@@ -753,6 +765,66 @@ export class TradingRuntimeManager {
       leverage: risk.leverage
     });
     if (!result.ok) throw new Error(result.reason ?? "SYMBOL_RULE_VALIDATION_FAILED");
+  }
+
+  private async loadChatOrderMarket(accountId: string, symbol: string): Promise<ChatOrderMarket> {
+    const runtime = await this.ensureRuntime(accountId);
+    const config = runtime.configRef.current;
+    const [inputs, livePrice] = await Promise.all([
+      runtime.account.mode === "DEMO" ? this.getRiskInputs(accountId, symbol) : Promise.resolve(null),
+      this.runtimeMarketDataFactory(runtime.account.mode === "DEMO").getLastPrice(symbol).catch(() => null)
+    ]);
+    if (runtime.account.mode === "DEMO" && !inputs) throw new Error("BINANCE_DISCONNECTED: balance, positions or symbol rules are unavailable");
+    const open = (inputs?.positions ?? []).filter((position) => position.quantity > 0);
+    return {
+      mode: runtime.account.mode,
+      config,
+      livePrice,
+      availableBalance: inputs?.availableBalance ?? 0,
+      currentUsedMargin: inputs?.currentUsedMargin ?? 0,
+      openPositions: open.length,
+      symbolOpenPositions: open.filter((position) => position.symbol === symbol).length,
+      symbolRules: inputs?.symbolRules ?? (await this.getSymbolRules(accountId, symbol)),
+      drawdownPercent: runtime.scanner.getEngine(symbol)?.getState().drawdownPercent ?? 0
+    };
+  }
+
+  /**
+   * Places a confirmed chat order: a MARKET entry through its own coordinator, so the automatic
+   * trading switch does not block it while the kill switch, readiness and pre-trade checks still do.
+   */
+  private async submitChatOrder(accountId: string, plan: EntryPlan, risk: RiskDecision): Promise<{ executionIntentId: string | null }> {
+    const runtime = await this.ensureRuntime(accountId);
+    if (runtime.account.mode !== "DEMO") throw new Error("REAL_EXECUTION_LOCKED");
+    // Built per order (it is rare and user-initiated) so a reconnected Binance key is always used.
+    const execution = await this.createChatExecution(runtime);
+    const findIntent = () => this.executionIntentRepository.findBySetupKey(accountId, buildSetupKey(accountId, plan, risk)).catch(() => null);
+    try {
+      await execution.submitBracketOrder(plan, risk);
+    } catch (error) {
+      // The coordinator rethrows only the error class; Binance's code and message are on the intent.
+      const intent = await findIntent();
+      throw new Error(intent?.lastError || (error instanceof Error ? error.message : String(error)));
+    }
+    runtime.scanner.markEntryPlaced(risk.symbol);
+    this.logger.info("[AI CHAT] order submitted", { tradingAccountId: accountId, symbol: risk.symbol, direction: plan.direction, quantity: risk.quantity });
+    return { executionIntentId: (await findIntent())?.id ?? null };
+  }
+
+  private async createChatExecution(runtime: AccountRuntime): Promise<ExecutionCoordinator> {
+    const { account, health, configRef } = runtime;
+    const rawExecution = await this.createExecutionGateway(account, "market", configRef.current.maxLeverage, () => configRef.current.marginMode, configRef.current.readOnlySoak);
+    return new ExecutionCoordinator({
+      tradingAccountId: account.id,
+      mode: account.mode,
+      entryType: "market",
+      repository: this.executionIntentRepository,
+      delegate: rawExecution,
+      logger: this.logger,
+      retry: { maxAttempts: this.baseConfig.binanceRetryMaxAttempts, baseDelayMs: this.baseConfig.binanceRetryBaseDelayMs },
+      executionGate: () => this.resolveRuntimeExecutionGate(account, health, { ...configRef.current, tradingEnabled: true }, rawExecution),
+      preTradeValidation: (plan, risk) => this.validatePreTrade(account, { ...configRef.current, entryMode: "market" }, plan, risk)
+    });
   }
 
   async listExecutions(accountId: string, limit = 100): Promise<unknown[]> {

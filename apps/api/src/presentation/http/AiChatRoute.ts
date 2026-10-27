@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { mentionedSymbols, type AiChatContext, type AiChatService, type AiChatTurn } from "../../application/ai/AiChatService.js";
+import { mentionedSymbols, type AiChatContext, type AiChatService, type AiChatToolbox, type AiChatTurn } from "../../application/ai/AiChatService.js";
+import type { ChatOrderProposalResult, ChatOrderRequest } from "../../application/ai/AiChatOrders.js";
 import { LlmRequestError } from "../../application/ai/LocalLlmClient.js";
 import type { DecisionLogger } from "../../application/ports/Logger.js";
 import type { TradingRuntimeManager } from "../../application/runtime/TradingRuntimeManager.js";
@@ -51,9 +52,38 @@ export interface AiChatRouteParams {
   closedCandles: (symbol: string, timeframe: Timeframe, limit: number) => Promise<Candle[]>;
   logger: DecisionLogger;
   heartbeatMs?: number;
+  /** Tools the model may call (symbol lookup, news, order proposals); absent = context-only answers. */
+  tools?: AiChatToolbox;
 }
 
-/** Streams one chat answer as Server-Sent Events: `meta`, then `delta` pieces, then `done` or `error`. */
+/** Binds the chat tools to one account: analysis of any symbol, news, and order proposals. */
+export function createAiChatToolbox(deps: {
+  analyzeSymbol: (symbol: string) => Promise<unknown>;
+  closedCandles: (symbol: string, timeframe: Timeframe, limit: number) => Promise<Candle[]>;
+  livePrice: (symbol: string) => Promise<number | null>;
+  news: AiChatToolbox["news"];
+  proposeOrder: (request: ChatOrderRequest) => Promise<ChatOrderProposalResult>;
+}): AiChatToolbox {
+  return {
+    marketAnalysis: async (symbol) => {
+      if (!SYMBOL_PATTERN.test(symbol)) return { ok: false, error: "INVALID_SYMBOL", message: `${symbol} is not a USDT-M symbol` };
+      const [analysis, h1, m5, livePrice] = await Promise.all([
+        deps.analyzeSymbol(symbol),
+        deps.closedCandles(symbol, "H1", 24).catch(() => null),
+        deps.closedCandles(symbol, "M5", 36).catch(() => null),
+        deps.livePrice(symbol).catch(() => null)
+      ]);
+      return { symbol, checkedAt: new Date().toISOString(), livePrice, analysis, candles: { columns: ["openTime", "open", "high", "low", "close"], h1: compactCandles(h1), m5: compactCandles(m5) } };
+    },
+    news: deps.news,
+    proposeOrder: deps.proposeOrder
+  };
+}
+
+/**
+ * Streams one chat answer as Server-Sent Events: `meta`, then `tool` progress, `proposal` cards and
+ * `delta` pieces, then `done` or `error`.
+ */
 export async function streamAiChatReply(params: AiChatRouteParams): Promise<void> {
   const { request, response, corsHeaders, account, aiChat, logger } = params;
   const context = await buildAiChatContext(params);
@@ -81,9 +111,28 @@ export async function streamAiChatReply(params: AiChatRouteParams): Promise<void
     if (!response.writableEnded) response.write(": ping\n\n");
   }, params.heartbeatMs ?? HEARTBEAT_MS);
 
-  send("meta", { model, symbols: context.symbols.map((item) => item.symbol), unavailable: context.unavailable });
+  // A proposal becomes a card in the chat as soon as the risk manager accepts it.
+  const tools: AiChatToolbox | undefined = params.tools
+    ? {
+        ...params.tools,
+        proposeOrder: async (orderRequest) => {
+          const result = await params.tools!.proposeOrder(orderRequest);
+          if (result.ok) send("proposal", result.proposal);
+          return result;
+        }
+      }
+    : undefined;
+
+  send("meta", { model, symbols: context.symbols.map((item) => item.symbol), unavailable: context.unavailable, tools: Boolean(tools) });
   try {
-    const answer = await aiChat.reply({ context, turns: params.turns, model, signal: abort.signal, onDelta: (text) => send("delta", { text }) });
+    const answer = await aiChat.reply({
+      context,
+      turns: params.turns,
+      model,
+      signal: abort.signal,
+      onDelta: (text) => send("delta", { text }),
+      ...(tools ? { tools, onTool: (event) => send("tool", event) } : {})
+    });
     send("done", { model: answer.model, latencyMs: answer.latencyMs });
     logger.info("[AI CHAT] answered", { tradingAccountId: account.id, model: answer.model, latencyMs: answer.latencyMs, symbols: context.symbols.map((item) => item.symbol) });
   } catch (error) {

@@ -94,10 +94,11 @@ describe("AI chat input", () => {
     expect(mentionedSymbols("Tình hình bot hôm nay thế nào?", watchlist)).toEqual([]);
   });
 
-  it("puts the read-only rules and the context before the conversation", () => {
+  it("puts the rules and the context before the conversation", () => {
     const messages = buildAiChatMessages(context(), [{ role: "user", content: "Tóm tắt" }]);
     expect(messages[0]).toEqual({ role: "system", content: aiChatSystemPrompt() });
-    expect(aiChatSystemPrompt()).toContain("CHỈ ĐỌC");
+    // Orders only ever go through a card the user confirms.
+    expect(aiChatSystemPrompt()).toContain("propose_order KHÔNG đặt lệnh");
     expect(aiChatSystemPrompt()).toContain("H1 EMA trend");
     expect(messages[1]?.role).toBe("system");
     expect(messages[1]?.content).toContain('"name":"My Testnet"');
@@ -151,7 +152,7 @@ describe("AI chat stream", () => {
     expect(h.response.headers).toMatchObject({ "content-type": "text/event-stream; charset=utf-8", "x-accel-buffering": "no" });
     expect(h.events()).toEqual([
       // No runtime manager in this harness, so the model is told the runtime data is missing.
-      { event: "meta", data: { model: "account-model", symbols: [], unavailable: ["runtime"] } },
+      { event: "meta", data: { model: "account-model", symbols: [], unavailable: ["runtime"], tools: false } },
       { event: "delta", data: { text: "Bot " } },
       { event: "delta", data: { text: "đang chờ." } },
       { event: "done", data: { model: "served", latencyMs: expect.any(Number) } }

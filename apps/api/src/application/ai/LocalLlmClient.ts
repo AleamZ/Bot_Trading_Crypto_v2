@@ -36,6 +36,46 @@ export interface StreamingLlmClient {
   stream(request: LlmChatRequest, onDelta: (text: string) => void, options?: LlmStreamOptions): Promise<LlmChatResponse>;
 }
 
+/** A function the model asked to run; `arguments` is the JSON text the model wrote. */
+export interface LlmToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface LlmToolDefinition {
+  name: string;
+  description: string;
+  /** JSON Schema of the arguments object. */
+  parameters: Record<string, unknown>;
+}
+
+/** Conversation for tool calling: the model's tool requests and the tool results go back to it. */
+export type LlmAgentMessage =
+  | LlmChatMessage
+  | { role: "assistant"; content: string | null; toolCalls: LlmToolCall[] }
+  | { role: "tool"; toolCallId: string; content: string };
+
+export interface LlmToolRequest {
+  model: string;
+  messages: LlmAgentMessage[];
+  /** Empty = the model must answer in text. */
+  tools: LlmToolDefinition[];
+  temperature?: number;
+}
+
+export interface LlmToolResponse {
+  model: string;
+  /** Text answer; empty while the model only asks for tools. */
+  content: string;
+  toolCalls: LlmToolCall[];
+}
+
+/** OpenAI-style function calling (`tools` / `tool_calls`). */
+export interface ToolCallingLlmClient {
+  completeWithTools(request: LlmToolRequest, options?: LlmStreamOptions): Promise<LlmToolResponse>;
+}
+
 export interface LocalLlmConfig {
   baseUrl: string;
   apiKey: string | null;
@@ -79,7 +119,7 @@ export class LlmRequestError extends Error {
 }
 
 /** Minimal OpenAI-compatible `/chat/completions` client built on fetch. */
-export class LocalLlmClient implements LlmClient, StreamingLlmClient {
+export class LocalLlmClient implements LlmClient, StreamingLlmClient, ToolCallingLlmClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(
@@ -139,6 +179,62 @@ export class LocalLlmClient implements LlmClient, StreamingLlmClient {
     const content = parsed?.choices?.[0]?.message?.content;
     if (typeof content !== "string" || content.trim().length === 0) throw new LlmRequestError("LLM_EMPTY_RESPONSE", "LLM response has no message content");
     return { model: typeof parsed?.model === "string" && parsed.model ? parsed.model : request.model, content };
+  }
+
+  /** One non-streamed round of function calling: either tool calls to run or the final text. */
+  async completeWithTools(request: LlmToolRequest, options: LlmStreamOptions = {}): Promise<LlmToolResponse> {
+    const timeoutMs = options.timeoutMs ?? this.config.timeoutMs;
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    const abortFromCaller = () => controller.abort();
+    if (options.signal?.aborted) controller.abort();
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.config.apiKey) headers.authorization = `Bearer ${this.config.apiKey}`;
+    const body: Record<string, unknown> = {
+      model: request.model,
+      messages: request.messages.map(toWireMessage),
+      temperature: request.temperature ?? 0.3,
+      stream: false
+    };
+    if (request.tools.length > 0) {
+      body.tools = request.tools.map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.parameters } }));
+      body.tool_choice = "auto";
+    }
+
+    let response: Response;
+    let text: string;
+    try {
+      response = await this.fetchImpl(`${this.config.baseUrl}/chat/completions`, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
+      text = await response.text();
+    } catch (error) {
+      if (timedOut) throw new LlmRequestError("LLM_TIMEOUT", `LLM request timed out after ${timeoutMs}ms`);
+      if (controller.signal.aborted) throw new LlmRequestError("LLM_ABORTED", "LLM request was cancelled");
+      throw new LlmRequestError("LLM_NETWORK_ERROR", error instanceof Error ? error.message : String(error));
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abortFromCaller);
+    }
+
+    if (!response.ok) throw new LlmRequestError("LLM_HTTP_ERROR", `LLM HTTP ${response.status}: ${text.slice(0, 300)}`);
+    const parsed = safeJsonParse(text) as {
+      model?: unknown;
+      choices?: Array<{ message?: { content?: unknown; tool_calls?: Array<{ id?: unknown; function?: { name?: unknown; arguments?: unknown } }> } }>;
+    } | null;
+    const message = parsed?.choices?.[0]?.message;
+    const content = typeof message?.content === "string" ? message.content : "";
+    const toolCalls: LlmToolCall[] = (Array.isArray(message?.tool_calls) ? message.tool_calls : []).flatMap((call, index) => {
+      const name = call.function?.name;
+      if (typeof name !== "string" || !name) return [];
+      const args = call.function?.arguments;
+      return [{ id: typeof call.id === "string" && call.id ? call.id : `call_${index}`, name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) }];
+    });
+    if (toolCalls.length === 0 && content.trim().length === 0) throw new LlmRequestError("LLM_EMPTY_RESPONSE", "LLM response has no message content");
+    return { model: typeof parsed?.model === "string" && parsed.model ? parsed.model : request.model, content, toolCalls };
   }
 
   /**
@@ -222,6 +318,18 @@ export class LocalLlmClient implements LlmClient, StreamingLlmClient {
       options.signal?.removeEventListener("abort", abortFromCaller);
     }
   }
+}
+
+function toWireMessage(message: LlmAgentMessage): Record<string, unknown> {
+  if (message.role === "tool") return { role: "tool", tool_call_id: message.toolCallId, content: message.content };
+  if (message.role === "assistant" && "toolCalls" in message) {
+    return {
+      role: "assistant",
+      content: message.content,
+      tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }))
+    };
+  }
+  return { role: message.role, content: message.content };
 }
 
 /**

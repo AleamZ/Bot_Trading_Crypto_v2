@@ -40,7 +40,7 @@ const homeState = {
   snapshot: null,
   snapshotAt: 0,
 };
-// Read-only AI chat; history lives in this browser, per trading account.
+// AI chat (analysis, news, order cards confirmed by the user); history lives in this browser, per trading account.
 const CHAT_HISTORY_KEPT = 40;
 const CHAT_TURNS_SENT = 16;
 const chatState = {
@@ -2682,7 +2682,7 @@ async function sendChat(text) {
     .map(({ role, content }) => ({ role, content }))
     .concat({ role: "user", content: question })
     .slice(-CHAT_TURNS_SENT);
-  const answer = { role: "assistant", content: "", pending: true, model: null, error: null };
+  const answer = { role: "assistant", content: "", pending: true, model: null, error: null, tools: [], proposals: [] };
   chatState.messages.push({ role: "user", content: question }, answer);
   $("chat-input").value = "";
   const abort = new AbortController();
@@ -2739,12 +2739,130 @@ async function readChatStream(body, answer) {
         continue;
       }
       if (event === "meta") answer.model = payload.model ?? null;
+      if (event === "tool") upsertChatTool(answer, payload);
+      if (event === "proposal") answer.proposals.push({ ...payload, state: "open", result: null, error: null });
       if (event === "delta") answer.content += payload.text ?? "";
       if (event === "done") answer.model = payload.model ?? answer.model;
       if (event === "error") answer.error = `${payload.message ?? "AI không trả lời được"} (${payload.code ?? "AI_CHAT_FAILED"})`;
       queueChatRender();
     }
   }
+}
+
+// One line per tool call: "start" is replaced by its "done" / "error".
+function upsertChatTool(answer, event) {
+  const index = answer.tools.findIndex((tool) => tool.id === event.id);
+  if (index === -1) answer.tools.push(event);
+  else answer.tools[index] = event;
+}
+
+// The order is placed only here, when the user confirms the card; the server checks it again.
+async function confirmChatOrder(proposal) {
+  const accountId = chatState.accountId;
+  if (!accountId || proposal.state !== "open") return;
+  if (Date.parse(proposal.expiresAt) <= Date.now()) {
+    proposal.state = "expired";
+    renderChat();
+    return;
+  }
+  proposal.state = "placing";
+  renderChat();
+  try {
+    const response = await apiFetch(`/api/trading-accounts/${accountId}/ai-chat/orders/${encodeURIComponent(proposal.id)}/confirm`, { method: "POST" });
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+    proposal.state = "placed";
+    proposal.result = body.order ?? null;
+  } catch (error) {
+    proposal.state = "failed";
+    const message = error instanceof Error ? error.message : String(error);
+    proposal.error = executionErrorText(message) || message;
+  }
+  if (chatState.accountId === accountId) renderChat();
+}
+
+function cancelChatOrder(proposal) {
+  if (proposal.state !== "open") return;
+  proposal.state = "cancelled";
+  renderChat();
+}
+
+function chatToolList(tools) {
+  const list = document.createElement("ul");
+  list.className = "chat-tools";
+  for (const tool of tools) {
+    const item = document.createElement("li");
+    item.dataset.status = tool.status;
+    item.textContent = `${tool.status === "start" ? "…" : tool.status === "done" ? "✓" : "!"} ${tool.label}`;
+    if (tool.detail) item.title = tool.detail;
+    list.append(item);
+  }
+  return list;
+}
+
+function chatOrderCard(proposal) {
+  if (proposal.state === "open" && Date.parse(proposal.expiresAt) <= Date.now()) proposal.state = "expired";
+  const card = document.createElement("div");
+  card.className = "chat-order";
+  card.dataset.state = proposal.state;
+  const head = document.createElement("div");
+  head.className = "chat-order-head";
+  const title = document.createElement("strong");
+  title.textContent = `Đề xuất lệnh · ${proposal.symbol}`;
+  head.append(title, badge(proposal.side, proposal.side === "LONG" ? "ok" : "danger"));
+  const rows = document.createElement("dl");
+  const add = (label, value) => {
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = value;
+    rows.append(term, detail);
+  };
+  add("Vào lệnh", `MARKET · ~${formatPrice(proposal.entry)}`);
+  add("Stop loss", formatPrice(proposal.stopLoss));
+  add("Take profit", formatPrice(proposal.takeProfit));
+  add("Khối lượng", `${formatQuantity(proposal.quantity)} ${proposal.symbol.replace(/USDT$/, "")} · ${proposal.sizing === "USER" ? "theo bạn" : "theo risk"}`);
+  add("Giá trị", `${formatUsdt(proposal.notional)} · ${formatLeverageValue(proposal.leverage)} · margin ${formatUsdt(proposal.margin)}`);
+  add("Rủi ro / Lãi", `${formatUsdt(proposal.riskUsdt)} / ${formatUsdt(proposal.profitUsdt)} · R:R ${formatRatio(proposal.riskReward)}`);
+  card.append(head, rows);
+  if (proposal.reason) {
+    const reason = document.createElement("p");
+    reason.className = "chat-order-reason";
+    reason.textContent = proposal.reason;
+    card.append(reason);
+  }
+  const footer = document.createElement("div");
+  footer.className = "chat-order-foot";
+  if (proposal.state === "open" || proposal.state === "placing") {
+    const confirm = document.createElement("button");
+    confirm.type = "button";
+    confirm.className = "primary";
+    confirm.disabled = proposal.state === "placing";
+    confirm.textContent = proposal.state === "placing" ? "Đang đặt lệnh…" : "Xác nhận đặt lệnh";
+    confirm.addEventListener("click", () => confirmChatOrder(proposal));
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.disabled = proposal.state === "placing";
+    cancel.textContent = "Huỷ";
+    cancel.addEventListener("click", () => cancelChatOrder(proposal));
+    const expires = document.createElement("small");
+    expires.textContent = `DEMO · giá kiểm tra lại khi xác nhận · hết hạn ${new Date(proposal.expiresAt).toLocaleTimeString()}`;
+    footer.append(confirm, cancel, expires);
+  } else {
+    const status = document.createElement("p");
+    status.className = proposal.state === "placed" ? "chat-order-status ok" : proposal.state === "failed" ? "chat-order-status danger" : "chat-order-status";
+    status.textContent =
+      proposal.state === "placed"
+        ? `Đã đặt lệnh ${proposal.side} ${formatQuantity(proposal.result?.quantity ?? proposal.quantity)} tại ~${formatPrice(proposal.result?.entry ?? proposal.entry)}${proposal.result?.executionIntentId ? ` · ${proposal.result.executionIntentId}` : ""}`
+        : proposal.state === "failed"
+          ? `Không đặt được: ${proposal.error}`
+          : proposal.state === "expired"
+            ? "Đề xuất đã hết hạn. Hỏi AI để tạo lại."
+            : "Đã huỷ, không đặt lệnh.";
+    footer.append(status);
+  }
+  card.append(footer);
+  return card;
 }
 
 // Deltas arrive faster than the screen refreshes; render at most once per frame.
@@ -2765,12 +2883,12 @@ function renderChat() {
   $("chat-send").classList.toggle("primary", !busy);
   $("chat-suggestions").hidden = chatState.messages.length > 0;
   const lastModel = [...chatState.messages].reverse().find((message) => message.model)?.model;
-  $("chat-meta").textContent = `${lastModel ? `${lastModel} · ` : ""}Chỉ đọc · không đặt lệnh, không đổi setting`;
+  $("chat-meta").textContent = `${lastModel ? `${lastModel} · ` : ""}Phân tích · tin tức · đặt lệnh DEMO khi bạn xác nhận`;
   if (chatState.messages.length === 0) {
     const intro = document.createElement("li");
     intro.className = "chat-intro";
     intro.textContent =
-      "Hỏi về trạng thái bot, một symbol (ví dụ “Phân tích ETHUSDT”), hay vì sao bot chưa vào lệnh. AI dùng dữ liệu realtime của tài khoản này và chỉ đọc: không đặt lệnh, không đổi setting.";
+      "Hỏi về bot, phân tích bất kỳ coin nào (ví dụ “Phân tích ETH”), tin tức mới nhất, hoặc bảo AI đặt lệnh (ví dụ “Long BTC 0.002”). AI chỉ đề xuất: lệnh được đặt trên tài khoản DEMO khi bạn bấm Xác nhận trên thẻ lệnh. AI không đổi setting, không huỷ lệnh.";
     list.replaceChildren(intro);
     return;
   }
@@ -2788,7 +2906,9 @@ function chatMessageItem(message) {
     bubble.textContent = message.content;
   } else {
     const visible = visibleChatText(message.content);
+    if (message.tools?.length) bubble.append(chatToolList(message.tools));
     if (visible) bubble.append(renderChatMarkdown(visible));
+    for (const proposal of message.proposals ?? []) bubble.append(chatOrderCard(proposal));
     if (message.pending && !visible) bubble.append(typingDots());
     if (message.stopped) {
       const note = document.createElement("p");

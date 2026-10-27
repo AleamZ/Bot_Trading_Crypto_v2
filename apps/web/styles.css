@@ -2634,6 +2634,94 @@ code {
   font-style: italic;
 }
 
+.chat-bubble .chat-tools {
+  margin: 0 0 8px !important;
+  padding: 0 !important;
+  list-style: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-bubble .chat-tools li {
+  margin: 0 !important;
+}
+
+.chat-bubble .chat-tools li[data-status="error"] {
+  color: var(--danger);
+}
+
+.chat-order {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.chat-order[data-state="cancelled"],
+.chat-order[data-state="expired"] {
+  opacity: 0.7;
+}
+
+.chat-order-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.chat-order dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.chat-order dt {
+  color: var(--muted);
+}
+
+.chat-order dd {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.chat-order-reason {
+  margin: 8px 0 0 !important;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-order-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.chat-order-foot small {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat-order-status {
+  margin: 0 !important;
+  font-weight: 700;
+}
+
+.chat-order-status.ok {
+  color: var(--success);
+}
+
+.chat-order-status.danger {
+  color: var(--danger);
+}
+
 .typing {
   display: inline-flex;
   gap: 4px;

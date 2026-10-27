@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadConfig, parseFlag, validateTradingSettings } from "../src/application/config/AppConfig.js";
+import { applyStoredTradingSettings, loadConfig, parseFlag, validateTradingSettings } from "../src/application/config/AppConfig.js";
 
 describe("boolean flags", () => {
   it("reads the text of true/false values instead of their truthiness", () => {
@@ -19,6 +19,16 @@ describe("loadConfig env flags", () => {
     withEnv({ READ_ONLY_SOAK: "false" }, () => expect(loadConfig().readOnlySoak).toBe(false));
     withEnv({ READ_ONLY_SOAK: "true" }, () => expect(loadConfig().readOnlySoak).toBe(true));
     withEnv({ READ_ONLY_SOAK: undefined }, () => expect(loadConfig().readOnlySoak).toBe(false));
+  });
+
+  it("keeps READ_ONLY_SOAK from the env when a stored settings row says otherwise", () => {
+    withEnv({ READ_ONLY_SOAK: "false" }, () => {
+      const stored = validateTradingSettings({ readOnlySoak: true, riskPerTradeUsdt: 35 });
+      const config = applyStoredTradingSettings(loadConfig(), stored);
+      expect(config.readOnlySoak).toBe(false);
+      expect(config.riskPerTradeUsdt).toBe(35);
+    });
+    withEnv({ READ_ONLY_SOAK: "true" }, () => expect(applyStoredTradingSettings(loadConfig(), validateTradingSettings({ readOnlySoak: false })).readOnlySoak).toBe(true));
   });
 
   it("LOCAL_TRADING_RUNTIME_ENABLED=false keeps the development runtime off", () => {

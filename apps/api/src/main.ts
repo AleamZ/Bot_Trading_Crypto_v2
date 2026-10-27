@@ -1,4 +1,4 @@
-import { applyTradingSettings, loadConfig, validateTradingSettings } from "./application/config/AppConfig.js";
+import { applyStoredTradingSettings, loadConfig, validateTradingSettings } from "./application/config/AppConfig.js";
 import { MarketScanner } from "./application/scanner/MarketScanner.js";
 import { AuthService } from "./application/auth/AuthService.js";
 import { TradingAccountService } from "./application/trading-account/TradingAccountService.js";
@@ -47,7 +47,7 @@ const tradingAccounts = new TradingAccountService(
 );
 const storedSettings = await repository.getTradingSettings();
 if (storedSettings) {
-  config = applyTradingSettings(config, validateTradingSettings(storedSettings));
+  config = applyStoredTradingSettings(config, validateTradingSettings(storedSettings));
 } else {
   await repository.saveTradingSettings(validateTradingSettings(config));
 }

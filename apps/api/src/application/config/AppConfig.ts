@@ -252,6 +252,15 @@ export function applyTradingSettings(config: AppConfig, settings: TradingSetting
   return schema.parse({ ...config, ...settings });
 }
 
+/**
+ * Startup config: the stored global settings row overrides trading parameters but never
+ * READ_ONLY_SOAK, which only the environment controls. A row saved while "false" still parsed
+ * as true otherwise keeps every DEMO account read-only after the env is fixed.
+ */
+export function applyStoredTradingSettings(config: AppConfig, stored: TradingSettings): AppConfig {
+  return { ...applyTradingSettings(config, stored), readOnlySoak: config.readOnlySoak };
+}
+
 export function loadConfig(): AppConfig {
   const parsed = schema.parse({
     ...defaultTradingSettings,
